@@ -82,6 +82,11 @@ def _wnode(text="", desc="", cls="android.widget.TextView", clickable=False,
             "parents": []}
 
 
+class OfflineGuardTripped(BaseException):
+    """Not an Exception: code that catches Exception (the read after an
+    action does, on purpose) must not be able to swallow a tripped guard."""
+
+
 class OfflineTestCase(unittest.TestCase):
     """Installs loud offline guards around every live-I/O entry point."""
 
@@ -95,16 +100,20 @@ class OfflineTestCase(unittest.TestCase):
         for name in self.GUARDS:
             p = mock.patch.object(pc, name)
             m = p.start()
-            m.side_effect = AssertionError(
+            m.side_effect = OfflineGuardTripped(
                 "OFFLINE GUARD TRIPPED: pc.%s called without a mock "
                 "(live I/O attempted)" % name)
             self._guards[name] = p
             self.addCleanup(p.stop)
         p = mock.patch("socket.socket")
         m = p.start()
-        m.side_effect = AssertionError(
+        m.side_effect = OfflineGuardTripped(
             "OFFLINE GUARD TRIPPED: socket.socket called (live I/O attempted)")
         self._guards["socket.socket"] = p
+        self.addCleanup(p.stop)
+        # No test writes the real run/commands.log.
+        p = mock.patch.object(pc, "log_command")
+        p.start()
         self.addCleanup(p.stop)
 
     def allow(self, name, **kwargs):
@@ -639,7 +648,7 @@ class JsonOutputTests(OfflineTestCase):
 
     def test_json_wait_timeout_errors_to_stderr(self):
         self.allow("u2sock", return_value=pc.U2_NOT_FOUND)
-        args = self.parse(["wait", "Never", "--json"])
+        args = self.parse(["wait", "Never", "--json", "--no-evidence"])
         with self.cap() as (out, err):
             rc = pc.cmd_wait(args)
         self.assertEqual(rc, 1)
@@ -648,12 +657,7 @@ class JsonOutputTests(OfflineTestCase):
         self.assertIn('timeout waiting for "Never"', err.getvalue())
 
     def test_json_state(self):
-        self.allow(
-            "adb_or_ensure",
-            return_value=SimpleNamespace(
-                returncode=0,
-                stdout="  mFocusedApp=AppWindowToken{abc} u0 com.example/.Main\n",
-                stderr=""))
+        # The app in front comes from the screen read itself: no adb call.
         self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
         args = self.parse(["state", "--json"])
         with self.cap() as (out, err):
@@ -661,8 +665,19 @@ class JsonOutputTests(OfflineTestCase):
         self.assertEqual(rc, 0)
         data = json.loads(out.getvalue())
         self.assertTrue(data["ok"])
-        self.assertEqual(data["app"], "com.example/.Main")
+        self.assertEqual(data["app"], "com.example")
         self.assertIn("Hello", data["texts"])
+
+    def test_state_prints_screen_rows(self):
+        self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
+        args = self.parse(["state"])
+        with self.cap() as (out, err):
+            rc = pc.cmd_state(args)
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertIn("screen: com.example", text)
+        self.assertIn("Hello (300,250)", text)
+        self.assertIn("OK (click) [Button]", text)
 
 
 # ------------------------------------------------------------ 5. unicode input
@@ -740,10 +755,11 @@ class UnicodeTests(OfflineTestCase):
 
     def test_cmd_type_unicode_flag_forces_adbkeyboard(self):
         m_uni = self.allow("type_via_adbkeyboard", return_value=0)
+        self.allow("u2sock", return_value="100")
         self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
         args = SimpleNamespace(text="hello", field=None, clear=False,
                                clear_keys=20, unicode=True, ascii=False,
-                               slow=False)
+                               slow=False, quiet=True)
         with self.cap():
             rc = pc.cmd_type(args)
         self.assertEqual(rc, 0)
@@ -755,20 +771,63 @@ class UnicodeTests(OfflineTestCase):
         m_adb = self.allow("adb_or_ensure")
         m_adb.return_value = SimpleNamespace(returncode=0, stdout="",
                                              stderr="")
-        self.allow("u2sock", return_value=None)  # health -> None: skip fast path
+        self.allow("u2sock", return_value=None)  # no UI helper: key events
+        self.allow("scrcpy_send", side_effect=RuntimeError("no scrcpy"))
         self.allow("u2_invalidate")
         self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
         args = SimpleNamespace(text="hé", field=None, clear=False,
                                clear_keys=20, unicode=False, ascii=True,
-                               slow=False)
+                               slow=False, quiet=True)
         with mock.patch.object(pc.time, "sleep", lambda s: None):
             with self.cap():
                 rc = pc.cmd_type(args)
         self.assertEqual(rc, 0)
         m_uni.assert_not_called()
         sent = [c[0] for c in m_adb.call_args_list]
-        self.assertIn(("shell", "input", "text", "h"), sent)
-        self.assertIn(("shell", "input", "text", "\\é"), sent)
+        # one adb call types the whole string
+        self.assertIn(("shell", "input", "text", "h\\é"), sent)
+
+    def test_cmd_type_uses_helper_set_text_without_a_read(self):
+        """The UI helper finds the focused field itself: no screen read
+        and no health call before typing."""
+        self.allow("u2_invalidate")
+        dump = self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append(cmd)
+            if cmd == "set_text":
+                return ""
+            if cmd == "idle":
+                return "500"
+            return None
+        self.allow("u2sock", side_effect=u2)
+        args = SimpleNamespace(text="hello", field=None, clear=False,
+                               clear_keys=20, unicode=False, ascii=False,
+                               slow=False, quiet=False)
+        with self.cap() as (out, err):
+            rc = pc.cmd_type(args)
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, ["set_text", "idle"])
+        self.assertEqual(dump.call_count, 1)  # the read after, not before
+        self.assertIn("typed 5 chars", out.getvalue())
+        self.assertIn("screen: com.example", out.getvalue())
+
+    def test_cmd_type_scrcpy_keys_when_no_field(self):
+        """No editable field for the helper: key events over scrcpy."""
+        self.allow("u2_invalidate")
+        self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
+        self.allow("u2sock", return_value=None)
+        sc = self.allow("scrcpy_send", return_value=True)
+        args = SimpleNamespace(text="ab\ncd", field=None, clear=False,
+                               clear_keys=20, unicode=False, ascii=False,
+                               slow=False, quiet=True)
+        with self.cap() as (out, err):
+            rc = pc.cmd_type(args)
+        self.assertEqual(rc, 0)
+        sent = [c[0][0] for c in sc.call_args_list]
+        self.assertEqual(sent, ["text ab", "key 66", "text cd"])
+        self.assertIn("key events", out.getvalue())
 
 
 # ----------------------------------------------- 6. existing functionality
@@ -1084,17 +1143,21 @@ class DocsTests(OfflineTestCase):
 
 class OfflineSafetyTests(OfflineTestCase):
     def test_guard_blocks_adb(self):
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(OfflineGuardTripped):
             pc.adb("get-state")
 
     def test_guard_blocks_u2sock(self):
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(OfflineGuardTripped):
             pc.u2sock("dump")
+
+    def test_guard_is_not_swallowed_by_read_after(self):
+        with self.assertRaises(OfflineGuardTripped):
+            pc.read_after()
 
     @unittest.skipIf(os.name == "nt", "Unix sockets: burner runs on Linux and macOS")
     def test_guard_blocks_socket(self):
         import socket as _socket
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(OfflineGuardTripped):
             _socket.socket(_socket.AF_UNIX)
 
     def test_bin_burner_compiles(self):
@@ -1161,8 +1224,10 @@ class AmbiguousTapTests(OfflineTestCase):
         self.allow("wake_async")
         self.allow("ui_dump", return_value=ET.fromstring(xml))
         tc = self.allow("tap_center")
-        args = self.parse(argv)
-        with self.cap() as (out, err):
+        self.allow("u2sock", return_value="100")  # the quiet wait after a tap
+        # These test the tap decision only: no read after, no evidence.
+        args = self.parse([argv[0], "--quiet", "--no-evidence"] + argv[1:])
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_tap(args)
         return rc, out.getvalue(), err.getvalue(), tc
 
@@ -1212,7 +1277,7 @@ class AmbiguousTapTests(OfflineTestCase):
         self.allow("wake_async")
         self.allow("ui_dump", return_value=ET.fromstring(AMBI_XML))
         self.allow("tap_center")
-        args = self.parse(["tap", "--json", "OK"])
+        args = self.parse(["tap", "--json", "--no-evidence", "OK"])
         with self.cap() as (out, err):
             rc = pc.cmd_tap(args)
         self.assertEqual(rc, 1)
@@ -1313,15 +1378,16 @@ class SnapTests(OfflineTestCase):
         self.allow("wake_async")
         self.allow("ui_dump", return_value=ET.fromstring(AMBI_XML))
         tc = self.allow("tap_center")
-        args = self.parse(["tap", "@e2"])
-        with self.cap() as (out, err):
+        self.allow("u2sock", return_value="100")
+        args = self.parse(["tap", "--quiet", "@e2"])
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_tap(args)
         self.assertEqual(rc, 0)
         tc.assert_called_once_with(650, 450)  # Cancel button coords
         self.assertIn("@e2", out.getvalue())
 
     def test_tap_stale_snap_fails(self):
-        args = self.parse(["tap", "@e1"])
+        args = self.parse(["tap", "--no-evidence", "@e1"])
         with self.cap() as (out, err):
             rc = pc.cmd_tap(args)
         self.assertEqual(rc, 1)
@@ -1913,12 +1979,14 @@ class SetupWizardTests(OfflineTestCase):
         self.assertEqual(rc, 0)
 
     def test_pair_needs_code_ip_port(self):
+        self.allow("adb", return_value=SimpleNamespace(returncode=1, stdout="", stderr=""))
         with self.cap() as (out, err):
             rc = pc.cmd_setup(_setup_args(step="pair"))
         self.assertEqual(rc, 1)
         self.assertIn("--code", err.getvalue())
 
     def test_pair_rejects_bad_code(self):
+        self.allow("adb", return_value=SimpleNamespace(returncode=1, stdout="", stderr=""))
         with self.cap():
             rc = pc.cmd_setup(_setup_args(step="pair", code="abc",
                                           ip="100.0.0.1", pair_port="1234"))
@@ -2029,6 +2097,7 @@ class FastPathTests(OfflineTestCase):
     def test_tap_uses_mux_and_skips_adb(self):
         self.unguard("tap_center")
         self.allow("wake")
+        self.allow("scrcpy_send", side_effect=RuntimeError("no scrcpy helper"))
         u2 = self.allow("u2sock", return_value="")
         adb = self.allow("adb_or_ensure")
         pc.tap_center(10, 20)
@@ -2038,6 +2107,7 @@ class FastPathTests(OfflineTestCase):
     def test_tap_falls_back_to_adb_when_mux_unreached(self):
         self.unguard("tap_center")
         self.allow("wake")
+        self.allow("scrcpy_send", side_effect=RuntimeError("no scrcpy helper"))
         self.allow("u2sock", return_value=None)
         self.allow("_u2_status", new="unsent")
         adb = self.allow("adb_or_ensure")
@@ -2048,6 +2118,7 @@ class FastPathTests(OfflineTestCase):
     def test_tap_lost_reply_does_not_tap_again(self):
         self.unguard("tap_center")
         self.allow("wake")
+        self.allow("scrcpy_send", side_effect=RuntimeError("no scrcpy helper"))
         self.allow("u2sock", return_value=None)
         self.allow("_u2_status", new="lost")
         adb = self.allow("adb_or_ensure")
@@ -2059,6 +2130,7 @@ class FastPathTests(OfflineTestCase):
     def test_tap_old_mux_without_command_uses_adb(self):
         self.unguard("tap_center")
         self.allow("wake")
+        self.allow("scrcpy_send", side_effect=RuntimeError("no scrcpy helper"))
         self.allow("u2sock", return_value=None)
         self.allow("_u2_status", new="err unknown command: tap")
         adb = self.allow("adb_or_ensure")
@@ -2091,8 +2163,9 @@ class FastPathTests(OfflineTestCase):
             stderr="", returncode=0))
         self.allow("u2_invalidate")
         self.allow("nav_record")
-        with self.cap() as (out, err):
-            rc = pc.cmd_start(SimpleNamespace(package="com.example"))
+        self.allow("u2sock", return_value="100")  # the quiet wait after a launch
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_start(SimpleNamespace(package="com.example", quiet=True))
         self.assertEqual(rc, 0)
         self.assertEqual(adb.call_count, 1)
         self.assertIn("monkey -p 'com.example'", adb.call_args[0][1])
@@ -2110,21 +2183,49 @@ class FastPathTests(OfflineTestCase):
         u2.assert_not_called()
         adb.assert_not_called()
 
-    def test_plain_scroll_via_scrcpy_checks_app_after_each_swipe(self):
+    def test_plain_scroll_via_scrcpy_reads_once_and_catches_leaving_the_app(self):
         self.allow("wake")
         self.allow("u2_invalidate")
-        replies = iter(["1080 2400 com.example", "1080 2400 com.example",
-                        "1080 2400 com.android.launcher"])
-        self.allow("u2sock", side_effect=lambda *a, **k: next(replies))
+        # The app in front is asked the same way before and after the
+        # swipes (the active window), never compared with a read's
+        # majority package: another app's dialog in front would differ.
+        screens = iter(["1080 2400 com.example", "1080 2400 com.android.launcher"])
+
+        def u2(cmd, arg="", timeout=30):
+            return next(screens) if cmd == "screen" else "400"
+        u2sock = self.allow("u2sock", side_effect=u2)
         sc = self.allow("scrcpy_send", return_value=True)
         adb = self.allow("adb_or_ensure")
+        dump = self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
-            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=3, to=None))
+            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=3, to=None,
+                                               quiet=False))
         self.assertEqual(rc, 1)
-        self.assertEqual(sc.call_count, 2)
+        self.assertEqual(sc.call_count, 3)
         sc.assert_called_with("swipe 540 1920 540 480 250")
         adb.assert_not_called()
+        self.assertEqual(dump.call_count, 1)  # one read, after the swipes
+        self.assertEqual([c[0][0] for c in u2sock.call_args_list],
+                         ["screen", "screen", "idle"])
         self.assertIn("scroll left com.example", err.getvalue())
+        self.assertIn("screen: com.example", out.getvalue())
+
+    def test_plain_scroll_via_scrcpy_prints_the_screen(self):
+        self.allow("wake")
+        self.allow("u2_invalidate")
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30:
+                   "1080 2400 com.example" if cmd == "screen" else "400")
+        sc = self.allow("scrcpy_send", return_value=True)
+        self.allow("adb_or_ensure")
+        self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to=None,
+                                               quiet=False))
+        self.assertEqual(rc, 0)
+        self.assertEqual(sc.call_count, 1)
+        self.assertIn("scrolled down x1", out.getvalue())
+        self.assertIn("screen: com.example", out.getvalue())
+        self.assertIn("Hello (300,250)", out.getvalue())
 
     def test_plain_scroll_one_adb_call_and_no_dump(self):
         self.allow("wake")
@@ -2135,7 +2236,8 @@ class FastPathTests(OfflineTestCase):
         adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(
             stdout=focus + "@@burner@@\n@@burner@@\n" + focus, stderr="", returncode=0))
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
-            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to=None))
+            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to=None,
+                                               quiet=True))
         self.assertEqual(rc, 0)
         dump.assert_not_called()
         self.assertEqual(adb.call_count, 1)
@@ -2151,7 +2253,8 @@ class FastPathTests(OfflineTestCase):
         self.allow("adb_or_ensure", return_value=SimpleNamespace(
             stdout=out_txt, stderr="", returncode=0))
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
-            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=3, to=None))
+            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=3, to=None,
+                                               quiet=True))
         self.assertEqual(rc, 1)
         self.assertIn("scroll left com.example", err.getvalue())
 
@@ -2167,6 +2270,384 @@ class FastPathTests(OfflineTestCase):
         self.assertEqual(adb.call_count, 2)
         self.assertIn("KEYCODE_HOME", adb.call_args[0][1])
         self.assertIn("com.android.vending is still open", err.getvalue())
+
+
+# --------------------------------- 12. the screen printed after an action
+
+SCREEN_XML = """<hierarchy rotation="0">
+  <node text="" class="android.widget.FrameLayout" package="com.android.systemui" bounds="[0,0][1080,120]" clickable="false" enabled="true" focused="false" checked="false">
+    <node text="4:05" class="android.widget.TextView" package="com.android.systemui" bounds="[40,20][120,100]" clickable="false" enabled="true" focused="false" checked="false"/>
+  </node>
+  <node text="" class="android.widget.FrameLayout" package="com.example" bounds="[0,120][1080,2400]" clickable="false" enabled="true" focused="false" checked="false">
+    <node text="" class="android.widget.LinearLayout" package="com.example" bounds="[0,200][1080,400]" clickable="true" enabled="true" focused="false" checked="false">
+      <node text="Connected devices" class="android.widget.TextView" package="com.example" bounds="[100,250][600,350]" clickable="false" enabled="true" focused="false" checked="false"/>
+    </node>
+    <node text="" content-desc="Bluetooth" class="android.widget.Switch" package="com.example" bounds="[900,250][1050,350]" clickable="true" enabled="true" focused="false" checked="true" checkable="true"/>
+    <node text="" content-desc="Open" class="android.view.View" package="com.example" bounds="[800,500][1000,600]" clickable="true" enabled="true" focused="false" checked="false">
+      <node text="Open" class="android.widget.TextView" package="com.example" bounds="[820,510][980,590]" clickable="false" enabled="true" focused="false" checked="false"/>
+    </node>
+    <node text="" content-desc="Vinted: Shop &amp; sell&#10;Installed&#10;" class="android.view.View" package="com.example" bounds="[0,700][1080,900]" clickable="false" enabled="true" focused="false" checked="false"/>
+    <node text="" class="android.widget.EditText" package="com.example" bounds="[100,1000][900,1100]" clickable="true" enabled="true" focused="true" checked="false"/>
+    <node text="" content-desc="More options" class="android.widget.ImageButton" package="com.example" bounds="[980,1000][1060,1080]" clickable="true" enabled="true" focused="false" checked="false"/>
+    <node text="" class="android.view.View" package="com.example" bounds="[980,1200][1060,1280]" clickable="true" enabled="true" focused="false" checked="false"/>
+  </node>
+  <node text="" class="android.widget.FrameLayout" package="com.google.android.inputmethod.latin" bounds="[0,1500][1080,2400]" clickable="false" enabled="true" focused="false" checked="false">
+    <node text="" content-desc="q" class="android.widget.FrameLayout" package="com.google.android.inputmethod.latin" bounds="[0,1600][100,1700]" clickable="true" enabled="true" focused="false" checked="false"/>
+    <node text="" content-desc="w" class="android.widget.FrameLayout" package="com.google.android.inputmethod.latin" bounds="[100,1600][200,1700]" clickable="true" enabled="true" focused="false" checked="false"/>
+  </node>
+</hierarchy>"""
+
+
+class ScreenRowsTests(OfflineTestCase):
+    def rows(self, xml=SCREEN_XML):
+        root = ET.fromstring(xml)
+        pc._update_screen_from_dump(root)
+        return pc.screen_lines(pc.walk(root), 1080, 2400)
+
+    def test_status_bar_and_keyboard_left_out(self):
+        lines, keyboard = self.rows()
+        self.assertTrue(keyboard)
+        text = "\n".join(lines)
+        self.assertNotIn("4:05", text)
+        self.assertNotIn("[q]", text)
+        self.assertNotIn("[w]", text)
+
+    def test_one_row_per_control(self):
+        lines, _ = self.rows()
+        # the row container has no words of its own: its child is the row
+        self.assertEqual([l for l in lines if "Connected devices" in l],
+                         ["Connected devices (350,300)"])
+        # a control drawn twice is one row
+        self.assertEqual(len([l for l in lines if "Open" in l]), 1)
+        self.assertIn("[Open] (click) (900,550)", lines)
+
+    def test_switch_state_field_and_icon(self):
+        lines, _ = self.rows()
+        self.assertIn("[Bluetooth] (click,on) [Switch] (975,300)", lines)
+        self.assertIn("[text field] (click,focused) [EditText] (500,1050)", lines)
+        self.assertIn("[More options] (click) [ImageButton] (1020,1040)", lines)
+        # an icon-sized button with no words at all still shows (snap taps it)
+        self.assertIn("(click) (1020,1240)", lines)
+
+    def test_description_whitespace_collapsed(self):
+        lines, _ = self.rows()
+        self.assertIn("[Vinted: Shop & sell Installed] (540,800)", lines)
+
+    def test_app_in_front_ignores_keyboard(self):
+        root = ET.fromstring(SCREEN_XML)
+        self.assertEqual(pc.dump_package(root), "com.example")
+
+    def test_print_screen_header_and_cap(self):
+        root = ET.fromstring(SCREEN_XML)
+        with self.cap() as (out, err):
+            pc.print_screen(root, cap=2)
+        text = out.getvalue()
+        self.assertTrue(text.startswith("screen: com.example (keyboard open)\n"))
+        self.assertIn("more rows", text)
+
+    def test_read_after_waits_then_reads_fresh(self):
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append((cmd, arg))
+            return "500"
+        self.allow("u2sock", side_effect=u2)
+        dump = self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            pc.read_after()
+        self.assertEqual(calls, [("idle", "2000")])
+        dump.assert_called_once_with(fresh=True)
+        self.assertIn("screen: com.example", out.getvalue())
+
+    def test_read_after_rereads_a_half_drawn_screen(self):
+        self.allow("u2sock", return_value="100")
+        empty = ET.fromstring('<hierarchy rotation="0"></hierarchy>')
+        dump = self.allow("ui_dump", side_effect=[empty, ET.fromstring(SAMPLE_XML)])
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            pc.read_after()
+        self.assertEqual(dump.call_count, 2)
+        self.assertIn("screen: com.example", out.getvalue())
+
+    def test_looks_half_drawn(self):
+        self.assertTrue(pc.looks_half_drawn(0, None))
+        self.assertTrue(pc.looks_half_drawn(2, 20))
+        self.assertFalse(pc.looks_half_drawn(3, 20))   # a search box and its keyboard
+        self.assertFalse(pc.looks_half_drawn(2, 8))    # a small screen before too
+        self.assertFalse(pc.looks_half_drawn(6, 20))
+        self.assertFalse(pc.looks_half_drawn(3, None))
+
+    def test_quiet_still_waits_for_the_ui(self):
+        calls = []
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30: calls.append(cmd) or "100")
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            pc.read_after(quiet=True)
+        self.assertEqual(calls, ["idle"])
+        self.assertEqual(out.getvalue(), "")
+
+    def test_read_after_quiet_reads_nothing(self):
+        self.allow("u2sock", return_value="100")
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            pc.read_after(quiet=True)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_read_after_never_fails_the_action(self):
+        self.allow("u2sock", return_value=None)
+        self.allow("ui_dump", side_effect=RuntimeError("uiautomator dump kept coming back empty"))
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            pc.read_after()
+        self.assertIn("couldn't read the screen afterwards", err.getvalue())
+
+    def test_tap_prints_the_screen_it_ends_on(self):
+        self.allow("wake_async", return_value=mock.Mock())
+        self.allow("ui_dump", side_effect=[ET.fromstring(TAP_XML),
+                                            ET.fromstring(SAMPLE_XML)])
+        self.allow("tap_center")
+        self.allow("u2sock", return_value="300")
+        args = self.parse(["tap", "Not now"])
+        with self.cap() as (out, err):
+            rc = pc.cmd_tap(args)
+        self.assertEqual(rc, 0)
+        self.assertIn("tapped Not now", out.getvalue())
+        self.assertIn("screen: com.example", out.getvalue())
+        self.assertIn("OK (click) [Button]", out.getvalue())
+
+    def test_tap_quiet_skips_the_read(self):
+        self.allow("wake_async", return_value=mock.Mock())
+        dump = self.allow("ui_dump", return_value=ET.fromstring(TAP_XML))
+        self.allow("tap_center")
+        self.allow("u2sock", return_value="100")  # quiet: the wait, no read
+        args = self.parse(["tap", "--quiet", "Not now"])
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_tap(args)
+        self.assertEqual(rc, 0)
+        self.assertEqual(dump.call_count, 1)
+        self.assertNotIn("screen:", out.getvalue())
+
+    def test_do_reads_only_after_the_last_step(self):
+        seen = []
+
+        def fake(ns):
+            seen.append(getattr(ns, "quiet", None))
+            return 0
+        ap = pc.build_parser()
+        with mock.patch.object(pc, "build_parser", return_value=ap):
+            for name in ("press", "tap", "start"):
+                ap._subparsers._group_actions[0].choices[name].set_defaults(fn=fake)
+            with self.cap():
+                rc = pc.cmd_do(SimpleNamespace(flow="press BACK; tap X; start com.a"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen, [True, True, False])
+
+    def test_log_line_masks_typed_text(self):
+        line = pc.log_line(["type", "secret words", "--field", "Search"], 1234.5, 0)
+        self.assertNotIn("secret", line)
+        self.assertIn("burner type '…' --field Search", line)
+        self.assertIn("1234ms exit 0", line)
+        self.assertIn("tap 'Not now'", pc.log_line(["tap", "Not now"], 10, 1))
+
+
+# --------------------------------- 13. review fixes: typing, log, branch
+
+class TypingSafetyTests(OfflineTestCase):
+    def _args(self, **kw):
+        base = dict(text="hello", field=None, clear=False, clear_keys=20,
+                    unicode=False, ascii=False, slow=False, quiet=True)
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def test_lost_set_text_is_not_typed_again(self):
+        self.allow("u2_invalidate")
+        self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
+        sc = self.allow("scrcpy_send", return_value=True)
+
+        def u2(cmd, arg="", timeout=30):
+            pc._u2_status = "lost"
+            return None
+        self.allow("u2sock", side_effect=u2)
+        with self.cap() as (out, err):
+            rc = pc.cmd_type(self._args())
+        self.assertEqual(rc, 1)
+        sc.assert_not_called()
+        self.assertIn("didn't confirm the typing", err.getvalue())
+
+    def test_no_focused_field_falls_back_to_keys_and_says_so(self):
+        self.allow("u2_invalidate")
+        sc = self.allow("scrcpy_send", return_value=True)
+
+        def u2(cmd, arg="", timeout=30):
+            pc._u2_status = "err no editable field found (no field has the focus)"
+            return None
+        self.allow("u2sock", side_effect=u2)
+        with self.cap() as (out, err):
+            rc = pc.cmd_type(self._args())
+        self.assertEqual(rc, 0)
+        self.assertEqual([c[0][0] for c in sc.call_args_list], ["text hello"])
+        self.assertIn("no text field had the focus", out.getvalue())
+        self.assertIn("added to the field", out.getvalue())
+
+    def test_lost_field_tap_is_not_tapped_again(self):
+        tc = self.allow("tap_center")
+
+        def u2(cmd, arg="", timeout=30):
+            pc._u2_status = "lost"
+            return None
+        self.allow("u2sock", side_effect=u2)
+        self.assertEqual(pc.focus_field("Search"), "unsure")
+        tc.assert_not_called()
+
+    def test_missing_field(self):
+        self.allow("u2sock", return_value=pc.U2_NOT_FOUND)
+        self.assertEqual(pc.focus_field("Search"), "missing")
+
+    def test_type_keys_resumes_with_adb_after_scrcpy_stops(self):
+        adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(
+            returncode=0, stdout="", stderr=""))
+        sent = []
+
+        def sc(line):
+            sent.append(line)
+            if line == "key 66":
+                raise RuntimeError("gone")
+            return True
+        self.allow("scrcpy_send", side_effect=sc)
+        with self.cap():
+            pc.type_keys("abc\ndef")
+        self.assertEqual(sent, ["text abc", "key 66"])
+        self.assertEqual([c[0] for c in adb.call_args_list],
+                         [("shell", "input", "keyevent", "66"),
+                          ("shell", "input", "text", "def")])
+
+    def test_type_keys_spaces_at_the_ends_go_as_keys(self):
+        sc = self.allow("scrcpy_send", return_value=True)
+        pc.type_keys(" hi  ")
+        self.assertEqual([c[0][0] for c in sc.call_args_list],
+                         ["key 62", "text hi", "key 62", "key 62"])
+
+
+class CommandLogTests(OfflineTestCase):
+    def test_type_arguments_masked_in_any_order(self):
+        line = pc.log_line(["type", "--field", "Password", "hunter2"], 10, 0)
+        self.assertNotIn("hunter2", line)
+        self.assertIn("type --field Password '…'", line)
+        line = pc.log_line(["type", "--clear", "s3cret"], 10, 0)
+        self.assertNotIn("s3cret", line)
+        self.assertIn("type --clear '…'", line)
+        line = pc.log_line(["type", "--", "--starts-with-dashes"], 10, 0)
+        self.assertNotIn("starts-with", line)
+
+    def test_long_labels_still_deduplicated(self):
+        long = "x" * 200
+        root = ET.fromstring(SCREEN_XML.replace('content-desc="Open"', 'content-desc="%s"' % long)
+                             .replace('text="Open"', 'text="%s"' % long))
+        pc._update_screen_from_dump(root)
+        lines, _ = pc.screen_lines(pc.walk(root), 1080, 2400)
+        self.assertEqual(len([l for l in lines if "xxxx" in l]), 1)
+
+    def test_do_flow_and_pairing_code_masked(self):
+        line = pc.log_line(["do", "tap Password; type hunter2; press ENTER"], 10, 0)
+        self.assertNotIn("hunter2", line)
+        self.assertIn("type …", line)
+        self.assertIn("press ENTER", line)
+        line = pc.log_line(["setup", "--step", "pair", "--code", "123456", "--ip", "100.1.2.3"], 10, 0)
+        self.assertNotIn("123456", line)
+        self.assertIn("--ip 100.1.2.3", line)
+
+
+class BranchInstallTests(OfflineTestCase):
+    def test_install_ref_reads_the_marker(self):
+        d = tempfile.mkdtemp()
+        with mock.patch.object(pc, "ROOT", d):
+            self.assertEqual(pc.install_ref(), "master")
+            with open(os.path.join(d, ".burner-ref"), "w") as f:
+                f.write("fast\n")
+            self.assertEqual(pc.install_ref(), "fast")
+            with open(os.path.join(d, ".burner-ref"), "w") as f:
+                f.write("bad ref;rm\n")
+            self.assertEqual(pc.install_ref(), "master")
+
+    def test_skill_path_follows_the_branch(self):
+        d = tempfile.mkdtemp()
+        with mock.patch.object(pc, "ROOT", d):
+            with open(os.path.join(d, ".burner-ref"), "w") as f:
+                f.write("fast")
+            self.assertTrue(pc.skill_path().endswith("SKILL.md"))
+            with open(os.path.join(d, "SKILL-fast.md"), "w") as f:
+                f.write("# fast")
+            self.assertTrue(pc.skill_path().endswith("SKILL-fast.md"))
+
+    def test_version_names_the_branch(self):
+        with mock.patch.object(pc, "build_commit", return_value="abcdef1234"), \
+                mock.patch.object(pc, "install_ref", return_value="fast"):
+            with self.cap() as (out, err):
+                pc.cmd_version(self.parse(["version"]))
+            self.assertIn("burner abcdef1 on branch fast", out.getvalue())
+            with self.cap() as (out, err):
+                pc.cmd_version(self.parse(["version", "--json"]))
+            self.assertEqual(json.loads(out.getvalue())["ref"], "fast")
+
+    def test_update_fails_loudly_on_a_bad_download(self):
+        run = self.allow("subprocess")
+        run.run.return_value = SimpleNamespace(returncode=22)
+        with mock.patch.object(pc, "install_ref", return_value="fast"), \
+                mock.patch.object(pc, "_stop_helper_daemons") as stop:
+            with self.cap() as (out, err):
+                rc = pc.cmd_update(self.parse(["update"]))
+        self.assertEqual(rc, 22)
+        stop.assert_not_called()
+        self.assertIn("update failed", err.getvalue())
+        cmd = run.run.call_args[0][0]
+        self.assertIn("pipefail", cmd[2])
+        self.assertIn("fast/docs/install.sh", cmd[-1])
+
+
+SYSTEM_DIALOG_XML = """<hierarchy rotation="0">
+  <node text="" class="android.widget.FrameLayout" package="com.android.systemui" bounds="[0,0][1080,120]" clickable="false" enabled="true" focused="false" checked="false">
+    <node text="4:05" class="android.widget.TextView" package="com.android.systemui" bounds="[40,20][120,100]" clickable="false" enabled="true" focused="false" checked="false"/>
+  </node>
+  <node text="Hello" class="android.widget.TextView" package="com.example" bounds="[100,300][500,400]" clickable="false" enabled="true" focused="false" checked="false"/>
+  <node text="" class="android.widget.FrameLayout" package="com.android.systemui" bounds="[100,900][980,1500]" clickable="false" enabled="true" focused="false" checked="false">
+    <node text="Start recording or casting?" class="android.widget.TextView" package="com.android.systemui" bounds="[150,950][930,1050]" clickable="false" enabled="true" focused="false" checked="false"/>
+    <node text="Start now" class="android.widget.Button" package="com.android.systemui" bounds="[600,1300][930,1400]" clickable="true" enabled="true" focused="false" checked="false"/>
+  </node>
+  <node text="" content-desc="Back" class="android.widget.ImageView" package="com.android.systemui" bounds="[100,2300][200,2380]" clickable="true" enabled="true" focused="false" checked="false"/>
+</hierarchy>"""
+
+
+class SystemDialogRowsTests(OfflineTestCase):
+    def test_system_dialog_rows_stay_bars_go(self):
+        root = ET.fromstring(SYSTEM_DIALOG_XML)
+        pc._update_screen_from_dump(root)
+        lines, _ = pc.screen_lines(pc.walk(root), 1080, 2400)
+        text = "\n".join(lines)
+        self.assertIn("Start recording or casting?", text)
+        self.assertIn("Start now (click) [Button]", text)
+        self.assertNotIn("4:05", text)
+        self.assertNotIn("[Back]", text)
+
+    def test_system_ui_only_screen_says_so(self):
+        xml = SYSTEM_DIALOG_XML.replace('package="com.example"', 'package="com.android.systemui"')
+        with self.cap() as (out, err):
+            pc.print_screen(ET.fromstring(xml))
+        self.assertIn("screen: system UI", out.getvalue())
+
+    def test_unchanged_screen_is_reported(self):
+        same = ET.fromstring(SAMPLE_XML)
+        self.allow("u2sock", return_value="100")
+        dump = self.allow("ui_dump", return_value=same)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            pc.read_after(prev_root=ET.fromstring(SAMPLE_XML))
+        self.assertEqual(dump.call_count, 3)
+        self.assertIn("screen: com.example (unchanged)", out.getvalue())
+
+    def test_dismiss_reports_what_closed_even_if_the_read_fails(self):
+        self.allow("tap_center")
+        self.allow("u2sock", return_value=None)
+        self.allow("ui_dump", side_effect=[ET.fromstring(TAP_XML), RuntimeError("gone")])
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_dismiss(self.parse(["dismiss"]))
+        self.assertEqual(rc, 0)
+        self.assertIn("closed: Not now", out.getvalue())
+        self.assertIn("couldn't read the screen afterwards", err.getvalue())
 
 
 if __name__ == "__main__":

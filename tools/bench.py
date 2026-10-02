@@ -29,6 +29,11 @@ SHOT = os.path.join(tempfile.gettempdir(), "burner-bench.jpg")
 # (name, argv). Order matters: start Settings before tapping in it. Each
 # pass begins with Settings closed (untimed), so `start` and the search tap
 # measure the same thing every pass.
+#
+# An action prints the screen it ends on, so its row is what an assistant
+# pays for one step (the action, the wait for the screen to settle, and
+# the read). The "(quiet)" rows are the bare action, for comparison with
+# the history from before Oct 2, when every action was bare.
 COMMANDS = [
     ("help", ["--help"]),
     ("status", ["status"]),
@@ -41,10 +46,15 @@ COMMANDS = [
     ("start", ["start", "com.android.settings"]),
     ("scroll down", ["scroll", "down"]),
     ("scroll up", ["scroll", "up"]),
-    # Last: on Pixels search is its own app and one BACK only hides its
-    # keyboard, so a scroll after this would rightly stop ("left Settings").
+    # On Pixels search is its own app: the first BACK only hides its
+    # keyboard, the second leaves it, so a scroll after the tap would
+    # rightly stop ("left Settings").
     ("tap", ["tap", "Search settings || Search"]),
+    ("type", ["type", "wifi"]),
     ("back", ["press", "BACK"]),
+    ("back 2", ["press", "BACK"]),
+    ("tap (quiet)", ["tap", "--quiet", "Search settings || Search"]),
+    ("back (quiet)", ["press", "--quiet", "BACK"]),
 ]
 
 

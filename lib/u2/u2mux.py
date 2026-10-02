@@ -162,7 +162,13 @@ class KeepAliveHTTP:
                 print_request=False):
         import http.client
         from uiautomator2.core import HTTPResponse, HTTPError
-        headers = {'User-Agent': 'uiautomator2', 'Accept-Encoding': '',
+        # The on-phone server gzips its JSON when asked: a screen read's
+        # 50-150KB crosses the link as 5-15KB (it matters on a slow link).
+        # Not for a screenshot: its base64 JPEG barely shrinks, and the
+        # phone pays for compressing it (shot went from 0.37s to 0.6s).
+        shot = isinstance(data, dict) and data.get("method") == "takeScreenshot"
+        headers = {'User-Agent': 'uiautomator2',
+                   'Accept-Encoding': '' if shot else 'gzip',
                    'Content-Type': 'application/json'}
         body = json.dumps(data) if data else None
         key = (dev.serial, port)
@@ -201,6 +207,13 @@ class KeepAliveHTTP:
                     ent[1] = _time.monotonic()
                 if resp.status != 200:
                     raise HTTPError("HTTP request failed: %s %s" % (resp.status, resp.reason))
+                if (resp.getheader("Content-Encoding") or "").lower() == "gzip":
+                    import gzip
+                    import zlib
+                    try:
+                        content = gzip.decompress(content)
+                    except (OSError, EOFError, zlib.error) as e:
+                        log("gzip reply couldn't be decoded (%s); using it as is" % e)
                 return HTTPResponse(content)
 
 
@@ -492,10 +505,16 @@ class U2Daemon:
                 if not el.exists:
                     el = None
             if el is None:
-                # prefer the focused EditText, else the first enabled one
+                # The focused EditText; with none focused, only a screen
+                # with exactly one field is unambiguous (a login form).
+                # Never "the first one" (it was Chrome's address bar once).
                 el = self.d(focused=True, className="android.widget.EditText")
                 if not el.exists:
-                    el = self.d(className="android.widget.EditText", enabled=True)
+                    fields = self.d(className="android.widget.EditText", enabled=True)
+                    if fields.count != 1:
+                        raise RuntimeError("no editable field found (no field has "
+                                           "the focus)")
+                    el = fields
             if not el.exists:
                 raise RuntimeError("no editable field found")
             el.set_text(p["text"])

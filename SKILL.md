@@ -236,6 +236,7 @@ Health and upkeep
   burner setup                      phone setup (see Setup)
   burner update [recipes]           update burner, or only its built-in recipes
   burner version                    this build and its skill rev (compare with the Skill rev line at the top of useburner.si/skill.md)
+  burner log                        the last commands run, how long each took and how it ended
   burner uninstall [--yes]          undo the phone changes setup made (lists them without --yes)
 ```
 

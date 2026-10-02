@@ -245,11 +245,12 @@ def live_screen_dims():
 
 
 def dump_package(root):
-    """Package of the app on screen (ignoring the status bar), or None."""
+    """Package of the app on screen (ignoring the status bar and an open
+    keyboard, whose keys can outnumber the app's rows), or None."""
     counts = {}
     for n in root.iter("node"):
         pkg = n.attrib.get("package", "")
-        if pkg and pkg != "com.android.systemui":
+        if pkg and pkg != "com.android.systemui" and not is_ime_package(pkg):
             counts[pkg] = counts.get(pkg, 0) + 1
     return max(counts, key=counts.get) if counts else None
 
@@ -492,10 +493,22 @@ def fast_dump(fresh=False):
     if xml and ("<hierarchy" in xml or "<?xml" in xml):
         try:
             root = ET.fromstring(xml)
-            _update_screen_from_dump(root)
-            return root
         except ET.ParseError:
-            pass
+            return None
+        if root.find("node") is None and not fresh:
+            # The first read after the helper's server (re)starts can be
+            # empty. Don't keep it (the helper would hand it out for 2s):
+            # drop it and read again.
+            u2sock("invalidate", timeout=5)
+            time.sleep(0.5)
+            xml = u2sock("dump", "fresh", timeout=40)
+            _trace("empty read, read again")
+            try:
+                root = ET.fromstring(xml) if xml else root
+            except ET.ParseError:
+                pass
+        _update_screen_from_dump(root)
+        return root
     return None
 
 
@@ -545,7 +558,11 @@ def walk(root):
             "enabled": node.attrib.get("enabled") != "false",
             "focused": node.attrib.get("focused") == "true",
             "checked": node.attrib.get("checked") == "true",
+            "checkable": node.attrib.get("checkable") == "true",
+            "selected": node.attrib.get("selected") == "true",
+            "package": node.attrib.get("package", ""),
             "parents": list(parents),
+            "elem": node,
         })
         for ch in node:
             rec(ch, parents + [node])
@@ -877,6 +894,240 @@ def visible_lines(nodes, include_all=False):
             if compact_visible(n, include_all)
             # drop the <hierarchy> root itself (no class/label/clickable)
             and (n["class"] or node_label(n) or n["clickable"])]
+
+
+# ------------------------------------------------- the screen after an action
+
+SYSTEM_UI_PKG = "com.android.systemui"
+IME_HINTS = ("inputmethod", "keyboard", "honeyboard", "swiftkey", ".ime.",
+             "latinime")
+
+
+def is_ime_package(pkg):
+    """True for a keyboard app's package (Gboard, Samsung, SwiftKey...)."""
+    p = (pkg or "").lower()
+    return any(h in p for h in IME_HINTS)
+
+
+# Classes worth naming on a row. A TextView or a layout says nothing an
+# assistant acts on; a Button, a field, a switch or a tab does.
+TELLING_CLASSES = ("Button", "EditText", "Switch", "CheckBox", "Radio",
+                   "Spinner", "SeekBar", "Toggle", "WebView", "Tab", "Image",
+                   "Chip", "Slider")
+LABEL_MAX = 120
+
+
+def _row_words(n):
+    """A node's own words: its text, else its content description, with
+    runs of whitespace (newlines inside a description) collapsed."""
+    return " ".join((n.get("text") or n.get("desc") or "").split())
+
+
+def _in_system_bars(r, h):
+    """True for a node that sits in the status bar or the navigation bar."""
+    return r[3] <= 0.07 * h or r[1] >= 0.93 * h
+
+
+def _has_labelled_child(n, nodes, i):
+    """True if a later node inside n carries words (n's words are then
+    its child's, and one row is enough)."""
+    elem = n.get("elem")
+    for m in nodes[i + 1:]:
+        if not any(p is elem for p in m.get("parents", ())):
+            break  # walk() is depth first: the rest are outside n too
+        if _row_words(m):
+            return True
+    return False
+
+
+def screen_lines(nodes, w, h):
+    """The rows an assistant needs to decide its next step, in screen
+    order, one per control: labelled rows, text fields, switches with
+    their state, and small unlabelled buttons, of the app in front. The
+    status bar and the keyboard's keys are left out (an open keyboard is
+    one word), and an unlabelled row or container is left out because its
+    words are its children's.
+    Returns (lines, keyboard_open). Pure function: no adb, unit-testable."""
+    lines, keyboard = [], False
+    prev_words, prev_rect = None, None
+    for i, n in enumerate(nodes):
+        pkg = n.get("package") or ""
+        r = _bounds_rect(n.get("bounds"))
+        if pkg == SYSTEM_UI_PKG and (r is None or _in_system_bars(r, h)):
+            continue  # status bar and nav bar; a system dialog's rows stay
+        if is_ime_package(pkg):
+            keyboard = True
+            continue
+        words = _row_words(n)
+        short = (n.get("class") or "").split(".")[-1]
+        field = short.endswith("EditText")
+        if not words and not field:
+            if not n.get("clickable") or not r:
+                continue
+            # keep an icon-sized button with no words of its own; drop a
+            # row or a container, and anything whose words are a child's
+            if (r[2] - r[0]) > 0.25 * w or (r[3] - r[1]) > 0.08 * h:
+                continue
+            if _has_labelled_child(n, nodes, i):
+                continue
+        # The same control drawn twice (Play Store's Open is a View
+        # described "Open" over a TextView reading "Open").
+        if words and words == prev_words and r and prev_rect:
+            cx, cy = (r[0] + r[2]) // 2, (r[1] + r[3]) // 2
+            if prev_rect[0] <= cx <= prev_rect[2] and prev_rect[1] <= cy <= prev_rect[3]:
+                continue
+        flags = []
+        if n.get("clickable"):
+            flags.append("click")
+        if n.get("checkable"):
+            flags.append("on" if n.get("checked") else "off")
+        if n.get("selected"):
+            flags.append("selected")
+        if field and n.get("focused"):
+            flags.append("focused")
+        if not n.get("enabled", True):
+            flags.append("disabled")
+        shown = words[:LABEL_MAX - 1] + "…" if len(words) > LABEL_MAX else words
+        if not words:
+            head = "[text field]" if field else ""
+        elif not n.get("text") and n.get("desc"):
+            head = "[" + shown + "]"  # a description, not words on screen
+        else:
+            head = shown
+        if flags:
+            head = (head + " (" + ",".join(flags) + ")").strip()
+        parts = [head] if head else []
+        if any(k in short for k in TELLING_CLASSES):
+            parts.append("[{}]".format(short))
+        cx, cy = n.get("center") or (None, None)
+        parts.append("({},{})".format(cx if cx is not None else "?",
+                                      cy if cy is not None else "?"))
+        lines.append(" ".join(parts))
+        prev_words, prev_rect = words, r
+    return lines, keyboard
+
+
+SCREEN_CAP = 80
+
+
+def print_screen(root, cap=SCREEN_CAP, note=""):
+    """Print the app in front and the screen's rows (see screen_lines).
+    note: a few words about the read ("(unchanged)")."""
+    nodes = walk(root)
+    lines, keyboard = screen_lines(nodes, *screen_dims())
+    app = dump_package(root)
+    if app is None:
+        app = "?"
+        if any(n.get("package") == SYSTEM_UI_PKG for n in nodes):
+            app = "system UI (lock screen, shade or a system dialog)"
+    print("screen: {}{}{}".format(app, " (keyboard open)" if keyboard else "",
+                                  " " + note if note else ""))
+    shown, hidden = lines[:cap], lines[cap:]
+    # Past the cap, keep what a next step needs most: text fields and the
+    # focused row (a form's input and Send sit at the bottom).
+    kept = [line for line in hidden if "[EditText]" in line or "focused" in line]
+    for line in shown + kept:
+        print("  " + line)
+    skipped = len(hidden) - len(kept)
+    if skipped:
+        print("  ... {} more rows (burner dump shows all)".format(skipped))
+
+
+def looks_half_drawn(rows, prev_rows):
+    """True for a read taken mid-transition: nothing on it, or one or two
+    rows where the screen before the action had a dozen. A real screen
+    with a few rows (a search box and its keyboard) is not. Pure."""
+    if rows == 0:
+        return True
+    return prev_rows is not None and prev_rows >= 12 and rows <= 2
+
+
+def settled_read(prev_root=None, idle_ms=2000, delay=0.25):
+    """The screen once an action has landed: a short pause (the action's
+    first events haven't reached the UI yet), then a wait on the phone
+    until the UI goes quiet (half a second with no changes, idle_ms at
+    most), then one fresh read. A read that looks half-drawn (see
+    looks_half_drawn), or that still shows the screen from before the
+    action, is read again twice, 0.4s apart. Returns (root, note): note
+    is "" once the read settled, else "(may still be loading)" or
+    "(unchanged)" to print with the screen."""
+    prev_lines = None
+    if prev_root is not None:
+        prev_lines = screen_lines(walk(prev_root), *screen_dims())[0]
+    prev_rows = None if prev_lines is None else len(prev_lines)
+    time.sleep(delay)
+    if u2sock("idle", str(idle_ms), timeout=idle_ms / 1000.0 + 10) is None:
+        time.sleep(0.5)  # no UI helper: give the screen a moment
+    root = ui_dump(fresh=True)
+    note = ""
+    for attempt in range(3):
+        lines = screen_lines(walk(root), *screen_dims())[0]
+        half = looks_half_drawn(len(lines), prev_rows)
+        same = prev_lines is not None and lines == prev_lines
+        if not half and not same:
+            break
+        if attempt == 2:
+            note = "(may still be loading)" if half else "(unchanged)"
+            break
+        _trace("read {}, reading again".format(
+            "looks half-drawn" if half else "unchanged so far"))
+        time.sleep(0.4)
+        u2sock("idle", "1000", timeout=12)
+        root = ui_dump(fresh=True)
+    return root, note
+
+
+def _disarm_watchdog():
+    """The action is done; the read that follows has its own timeouts, so
+    the command's 60s watchdog mustn't fail it after the fact."""
+    import signal
+    if hasattr(signal, "alarm"):
+        signal.alarm(0)
+
+
+def _report_unreadable(e):
+    """Say on stderr that the screen after an action couldn't be read."""
+    print("couldn't read the screen afterwards ({}); run burner dump".format(
+        str(e)[:80]), file=sys.stderr)
+
+
+def read_after_root(prev_root=None, idle_ms=2000):
+    """settled_read for a caller that prints the screen itself: (root,
+    note), or (None, "") with a line on stderr when the screen can't be
+    read. Never raises."""
+    _disarm_watchdog()
+    try:
+        return settled_read(prev_root, idle_ms=idle_ms)
+    except Exception as e:
+        _report_unreadable(e)
+        return None, ""
+
+
+def settle_only(idle_ms=2000, delay=0.25):
+    """Wait for the action to land and the UI to go quiet, without a
+    read: a chained step (`burner do`) that follows must not read the
+    screen mid-transition. Never raises."""
+    try:
+        time.sleep(delay)
+        u2sock("idle", str(idle_ms), timeout=idle_ms / 1000.0 + 10)
+    except Exception:
+        pass
+
+
+def read_after(quiet=False, idle_ms=2000, prev_root=None):
+    """After an action: wait for the screen to settle, read it once and
+    print it, so the assistant needn't follow the action with a read.
+    With quiet, only the wait. Never fails the action: a screen that can't
+    be read is reported."""
+    if quiet:
+        settle_only(idle_ms=idle_ms)
+        return
+    t0 = time.time()
+    root, note = read_after_root(prev_root, idle_ms=idle_ms)
+    if root is None:
+        return
+    _trace("read after {:.2f}s".format(time.time() - t0))
+    print_screen(root, note=note)
 
 
 def wake():
@@ -1372,11 +1623,15 @@ def cmd_tap(args):
             if isinstance(hit, dict) and hit.get("clicked"):
                 # daemon clicked on-device (exact text, 1 RPC)
                 waker.join()
-                return _tap_ok(args, args.text, None, via="u2")
+                rc = _tap_ok(args, args.text, None, via="u2")
+                read_after(quiet=args.quiet or as_json(args))
+                return rc
             if isinstance(hit, dict) and "x" in hit:
                 xy = (hit["x"], hit["y"])
                 tap_center(*xy, waker=waker)
-                return _tap_ok(args, hit["text"] or hit["desc"] or args.text, xy)
+                rc = _tap_ok(args, hit["text"] or hit["desc"] or args.text, xy)
+                read_after(quiet=args.quiet or as_json(args))
+                return rc
     waker.join()
     root = ui_dump()
     _update_screen_from_dump(root)
@@ -1407,7 +1662,9 @@ def cmd_tap(args):
             return _tap_settled_ok(args, tap_label, (x, y), added, removed, final_fp)
         # No settle: record action taken, destination unknown (no extra round-trip)
         nav_record_action(from_nodes, 'tap "{}"'.format(tap_label), to_fp=None, ok=True)
-        return _tap_ok(args, tap_label, (x, y))
+        rc = _tap_ok(args, tap_label, (x, y))
+        read_after(quiet=args.quiet or as_json(args), prev_root=root)
+        return rc
 
     w, h = _screen_for_tap()
     plan = plan_tap(nodes, w, h, text=args.text, fuzzy=args.fuzzy,
@@ -1435,7 +1692,9 @@ def cmd_tap(args):
         return _tap_settled_ok(args, tap_label, xy, added, removed, final_fp)
     # No settle: record action taken, destination unknown (no extra round-trip)
     nav_record_action(from_nodes, 'tap "{}"'.format(tap_label), to_fp=None, ok=True)
-    return _tap_ok(args, tap_label, xy)
+    rc = _tap_ok(args, tap_label, xy)
+    read_after(quiet=args.quiet or as_json(args), prev_root=root)
+    return rc
 
 
 def nav_record_action(from_nodes, action_desc, to_fp=None, ok=True):
@@ -1507,6 +1766,17 @@ def _wait_gone(args):
     return 0
 
 
+def _print_waited_screen(args):
+    """The screen a wait ended on. The helper's last poll is still cached,
+    so this read costs nothing on the phone."""
+    if getattr(args, "quiet", False) or as_json(args):
+        return
+    try:
+        print_screen(ui_dump())
+    except Exception as e:
+        _report_unreadable(e)
+
+
 def cmd_wait(args):
     # Fast path: the daemon polls (0.25s interval, fresh dump each poll) and
     # returns the matched node — one socket call, no per-poll RPC from here.
@@ -1522,20 +1792,28 @@ def cmd_wait(args):
         except ValueError:
             n = None
         if isinstance(n, dict) and n.get("gone"):
-            return _wait_gone(args)
+            rc = _wait_gone(args)
+            _print_waited_screen(args)
+            return rc
         if isinstance(n, dict) and n.get("found"):
-            return _wait_found(args, n["text"] or n["desc"] or args.text,
-                               n["bounds"], n["enabled"])
+            rc = _wait_found(args, n["text"] or n["desc"] or args.text,
+                             n["bounds"], n["enabled"])
+            _print_waited_screen(args)
+            return rc
     # Legacy path.
     deadline = time.time() + args.timeout
     while True:
         nodes = walk(ui_dump())
         hits = find_nodes(nodes, args.text, exact=not args.fuzzy)
         if args.absent and not hits:
-            return _wait_gone(args)
+            rc = _wait_gone(args)
+            _print_waited_screen(args)
+            return rc
         if not args.absent and hits:
             n = hits[0]
-            return _wait_found(args, n["text"], n["bounds"], n["enabled"], node=n)
+            rc = _wait_found(args, n["text"], n["bounds"], n["enabled"], node=n)
+            _print_waited_screen(args)
+            return rc
         if time.time() > deadline:
             return _wait_fail(args, 'timeout waiting for "{}"'.format(args.text))
         time.sleep(2)
@@ -1645,6 +1923,7 @@ def cmd_type(args):
         use_unicode = True
     else:
         use_unicode = needs_unicode_route(args.text)
+    quiet = getattr(args, "quiet", False)
     if use_unicode:
         nodes = walk(ui_dump())
         xy = None
@@ -1659,63 +1938,154 @@ def cmd_type(args):
                 if n["focused"] and "EditText" in n["class"]:
                     xy = clickable_target(n)
                     break
-        return type_via_adbkeyboard(args.text, xy, clear=args.clear,
-                                    clear_keys=args.clear_keys)
-    # Fast path: atomic ACTION_SET_TEXT via uiautomator2 (one shot, watchers fire).
-    # set_text replaces the field content, so --clear is implicit here.
-    if u2sock("health", timeout=10) is not None:
-        try:
-            nodes = walk(ui_dump())
-            target = None
-            if args.field:
-                hits = find_nodes(nodes, args.field, exact=True)
-                if hits:
-                    target = hits[0]
-            else:
-                for n in nodes:
-                    if n["focused"] and "EditText" in n["class"]:
-                        target = n
-                        break
-            if target is not None:
-                # tap to focus (scrcpy, fast), then atomic set_text on the focused field
-                xy = clickable_target(target)
-                if xy[0] is not None:
-                    tap_center(*xy)
-                    time.sleep(0.6)
-                out = u2sock("set_text", json.dumps({"text": args.text}), timeout=40)
-                if out is not None:
-                    print("typed {} chars (atomic)".format(len(args.text)))
-                    return 0
-                print("u2 set_text failed, falling back to char-by-char", file=sys.stderr)
-            elif args.field:
-                print('field "{}" not found'.format(args.field), file=sys.stderr)
-                return 1
-        except Exception as e:
-            print("fast type failed, falling back: {}".format(e), file=sys.stderr)
-    # Legacy char-by-char path (Bloks/RN-safe).
-    nodes = walk(ui_dump())
+        rc = type_via_adbkeyboard(args.text, xy, clear=args.clear,
+                                  clear_keys=args.clear_keys)
+        read_after(quiet=quiet)
+        return rc
+    # --field: focus the field first. One on-phone click by its label where
+    # the UI helper can (no screen read here), else a read and a tap.
     if args.field:
-        hits = find_nodes(nodes, args.field, exact=True)
-        if not hits:
+        got = focus_field(args.field)
+        if got == "missing":
             print('field "{}" not found'.format(args.field), file=sys.stderr)
             return 1
-        xy = clickable_target(hits[0])
-        tap_center(*xy)
-        time.sleep(0.8)
-    if args.clear:
-        for _ in range(args.clear_keys):
-            adb_or_ensure("shell", "input", "keyevent", "67")
+        if got == "unsure":
+            print("burner: the UI helper didn't confirm the tap on the field, "
+                  "so it isn't tapped again; typing into whatever has the "
+                  "focus now", file=sys.stderr)
         time.sleep(0.5)
-    delay = 0.4 if args.slow else 0.2
-    for ch in args.text:
-        if ch == "\n":
-            adb_or_ensure("shell", "input", "keyevent", "66")
-        else:
-            adb_or_ensure("shell", "input", "text", esc_char(ch))
-        time.sleep(delay)
+    # Fast path: one atomic ACTION_SET_TEXT on the focused field, done by
+    # the UI helper (it finds the field itself, so there is no screen read
+    # first). set_text replaces the content, so --clear is implicit.
+    no_focus = False
+    if not args.slow:
+        out = u2sock("set_text", json.dumps({"text": args.text}), timeout=40)
+        if out is not None:
+            print("typed {} chars".format(len(args.text)))
+            read_after(quiet=quiet)
+            return 0
+        if _u2_status == "lost":
+            # Sent, no reply: the phone may have typed it. Typing again
+            # could put the text in twice.
+            print("burner: the UI helper didn't confirm the typing, so it "
+                  "isn't typed again. Check the field on the screen below.",
+                  file=sys.stderr)
+            read_after(quiet=quiet)
+            return 1
+        if _u2_status.startswith("err"):
+            _trace("set_text: {}".format(_u2_status[:60]))
+            no_focus = "no editable field" in _u2_status
+    # Key events into whatever has the focus: the scrcpy helper's open
+    # connection types a whole string in a few milliseconds; adb's `input
+    # text` is one call per string. Both work in fields that ignore
+    # set_text (web views, some React Native apps), and they add to a
+    # field's content where set_text would replace it.
+    if args.clear:
+        clear_field(args.clear_keys)
+    type_keys(args.text, slow=args.slow)
     u2_invalidate()
-    print("typed {} chars (char-by-char)".format(len(args.text)))
+    how = "key events" if args.clear else "key events, added to the field"
+    if no_focus:
+        how += "; no text field had the focus, so check the screen"
+    print("typed {} chars ({})".format(len(args.text), how))
+    read_after(quiet=quiet)
     return 0
+
+
+def focus_field(label):
+    """Tap the field with this label: "done", "missing", or "unsure" when
+    the UI helper was asked and didn't answer (it may have tapped, so
+    there is no second tap)."""
+    r = u2sock("click_text", label, timeout=20)
+    if r == U2_NOT_FOUND:
+        return "missing"
+    if r is not None:
+        try:
+            hit = json.loads(r)
+        except ValueError:
+            hit = None
+        if isinstance(hit, dict):
+            if hit.get("clicked"):
+                return "done"
+            if "x" in hit:
+                tap_center(hit["x"], hit["y"])
+                return "done"
+    if _u2_status == "lost":
+        return "unsure"
+    hits = find_nodes(walk(ui_dump()), label, exact=True)
+    if not hits:
+        return "missing"
+    xy = clickable_target(hits[0])
+    if xy[0] is None:
+        return "missing"
+    tap_center(*xy)
+    return "done"
+
+
+def clear_field(keys=20):
+    """Backspace over a field's content, through the scrcpy helper when
+    it is up (milliseconds per key), else one adb call for all keys."""
+    try:
+        if all(scrcpy_send("key 67") for _ in range(keys)):
+            return
+    except Exception:
+        pass
+    adb_or_ensure("shell", "; ".join(["input keyevent 67"] * keys))
+    time.sleep(0.3)
+
+
+def _scrcpy_key(code):
+    """One key event over the scrcpy helper; raises if it refuses."""
+    if not scrcpy_send("key {}".format(code)):
+        raise RuntimeError("scrcpy refused a key")
+
+
+def _scrcpy_type_line(part):
+    """One line of text over the scrcpy helper. It trims the ends of a
+    command line, so spaces at either end go as space keys."""
+    body = part.strip(" ")
+    lead = len(part) - len(part.lstrip(" "))
+    trail = len(part) - len(part.rstrip(" ")) if body else 0
+    for _ in range(lead):
+        _scrcpy_key(62)
+    if body and not scrcpy_send("text " + body):
+        raise RuntimeError("scrcpy refused the text")
+    for _ in range(trail):
+        _scrcpy_key(62)
+
+
+def type_keys(text, slow=False):
+    """Type text as key events: a whole line per call over the scrcpy
+    helper (milliseconds), else one adb call per line, else (--slow) one
+    adb call per character. ENTER between lines. If scrcpy gives up part
+    way, adb carries on from the next line (nothing is typed twice)."""
+    if slow:
+        for ch in text:
+            if ch == "\n":
+                adb_or_ensure("shell", "input", "keyevent", "66")
+            else:
+                adb_or_ensure("shell", "input", "text", esc_char(ch))
+            time.sleep(0.4)
+        return
+    lines = text.split("\n")
+    done, entered = 0, False  # lines typed; ENTER before line `done` sent
+    try:
+        for i, part in enumerate(lines):
+            if i:
+                _scrcpy_key(66)
+                entered = True
+            _scrcpy_type_line(part)
+            done, entered = i + 1, False
+        return
+    except Exception as e:
+        print("scrcpy typing stopped after {} of {} line(s); adb types the "
+              "rest: {}".format(done, len(lines), e), file=sys.stderr)
+    for i, part in enumerate(lines[done:], start=done):
+        if i and not (i == done and entered):
+            adb_or_ensure("shell", "input", "keyevent", "66")
+        if part:
+            adb_or_ensure("shell", "input", "text",
+                          "".join(esc_char(c) for c in part))
 
 
 def cmd_press(args):
@@ -1767,36 +2137,21 @@ def cmd_press(args):
     except Exception:
         pass
     print("pressed {}".format(label))
+    read_after(quiet=getattr(args, "quiet", False))
     return 0
 
 
 def cmd_state(args):
-    # Ask for the focused app (filtered on the phone, so only one line
-    # crosses the link) while the UI dump runs.
-    import threading
-    focus = {}
-
-    def ask_focus():
-        try:
-            focus["r"] = adb_or_ensure(
-                "shell", "dumpsys activity activities | grep mFocusedApp")
-        except Exception as e:
-            print("couldn't read the focused app: {}".format(e), file=sys.stderr)
-
-    t = threading.Thread(target=ask_focus, daemon=True)
-    t.start()
-    nodes = walk(ui_dump())
-    t.join()
-    r = focus.get("r")
-    m = re.search(r"mFocusedApp=.*?\s+u0\s+(\S+)", (r.stdout or "") if r else "")
-    app = m.group(1) if m else "?"
-    texts = [n["text"] for n in nodes if n["text"]][:25]
+    """The app in front and the screen's rows, from one screen read (the
+    app comes from the read itself: no second call over the link)."""
+    root = ui_dump()
+    nodes = walk(root)
+    app = dump_package(root) or "?"
     if as_json(args):
+        texts = [n["text"] for n in nodes if n["text"]][:25]
         print(json.dumps({"ok": True, "app": app, "texts": texts}))
         return 0
-    print("app: {}".format(app))
-    for t in texts:
-        print("  " + t)
+    print_screen(root)
     return 0
 
 
@@ -1843,16 +2198,10 @@ def split_marked(text):
 def cmd_status(args):
     """One-call health summary, so nobody has to dig through dumpsys (which
     can also expose accounts and other personal details)."""
-    if not ensure(heal_fast_paths=False):
-        if as_json(args):
-            print(json.dumps({"online": False}))
-        else:
-            print("offline: the phone isn't reachable. Check that it's on "
-                  "Wi-Fi and Wireless debugging is on, then run `burner ensure`.")
-        return 1
-
     # One adb round trip instead of seven: each call through the tunnel costs
     # a few seconds. grep on the phone keeps the big dumpsys output off the wire.
+    # No connect/get-state calls first: if this call fails, adb_or_ensure
+    # reconnects once and retries it.
     script = ("echo @@battery; dumpsys battery; "
               "echo @@power; dumpsys power | grep mWakefulness=; "
               "echo @@window; dumpsys window | grep mCurrentFocus; "
@@ -1860,8 +2209,17 @@ def cmd_status(args):
               "echo @@pkgs; pm list packages -3; "
               "echo @@model; getprop ro.product.model; "
               "echo @@android; getprop ro.build.version.release")
-    r = adb("shell", script, timeout=45)
-    parts = split_marked(r.stdout if r.returncode == 0 else "")
+    r = adb_or_ensure("shell", script, timeout=45)
+    if r.returncode != 0 or "@@battery" not in (r.stdout or ""):
+        why = ((r.stderr or r.stdout or "").strip().splitlines() or [""])[0][:100]
+        if as_json(args):
+            print(json.dumps({"online": False, "error": why}))
+        else:
+            print("offline: the phone isn't reachable{}. Check that it's on "
+                  "Wi-Fi and Wireless debugging is on, then run `burner ensure`."
+                  .format(" (" + why + ")" if why else ""))
+        return 1
+    parts = split_marked(r.stdout)
     st = parse_status(
         parts.get("battery", ""), parts.get("power", ""),
         parts.get("window", ""), parts.get("df", ""),
@@ -1946,6 +2304,7 @@ def cmd_start(args):
     except Exception:
         pass
     print("launched {}".format(args.package))
+    read_after(quiet=getattr(args, "quiet", False), idle_ms=3000)
     return 0
 
 
@@ -2683,7 +3042,20 @@ def _scroll_swipe(direction, want_focus=False):
     return after
 
 
-def _scroll_to_end(direction, max_scrolls=15):
+def _swipe_once(direction):
+    """One swipe: the scrcpy helper's open connection when it is up, else
+    one adb call. Doesn't read the screen."""
+    if not _scrcpy_swipe(direction):
+        _scroll_swipe(direction)
+
+
+def _settled_dump():
+    """Read the screen after a swipe, once the UI has gone quiet. None
+    (with a line on stderr) when it can't be read."""
+    return read_after_root()[0]
+
+
+def _scroll_to_end(direction, max_scrolls=15, quiet=False):
     """Scroll the current app until the screen stops changing. Stays in the
     app: swipes start mid-screen, never from an edge (which would open the
     notification shade or app drawer)."""
@@ -2691,8 +3063,11 @@ def _scroll_to_end(direction, max_scrolls=15):
     pkg = dump_package(root)
     before = visible_lines(walk(root))
     for n in range(1, max_scrolls + 1):
-        _scroll_swipe(direction)
-        root = ui_dump()
+        _swipe_once(direction)
+        root = _settled_dump()
+        if root is None:
+            print("scrolled {} x{}; couldn't read the screen".format(direction, n))
+            return 0
         if pkg and dump_package(root) not in (None, pkg):
             print("scroll left {} (now in {}); stopped.".format(
                 pkg, dump_package(root)), file=sys.stderr)
@@ -2700,9 +3075,12 @@ def _scroll_to_end(direction, max_scrolls=15):
         after = visible_lines(walk(root))
         if after == before:
             print("at the {}".format("top" if direction == "up" else "bottom"))
-            return 0
+            break
         before = after
-    print("still moving after {} scrolls".format(max_scrolls))
+    else:
+        print("still moving after {} scrolls".format(max_scrolls))
+    if not quiet:
+        print_screen(root)
     return 0
 
 
@@ -2719,40 +3097,49 @@ def parse_focus(text):
     return m.group(1) if m else None
 
 
-def _scroll_plain(direction, times):
-    """Scroll without reading the screen. Swipes go over the scrcpy helper's
-    open connection, and the UI helper's small device-info call gives the
-    screen size and the app in front before and after each swipe, so leaving
-    the app is still caught. Falls back to one adb call per swipe."""
+def _scroll_plain(direction, times, quiet=False):
+    """Scroll, then read the screen once. Swipes go over the scrcpy
+    helper's open connection; the UI helper's small device-info call gives
+    the screen size and the app in front first, and the read at the end
+    shows the new content and catches a swipe that left the app. Falls back
+    to one adb call per swipe."""
     t0 = time.time()
     dims = live_screen_dims()
     _trace("scroll screen info {:.2f}s".format(time.time() - t0))
-    if dims is not None and _screen_pkg:
-        pkg = _screen_pkg
-        for i in range(times):
-            if not _scrcpy_swipe(direction):
-                return _scroll_plain_adb(direction, times - i)
-            t0 = time.time()
-            now = _screen_pkg if live_screen_dims() else None
-            _trace("scroll front-app check {:.2f}s".format(time.time() - t0))
-            # The swipe's events reach the phone a moment after we send them,
-            # and the screen tree that dumps read updates later still: give
-            # it 0.6s from the swipe (the check above counts toward it), then
-            # drop any dump cached in the meantime.
-            time.sleep(max(0.0, 0.6 - (time.time() - t0)))
-            u2_invalidate()
-            if now not in (None, pkg):
-                print("scroll left {} (now in {}); stopped.".format(pkg, now),
-                      file=sys.stderr)
-                return 1
-        print("scrolled {} x{}".format(direction, times))
-        return 0
     if dims is None:
         ui_dump()  # refreshes the screen size
-    return _scroll_plain_adb(direction, times)
+    if dims is None or not _screen_pkg:
+        return _scroll_plain_adb(direction, times, quiet=quiet)
+    pkg = _screen_pkg
+    for i in range(times):
+        if not _scrcpy_swipe(direction):
+            return _scroll_plain_adb(direction, times - i, quiet=quiet)
+        if i < times - 1:
+            time.sleep(0.3)  # let one swipe land before the next starts
+    # Still in the app? The same small call as before the swipes (the
+    # active window's package), so like is compared with like: a read's
+    # majority package can differ when another app's dialog is in front.
+    t0 = time.time()
+    now = _screen_pkg if live_screen_dims() else None
+    _trace("scroll front-app check {:.2f}s".format(time.time() - t0))
+    left = now not in (None, pkg)
+    root, note = None, ""
+    if quiet:
+        time.sleep(max(0.0, 0.6 - (time.time() - t0)))
+        u2_invalidate()
+    else:
+        root, note = read_after_root()
+    if left:
+        print("scroll left {} (now in {}); stopped.".format(pkg, now),
+              file=sys.stderr)
+    else:
+        print("scrolled {} x{}".format(direction, times))
+    if root is not None:
+        print_screen(root, note=note)
+    return 1 if left else 0
 
 
-def _scroll_plain_adb(direction, times):
+def _scroll_plain_adb(direction, times, quiet=False):
     pkg = None
     for i in range(times):
         if i == 0:
@@ -2764,41 +3151,50 @@ def _scroll_plain_adb(direction, times):
                   file=sys.stderr)
             return 1
     print("scrolled {} x{}".format(direction, times))
+    if not quiet:
+        root, note = read_after_root()
+        if root is not None:
+            print_screen(root, note=note)
     return 0
 
 
 def cmd_scroll(args):
     """Scroll like a finger would. `down` reveals content below (the finger
     swipes up). With --to, stop as soon as the text is visible."""
+    quiet = getattr(args, "quiet", False)
     if args.direction in ("top", "bottom"):
-        return _scroll_to_end("up" if args.direction == "top" else "down")
+        return _scroll_to_end("up" if args.direction == "top" else "down",
+                              quiet=quiet)
     times = args.times if (args.times != 1 or not args.to) else 10
     if not args.to:
-        return _scroll_plain(args.direction, times)
+        return _scroll_plain(args.direction, times, quiet=quiet)
     root = ui_dump()  # also refreshes the screen size
     pkg = dump_package(root)
     for i in range(times + 1):
-        if args.to and find_nodes(walk(root), args.to, exact=False):
+        if find_nodes(walk(root), args.to, exact=False):
             print("found: {}".format(args.to))
+            if not quiet:
+                print_screen(root)
             return 0
         if i == times:
             break
-        # Looking for text needs a fresh dump each time. A plain scroll only
-        # needs to know the app is still in front, read with the swipe.
-        _scroll_swipe(args.direction)
-        if args.to:
-            root = ui_dump()
-            now = dump_package(root)
+        # Looking for text needs a fresh read after each swipe.
+        _swipe_once(args.direction)
+        root = _settled_dump()
+        if root is None:
+            print("scrolled {} x{}; couldn't read the screen to look for {}"
+                  .format(args.direction, i + 1, args.to), file=sys.stderr)
+            return 1
+        now = dump_package(root)
         if pkg and now not in (None, pkg):
             print("scroll left {} (now in {}); stopped.".format(pkg, now),
                   file=sys.stderr)
             return 1
-    if args.to:
-        print("not found after {} scrolls: {}".format(times, args.to),
-              file=sys.stderr)
-        return 1
-    print("scrolled {} x{}".format(args.direction, times))
-    return 0
+    print("not found after {} scrolls: {}".format(times, args.to),
+          file=sys.stderr)
+    if not quiet:
+        print_screen(root)
+    return 1
 
 
 # Labels that close a pop-up without agreeing to anything, safest first.
@@ -2822,19 +3218,24 @@ def cmd_dismiss(args):
     """Close pop-ups that get in the way: permission asks, 'Got it' tips,
     upsells. Taps only close-without-agreeing labels, never OK/Allow/Accept.
     Prints what it closed so the user can be told."""
-    closed = []
+    closed, note = False, ""
+    root = ui_dump()
     for _ in range(max(1, args.max)):
-        node = pick_dismiss(walk(ui_dump()))
+        node = pick_dismiss(walk(root))
         if node is None:
             break
         x, y = clickable_target(node)
         tap_center(x, y)
-        closed.append(node.get("text") or node.get("desc"))
-        time.sleep(1.2)
-    if closed:
-        print("closed: {}".format(", ".join(closed)))
-    else:
+        closed = True
+        print("closed: {}".format(node.get("text") or node.get("desc")), flush=True)
+        # Wait on the phone for the pop-up's exit animation, then read.
+        root, note = read_after_root(prev_root=root)
+        if root is None:
+            return 0
+    if not closed:
         print("nothing to close")
+    if not getattr(args, "quiet", False):
+        print_screen(root, note=note)
     return 0
 
 
@@ -2961,6 +3362,7 @@ def cmd_open(args):
     adb_or_ensure(*cmd)
     u2_invalidate()
     print("opened {}".format(args.url))
+    read_after(quiet=getattr(args, "quiet", False), idle_ms=4000)
     return 0
 
 
@@ -3056,6 +3458,8 @@ def build_parser():
                         "and show what appeared/disappeared")
     p.add_argument("--no-evidence", action="store_true",
                    help="skip screenshot+dump capture on failure")
+    p.add_argument("--quiet", "-q", action="store_true",
+                   help="don't print the screen afterwards")
     p.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                    help="machine-readable JSON on stdout")
     p.set_defaults(fn=cmd_tap)
@@ -3068,6 +3472,8 @@ def build_parser():
                    help="wait until the text disappears")
     p.add_argument("--no-evidence", action="store_true",
                    help="skip screenshot+dump capture on failure")
+    p.add_argument("--quiet", "-q", action="store_true",
+                   help="don't print the screen afterwards")
     p.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                    help="machine-readable JSON on stdout")
     p.set_defaults(fn=cmd_wait)
@@ -3082,6 +3488,8 @@ def build_parser():
                    help="force the ADBKeyboard route even for ASCII text")
     p.add_argument("--ascii", action="store_true",
                    help="force the legacy path even for non-ASCII text")
+    p.add_argument("--quiet", "-q", action="store_true",
+                   help="don't print the screen afterwards")
     p.set_defaults(fn=cmd_type)
 
     p = sub.add_parser("scroll", help="scroll the screen (down shows more below)")
@@ -3091,6 +3499,8 @@ def build_parser():
     p.add_argument("--to", metavar="TEXT",
                    help="keep scrolling until TEXT is on screen (max --times, "
                         "default 10)")
+    p.add_argument("--quiet", "-q", action="store_true",
+                   help="don't print the screen afterwards")
     p.set_defaults(fn=cmd_scroll)
 
     p = sub.add_parser("press", help="keyevent (BACK, HOME, 224, 67, ...)")
@@ -3103,6 +3513,8 @@ def build_parser():
     p.add_argument("--shift", action="store_true", help="hold Shift (KEYCODE_SHIFT_LEFT)")
     p.add_argument("--alt", action="store_true", help="hold Alt (KEYCODE_ALT_LEFT)")
     p.add_argument("--meta", action="store_true", help="hold Meta/Win (KEYCODE_META_LEFT)")
+    p.add_argument("--quiet", "-q", action="store_true",
+                   help="don't print the screen afterwards")
     p.set_defaults(fn=cmd_press)
 
     p = sub.add_parser("status", help="is the phone up? battery, charging, screen, apps")
@@ -3118,6 +3530,8 @@ def build_parser():
     p = sub.add_parser("dismiss", help="close pop-ups (Not now, Skip, Don't allow...)")
     p.add_argument("--max", type=int, default=4,
                    help="most pop-ups to close in a row (default 4)")
+    p.add_argument("--quiet", "-q", action="store_true",
+                   help="don't print the screen afterwards")
     p.set_defaults(fn=cmd_dismiss)
 
     p = sub.add_parser("notifications",
@@ -3133,6 +3547,8 @@ def build_parser():
 
     p = sub.add_parser("start", help="launch app by package")
     p.add_argument("package")
+    p.add_argument("--quiet", "-q", action="store_true",
+                   help="don't print the screen afterwards")
     p.set_defaults(fn=cmd_start)
 
     p = sub.add_parser("shot", help="screenshot via screenshot.sh")
@@ -3163,6 +3579,8 @@ def build_parser():
     p.add_argument("url")
     p.add_argument("package", nargs="?", default=None,
                    help="app package to handle the link (skips the chooser)")
+    p.add_argument("--quiet", "-q", action="store_true",
+                   help="don't print the screen afterwards")
     p.set_defaults(fn=cmd_open)
 
     p = sub.add_parser("sleep", help="sleep N seconds (for use in 'do')")
@@ -3260,6 +3678,10 @@ def build_parser():
                    help="'recipes' to refresh only the built-in recipes")
     p.set_defaults(fn=cmd_update)
 
+    p = sub.add_parser("log", help="the last commands run, with their times and exit codes")
+    p.add_argument("--last", type=int, default=40, help="how many lines (default 40)")
+    p.set_defaults(fn=cmd_log)
+
     p = sub.add_parser("uninstall", help="undo the phone changes burner setup made")
     p.add_argument("--yes", action="store_true",
                    help="actually do it (without it, only list the changes)")
@@ -3277,6 +3699,8 @@ def cmd_do(args):
         except SystemExit:
             print("do: bad step {}: {}".format(i, step), file=sys.stderr)
             return 1
+        if i < len(steps) and hasattr(ns, "quiet"):
+            ns.quiet = True  # only the last step prints the screen
         print("do [{}]: {}".format(i, step), flush=True)
         rc = ns.fn(ns)
         if rc:
@@ -3449,7 +3873,7 @@ def record_command_line(args):
                           "route", "forget", "record", "replay", "recipe", "do",
                           "ensure", "gcode", "vcode", "amazon-status", "setup",
                           "uninstall", "update", "apps", "status", "dismiss", "notifications",
-                          "recipes", "save"}
+                          "recipes", "save", "log"}
         if argv[0] in non_recordable:
             return None
         # Reconstruct with proper quoting
@@ -4361,9 +4785,45 @@ def cmd_setup(args):
 
 
 INSTALL_URL = "https://useburner.si/install.sh"
+BRANCH_INSTALL_URL = "https://raw.githubusercontent.com/useburner/burner/{ref}/docs/install.sh"
 
 
-TARBALL_URL = "https://github.com/useburner/burner/archive/refs/heads/master.tar.gz"
+TARBALL_URL = "https://github.com/useburner/burner/archive/refs/heads/{ref}.tar.gz"
+FAST_SKILL = "SKILL-fast.md"
+
+
+REF_OK = re.compile(r"[A-Za-z0-9._/-]+")
+
+
+def install_ref():
+    """Branch this install came from: .burner-ref (written by the web
+    installer), else a git checkout's branch, else master."""
+    try:
+        with open(os.path.join(ROOT, ".burner-ref")) as f:
+            ref = f.read().strip()
+        if REF_OK.fullmatch(ref):
+            return ref
+    except OSError:
+        pass
+    if os.path.isdir(os.path.join(ROOT, ".git")):
+        try:
+            r = subprocess.run(["git", "-C", ROOT, "rev-parse", "--abbrev-ref", "HEAD"],
+                               capture_output=True, text=True, timeout=5)
+            name = (r.stdout or "").strip()
+            if r.returncode == 0 and name != "HEAD" and REF_OK.fullmatch(name):
+                return name
+        except Exception:
+            pass
+    return "master"
+
+
+def skill_path():
+    """The guide to re-read after an update: the fast guide on a branch
+    that ships one, else SKILL.md."""
+    fast = os.path.join(ROOT, FAST_SKILL)
+    if install_ref() != "master" and os.path.exists(fast):
+        return fast
+    return os.path.join(ROOT, "SKILL.md")
 
 
 def _update_recipes():
@@ -4372,7 +4832,7 @@ def _update_recipes():
     import io
     import tarfile
     try:
-        blob = _setup_urlopen(TARBALL_URL, timeout=120)
+        blob = _setup_urlopen(TARBALL_URL.format(ref=install_ref()), timeout=120)
     except Exception as e:
         print("could not download the latest recipes: {}".format(e),
               file=sys.stderr)
@@ -4431,11 +4891,13 @@ def cmd_version(args):
             rev = skill_rev(f.read())
     except OSError:
         rev = None
+    ref = install_ref()
     if as_json(args):
-        print(json.dumps({"ok": True, "commit": sha, "skill_rev": rev}))
+        print(json.dumps({"ok": True, "commit": sha, "skill_rev": rev, "ref": ref}))
         return 0
-    print("burner {} (skill rev {})".format(
-        sha[:7] if sha else "unknown", rev or "unknown"))
+    branch = "" if ref == "master" else " on branch " + ref
+    print("burner {}{} (skill rev {})".format(
+        sha[:7] if sha else "unknown", branch, rev or "unknown"))
     return 0
 
 
@@ -4445,11 +4907,16 @@ def cmd_update(args):
     itself are refreshed. `burner update recipes` refreshes only recipes."""
     if getattr(args, "what", None) == "recipes":
         return _update_recipes()
-    env = dict(os.environ, BURNER_DIR=ROOT)
-    r = subprocess.run(["bash", "-c", "curl -fsSL {} | bash".format(INSTALL_URL)],
-                       env=env)
+    ref = install_ref()
+    env = dict(os.environ, BURNER_DIR=ROOT, BURNER_REF=ref)
+    url = INSTALL_URL if ref == "master" else BRANCH_INSTALL_URL.format(ref=ref)
+    # pipefail: a failed download (offline, or a branch that is gone) must
+    # not feed bash an empty script and report success.
+    r = subprocess.run(["bash", "-c", 'set -o pipefail; curl -fsSL "$1" | bash',
+                        "burner-update", url], env=env)
     if r.returncode != 0:
-        print("update failed (see above).", file=sys.stderr)
+        print("update failed (see above). Nothing was changed if the download "
+              "failed; the branch is {}.".format(ref), file=sys.stderr)
         return r.returncode
     _stop_helper_daemons()
     # Start both helpers again now, in the background, so the next command
@@ -4462,7 +4929,7 @@ def cmd_update(args):
     except OSError:
         pass
     print("Updated. Re-read {} now: the instructions may have changed.".format(
-        os.path.join(ROOT, "SKILL.md")))
+        skill_path()))
     return 0
 
 
@@ -4599,9 +5066,85 @@ def _arm_watchdog(args):
         print("burner {}: no result after {}s, stopped. The phone may be "
               "asleep or unreachable: run `burner ensure`, then try again."
               .format(cmd, limit), file=sys.stderr)
+        log_command((time.time() - _T0) * 1000, 124)
         os._exit(124)
     signal.signal(signal.SIGALRM, fire)
     signal.alarm(limit)
+
+
+COMMANDS_LOG = os.path.join(ROOT, "run", "commands.log")
+COMMANDS_LOG_MAX = 400 * 1024  # bytes: trimmed to the newest half past this
+
+
+_LOG_KEEP_VALUE = {"--field", "--clear-keys", "--timeout"}
+_LOG_TYPE_IN_FLOW = re.compile(r"""(\btype\s+)(?:"[^"]*"|'[^']*'|\S+)""")
+
+
+def log_line(argv, ms, rc):
+    """One line for run/commands.log: when, how long, the exit code and the
+    command. Typed text never goes in: every `type` argument but its flags
+    is masked, `type` steps inside a `do`/`save` flow lose their text, and
+    a pairing code stays out."""
+    words = list(argv)
+    cmd = words[0] if words else ""
+    if cmd == "type":
+        # A flag stays, and so does the value of a flag that takes one;
+        # whatever else is there is the typed text.
+        masked, after_dashes = [], False
+        for prev, w in zip(words, words[1:]):
+            if after_dashes:  # past a bare --, everything is typed text
+                masked.append("…")
+                continue
+            if w == "--":
+                after_dashes = True
+                masked.append(w)
+                continue
+            keep = w.startswith("--") or prev in _LOG_KEEP_VALUE
+            masked.append(w if keep else "…")
+        words = [cmd] + masked
+    elif cmd in ("do", "save", "record", "replay"):
+        words = [cmd] + [_LOG_TYPE_IN_FLOW.sub(r"\1…", w) for w in words[1:]]
+    elif cmd == "setup":
+        for i, w in enumerate(words):
+            if i and words[i - 1] == "--code":
+                words[i] = "…"
+    return "{} {:>6}ms exit {} burner {}".format(
+        time.strftime("%Y-%m-%d %H:%M:%S"), int(ms), rc,
+        " ".join(shlex.quote(w) for w in words))
+
+
+def log_command(ms, rc):
+    """Append this command to run/commands.log. Never raises."""
+    try:
+        os.makedirs(os.path.dirname(COMMANDS_LOG), exist_ok=True)
+        try:
+            big = os.path.getsize(COMMANDS_LOG) > COMMANDS_LOG_MAX
+        except OSError:
+            big = False
+        if big:
+            with open(COMMANDS_LOG, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            with open(COMMANDS_LOG, "w", encoding="utf-8") as f:
+                f.writelines(lines[len(lines) // 2:])
+        # Only this user reads it (0600): it lists what was done on the phone.
+        fd = os.open(COMMANDS_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(log_line(sys.argv[1:], ms, rc) + "\n")
+    except Exception:
+        pass
+
+
+def cmd_log(args):
+    """Print the last commands run, with how long each took and how it
+    ended: where the time went in a task, without any other tool."""
+    try:
+        with open(COMMANDS_LOG, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        print("no commands logged yet")
+        return 0
+    sys.stdout.writelines(lines[-max(1, args.last):])
+    return 0
 
 
 def main():
@@ -4623,22 +5166,35 @@ def main():
         atexit.register(_trace_total)
         _trace_sleeps()
         _trace_json("start", None)  # touch the file: the UI helper traces too
+    rc = 1
     try:
-        sys.exit(args.fn(args))
+        rc = args.fn(args) or 0
     except _ADB_TIMEOUT:
         # A phone that is asleep or off the tailnet makes adb hang. Say so
         # plainly instead of dumping a traceback.
         print("burner: the phone didn't answer in time. Check that it's on "
               "the charger with the screen awake and that Tailscale is "
               "connected, then run `burner doctor`.", file=sys.stderr)
-        sys.exit(1)
     except RuntimeError as e:
         if "kept coming back empty" not in str(e):
             raise
         print("burner: couldn't read the phone's screen. Check that it's on "
               "the charger with the screen awake and that Tailscale is "
               "connected, then run `burner ensure`.", file=sys.stderr)
-        sys.exit(1)
+    except SystemExit as e:
+        # A command that exits by itself: same code (a message prints and
+        # exits 1, as Python does), but logged first.
+        if e.code is None:
+            rc = 0
+        elif isinstance(e.code, int):
+            rc = e.code
+        else:
+            print(e.code, file=sys.stderr)
+    finally:
+        # Every command ends up in the log, a crash included (rc stays 1).
+        if getattr(args, "cmd", None) != "log":
+            log_command((time.time() - _T0) * 1000, rc)
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

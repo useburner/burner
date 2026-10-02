@@ -9,7 +9,13 @@
 # other local state are never deleted. No sudo. Safe to re-run.
 set -u
 
-TARBALL_URL="https://github.com/useburner/burner/archive/refs/heads/master.tar.gz"
+# BURNER_REF picks a branch (default master). The fast branch installs with:
+#   curl -fsSL https://raw.githubusercontent.com/useburner/burner/fast/docs/install.sh | BURNER_REF=fast bash
+REF="${BURNER_REF:-master}"
+case "$REF" in
+  ""|*[!A-Za-z0-9._/-]*) echo "burner: ERROR: BURNER_REF must be a branch name (letters, digits, . _ / -)" >&2; exit 1 ;;
+esac
+TARBALL_URL="https://github.com/useburner/burner/archive/refs/heads/${REF}.tar.gz"
 DEST="${BURNER_DIR:-$HOME/burner}"
 MARKER=".burner-web-install"
 
@@ -39,6 +45,7 @@ fi
 if [ -d "$DEST/.git" ]; then
   command -v git >/dev/null 2>&1 || die "$DEST is a git checkout but git is not installed."
   info "updating existing checkout in $DEST (git pull --ff-only)..."
+  [ "$REF" = "master" ] || info "a git checkout follows its own branch: BURNER_REF=$REF is not used (git checkout $REF there if you want it)"
   git -C "$DEST" pull --ff-only \
     || die "git pull --ff-only failed in $DEST. Resolve local changes there and re-run."
 elif [ -d "$DEST" ] && [ ! -f "$DEST/$MARKER" ] && [ -n "$(ls -A "$DEST" 2>/dev/null)" ]; then
@@ -49,8 +56,9 @@ else
   info "downloading burner..."
   fetch "$TARBALL_URL" "$TMPDIR_B/burner.tar.gz" || die "download failed: $TARBALL_URL"
   tar -xzf "$TMPDIR_B/burner.tar.gz" -C "$TMPDIR_B" || die "could not extract the burner tarball."
-  SRC="$TMPDIR_B/burner-master"
-  [ -f "$SRC/install.sh" ] || die "unexpected tarball layout (no burner-master/install.sh)."
+  # GitHub names the folder after the branch, with / turned into -.
+  SRC="$TMPDIR_B/burner-$(printf '%s' "$REF" | tr / -)"
+  [ -f "$SRC/install.sh" ] || die "unexpected tarball layout (no $(basename "$SRC")/install.sh)."
   mkdir -p "$DEST" || die "cannot create $DEST"
   # Copy contents (including dotfiles) into DEST.
   (cd "$SRC" && tar -cf - .) | (cd "$DEST" && tar -xf -) || die "could not copy files into $DEST"
@@ -58,9 +66,13 @@ else
   # GitHub tarballs carry their commit id; `burner version` reports it.
   python3 -c 'import sys, tarfile; print(tarfile.open(sys.argv[1]).pax_headers.get("comment", ""))' \
     "$TMPDIR_B/burner.tar.gz" > "$DEST/.burner-version" 2>/dev/null || rm -f "$DEST/.burner-version"
-  info "extracted to $DEST"
+  # `burner update` and `burner version` follow the same branch from now on.
+  if [ "$REF" = "master" ]; then rm -f "$DEST/.burner-ref"; else echo "$REF" > "$DEST/.burner-ref"; fi
+  info "extracted to $DEST (branch $REF)"
 fi
 
+GUIDE="https://useburner.si/skill.md"
+[ "$REF" = "master" ] || GUIDE="https://raw.githubusercontent.com/useburner/burner/${REF}/SKILL-fast.md"
 [ -f "$DEST/install.sh" ] || die "$DEST/install.sh not found."
 info "running $DEST/install.sh..."
 bash "$DEST/install.sh" || die "$DEST/install.sh failed (see output above)."
@@ -78,5 +90,5 @@ Next step: pair the phone (a human, once, about 10 minutes):
 
   burner setup
 
-Agent guide: https://useburner.si/skill.md
+Agent guide: $GUIDE
 EOF
