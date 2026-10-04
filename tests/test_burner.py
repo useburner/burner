@@ -3243,5 +3243,14 @@ class StartAndSettingsTests(OfflineTestCase):
         self.assertIn("no settings page called", err.getvalue())
 
 
+class EmptyScreenTests(OfflineTestCase):
+    def test_helper_real_screen(self):
+        mod = _u2mux()
+        self.assertTrue(mod.real_screen(SAMPLE_XML))
+        self.assertFalse(mod.real_screen('<?xml version="1.0"?><hierarchy rotation="0" />'))
+        self.assertFalse(mod.real_screen(""))
+        self.assertFalse(mod.real_screen(None))
+
+
 if __name__ == "__main__":
     unittest.main()

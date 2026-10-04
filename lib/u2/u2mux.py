@@ -240,11 +240,17 @@ def read_screen(d, timeout=DUMP_RPC_TIMEOUT):
     return d.jsonrpc_call("dumpWindowHierarchy", [False, None], timeout=timeout)
 
 
+def real_screen(xml):
+    """True for a read that holds at least one node. A half-started
+    server answers with an empty hierarchy for every read (Oct 4: text
+    taps kept missing until the server was restarted)."""
+    return bool(xml) and "<hierarchy" in xml and "<node" in xml
+
+
 def server_works(d):
     """True if the on-device server answers and can read the screen."""
     d.info  # cheap deviceInfo RPC — raises if the server is dead
-    xml = read_screen(d, timeout=PROBE_TIMEOUT)
-    return bool(xml) and "<hierarchy" in xml
+    return real_screen(read_screen(d, timeout=PROBE_TIMEOUT))
 
 
 def ensure_server():
@@ -408,6 +414,13 @@ class U2Daemon:
             gen, t0 = self._gen, _time.monotonic()
             with _t("dump rpc"):
                 xml = read_screen(self.d)
+            if not real_screen(xml):
+                # An empty read: the server is half-started. Restart it
+                # once and read again (a read changes nothing on the phone).
+                log("empty read; restarting the server")
+                self.connect()
+                with _t("dump rpc (after restart)"):
+                    xml = read_screen(self.d)
             with self._cache_lock:
                 if gen == self._gen:
                     self._cache = (t0, xml)
@@ -663,6 +676,13 @@ class U2Daemon:
             xml = results[-1]
             if isinstance(xml, Exception) or not xml:
                 raise RuntimeError("act failed after sending: no read (%s)" % xml)
+            if not real_screen(xml):
+                # The action happened; only the read is repeated, after a
+                # server restart (a half-started server reads empty).
+                log("empty read after the action; restarting the server")
+                self.connect()
+                with _t("dump rpc (after restart)"):
+                    xml = read_screen(self.d)
             with self._cache_lock:
                 self._gen += 1
                 self._cache = (_time.monotonic(), xml)
