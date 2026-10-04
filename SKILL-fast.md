@@ -118,7 +118,7 @@ Codes, health, upkeep
   burner gcode --from 'from:x@y'    newest code from Gmail (--mins 15)
   burner vcode --from 'from:x@y'    wait for the code box, fetch, type (--submit "Continue")
   burner doctor                     full health check
-  burner ensure                     reconnect everything (about 5 seconds)
+  burner ensure                     reconnect everything (5 seconds; up to a minute when it has to turn Wireless debugging back on)
   burner update                     update burner (stays on this version)
   burner version                    build, branch and skill rev
   burner log                        the last commands run, how long each took, exit codes
@@ -143,8 +143,9 @@ Details that save a step:
 | Problem | Fix |
 |---|---|
 | Phone unreachable after a restart | Give it about 2 minutes, then `burner ensure`. |
-| Commands hang, or exit 124 | `burner ensure` restarts the connection and the on-phone helper in about 5 seconds. |
-| `burner dump` comes back empty | The screen went dark: phone on its charger, then `burner ensure`. |
+| `burner ensure` says Wireless debugging is off | Android turns it off after a Wi-Fi blip or a restart; `burner ensure` asks the phone's adb-auto-enable app to turn it back on by itself and waits (the app's routine takes about a minute, so let it run). If it says the app isn't answering, ask the user to open adb-auto-enable on the phone once, or to turn on Wireless debugging in Developer options, then `burner ensure`. |
+| Commands hang, or exit 124 | `burner ensure` restarts the connection and the on-phone helper (5 seconds; up to a minute when Wireless debugging was off). |
+| `burner dump` comes back empty | burner wakes a dark screen and restarts the on-phone helper by itself; if reads stay empty, phone on its charger, then `burner ensure`. |
 | `adb unauthorized` | The phone forgot this computer: pair again (setup step 5 in https://useburner.si/skill.md). |
 | Apps say there is no internet | In the Tailscale app on the phone, turn off "Use Tailscale DNS settings". |
 | `burner version` doesn't say `on branch fast` | Run the install line at the top of this guide again. |

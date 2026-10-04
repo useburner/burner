@@ -247,39 +247,154 @@ def real_screen(xml):
     return bool(xml) and "<hierarchy" in xml and "<node" in xml
 
 
+SYSTEM_UI = "com.android.systemui"
+
+
+def blank_screen(xml):
+    """True for a read with no app on it: no node at all, or nothing but
+    the system UI's bare window (a node or two). The latter is what an
+    off screen reads like: the shade's window holds the focus with
+    nothing in it (Oct 4, a Pixel 7 off its charger, whose screen turns
+    off after 10s: label taps missed and `wait` timed out while
+    screenshots, which wake the phone first, looked fine). A pulled-down
+    shade or a lock screen has many more nodes. Pure."""
+    if not real_screen(xml):
+        return True
+    if xml.count("<node") > 2:
+        return False
+    return set(re.findall(r'package="([^"]*)"', xml)) <= {SYSTEM_UI}
+
+
+def screen_on(d):
+    """deviceInfo's screenOn: True or False, None when the server doesn't
+    say. One cheap RPC. Raises when the server doesn't answer (a dead
+    server must not pass for "screen on")."""
+    info = d.info
+    return info.get("screenOn") if isinstance(info, dict) else None
+
+
 def server_works(d):
-    """True if the on-device server answers and can read the screen."""
-    d.info  # cheap deviceInfo RPC — raises if the server is dead
+    """True if the on-device server answers and can read the screen. An
+    off screen reads blank whatever the server's state, so it is woken
+    first; a just-started server's first read can be empty, so it gets
+    two reads."""
+    if screen_on(d) is False:  # raises if the server is dead
+        try:
+            d.jsonrpc.wakeUp()
+        except Exception as e:
+            log("wakeUp failed (%s)" % str(e)[:80])
+        _time.sleep(0.5)
+    if real_screen(read_screen(d, timeout=PROBE_TIMEOUT)):
+        return True
+    _time.sleep(0.5)
     return real_screen(read_screen(d, timeout=PROBE_TIMEOUT))
 
 
-def ensure_server():
-    """Make sure the on-device uiautomator2 server is listening and can
-    read the screen; restart it when it can't."""
-    import uiautomator2 as u2
+# The server's process on the phone: app_process running the u2 jar, and
+# the shell wrapper adb started it through. A stray `uiautomator` shell
+# command holds the same accessibility connection, so it counts too.
+SERVER_MARKS = ("com.wetest.uia2", "com.android.commands.uiautomator")
+
+
+def err_text(e, n=160):
+    """An exception for a log line: its type and the end of its message
+    (the telling part of uiautomator2's launch errors sits at the end)."""
+    msg = " ".join(str(e).split())
+    return "%s: %s" % (type(e).__name__, msg[-n:])
+
+
+def server_pids(ps_output):
+    """PIDs of the UI server's processes in a `ps -A -o PID,ARGS` listing.
+    Pure."""
+    pids = []
+    for line in (ps_output or "").splitlines():
+        parts = line.split()
+        if len(parts) < 2 or not parts[0].isdigit():
+            continue
+        if any(m in line for m in SERVER_MARKS):
+            pids.append(parts[0])
+    return pids
+
+
+PS_SERVER = "ps -A -o PID,ARGS"
+SHELL_TIMEOUT = 8  # a phone shell over a stalled tunnel must not hold the lock for long
+
+
+def kill_server_on_phone(dev):
+    """Kill the UI server's processes on the phone (they run as the shell
+    user, so adb's shell may) and check they are gone. Returns the PIDs
+    found. uiautomator2 can't do this: it only stops a server it launched
+    itself, and never relaunches one that still answers /ping."""
+    pids = server_pids(dev.shell(PS_SERVER, timeout=SHELL_TIMEOUT))
+    if not pids:
+        log("no UI server process on the phone")
+        return pids
+    dev.shell("kill -9 " + " ".join(pids), timeout=SHELL_TIMEOUT)
+    _time.sleep(0.6)  # the accessibility connection takes a moment to free
+    left = server_pids(dev.shell(PS_SERVER, timeout=SHELL_TIMEOUT))
+    if left:
+        raise RuntimeError("could not kill the UI server on the phone (pid %s)" % " ".join(left))
+    log("killed the server on the phone (pid %s)" % " ".join(pids))
+    return pids
+
+
+def apply_fast_config(d):
+    """No idle wait on the server: Chrome never idles, so every UiObject
+    call was paying ~1s waitForIdle(); burner does its own polling. The
+    server loses this on every restart, so it is applied to each one."""
     try:
-        if server_works(u2.connect(TARGET)):
-            return
-        log("server answers but can't read the screen; restarting it")
+        cfg = d.jsonrpc.getConfigurator()
+        cfg.update({"waitForIdleTimeout": 0, "waitForSelectorTimeout": 0})
+        d.jsonrpc.setConfigurator(cfg)
     except Exception as e:
-        log("server not responding (%s), (re)initing" % e)
-    # The old server process can linger half-dead (this is the
-    # "ApplicationSharedMemory not initialized" error). Stop it before
-    # pushing a new one so the restart is clean and happens once.
+        log("configurator tweak failed:", err_text(e))
+
+
+def ensure_server():
+    """The on-device uiautomator2 server, listening and able to read the
+    screen; restarted (killed on the phone, started fresh) when it can't.
+    Returns the connected device."""
+    import adbutils
+    import uiautomator2 as u2
+    first = "it reads empty screens"
     try:
-        u2.connect(TARGET).stop_uiautomator()
-    except Exception as e2:
-        log("stop_uiautomator failed (%s)" % e2)
-    # Pass the serial: with one, init only pushes u2.jar. Without it, init
-    # also installs the ATX keyboard app, which Android 14+ blocks as an
-    # "unsafe app" (it targets an old Android). burner doesn't need it.
-    r = subprocess.run(
-        [VENV_PY, "-m", "uiautomator2", "init", "--serial", TARGET],
-        capture_output=True, text=True, timeout=120)
-    d = u2.connect(TARGET)
-    if not server_works(d):
-        raise RuntimeError("the phone's UI server came back but can't read the screen")
-    log("server (re)started")
+        d = u2.connect(TARGET)  # starts a dead server (and pushes a new jar)
+        apply_fast_config(d)
+        if server_works(d):
+            return d
+        log("server answers but reads empty screens; restarting it")
+    except Exception as e:
+        first = err_text(e)
+        log("server not responding (%s); restarting it" % first)
+    why = "no read"
+    for attempt in (1, 2):
+        try:
+            killed = kill_server_on_phone(adbutils.adb.device(TARGET))
+            _KEEPALIVE.close()
+            d = u2.connect(TARGET)  # /ping fails now, so this launches one
+            apply_fast_config(d)
+            if server_works(d):
+                log("server (re)started")
+                return d
+            why = ("a fresh server reads empty screens" if killed else
+                   "no server process was running, and a fresh one reads empty screens")
+        except Exception as e:
+            why = err_text(e)
+        log("restart %d: %s" % (attempt, why))
+        _time.sleep(1.0)
+    raise RuntimeError("the phone's UI server couldn't be restarted: %s (at first: %s)"
+                       % (why, first))
+
+
+RESTART_COOLDOWN_S = 20.0  # at most one server restart per this
+
+
+def restart_allowed(since_restart, cooldown=RESTART_COOLDOWN_S):
+    """Whether the server may be restarted: not within the cooldown of the
+    last restart. Then an empty read is taken as what the phone shows and
+    a failed command is raised as it is, so a server that stays broken
+    isn't killed and relaunched on every read and command. Pure."""
+    return since_restart >= cooldown
 
 
 DUMP_TTL = 2.0  # seconds a cached hierarchy dump stays valid
@@ -334,7 +449,11 @@ def act_calls(spec):
     when the last event is older than its quiet window), the wait for
     the UI to go quiet, and the read that is returned. No
     waitForWindowUpdate: inside a batch it crashed the phone's server
-    (Oct 4). Pure."""
+    (Oct 4). An action starts with wakeUp: a tap or a key on an off
+    screen is dropped (a phone off its charger turns its screen off after
+    10s), and wakeUp is a no-op with the screen on and sleeps 500ms only
+    when it woke the phone. Not before POWER or SLEEP, whose job is the
+    opposite. Pure."""
     calls = []
     if "tap" in spec:
         x, y = spec["tap"]
@@ -348,10 +467,24 @@ def act_calls(spec):
         sel = dict(Selector(focused=True, className="android.widget.EditText"))
         calls.append(("setText", [sel, str(spec["set_text"])]))
     if calls:
+        if not sleeps_the_screen(spec):
+            calls.insert(0, ("wakeUp", []))
         calls.append(("dumpWindowHierarchy", [False, None]))
     calls.append(("waitForIdle", [int(spec.get("idle", 2000))]))
     calls.append(("dumpWindowHierarchy", [False, None]))
     return calls
+
+
+ACTION_METHODS = ("click", "pressKeyCode", "setText")
+SLEEP_KEYS = (26, 223, 276)  # POWER, SLEEP, SOFT_SLEEP
+
+
+def sleeps_the_screen(spec):
+    """True for an act spec whose key turns the screen off. Pure."""
+    try:
+        return "key" in spec and int(spec["key"]) in SLEEP_KEYS
+    except (TypeError, ValueError):
+        return False
 
 
 class U2Daemon:
@@ -366,27 +499,26 @@ class U2Daemon:
         self._gen = 0        # bumped on invalidate; stale in-flight dumps aren't cached
         self._last_xml = ""  # the newest read, however old: a hint for `screen`
         self._last_xml_t = 0.0  # when it was read (monotonic)
+        self._last_restart = -1e9  # monotonic time of the last connect()
+        self._restart_error = None  # why the last connect() failed, until one works
         self.d = None
         self.connect()
 
     def connect(self):
-        import uiautomator2 as u2
         with self._lock:
             self.invalidate()
             install_keepalive()
             _KEEPALIVE.close()  # drop streams to a possibly-dead server
-            ensure_server()
-            self.d = u2.connect(TARGET)
-            # Kill the idle wait: Chrome never idles, so every UiObject call
-            # was paying ~1s waitForIdle(). Zero it; burner does its own polling.
-            # Re-applied on every connect since the server loses it on restart.
             try:
-                cfg = self.d.jsonrpc.getConfigurator()
-                cfg.update({"waitForIdleTimeout": 0, "waitForSelectorTimeout": 0})
-                self.d.jsonrpc.setConfigurator(cfg)
-                log("fast config applied:", self.d.jsonrpc.getConfigurator())
+                self.d = ensure_server()  # applies the fast configurator
+                self._restart_error = None
             except Exception as e:
-                log("configurator tweak failed:", e)
+                self._restart_error = err_text(e)
+                raise
+            finally:
+                # Stamped even when the restart failed: the cooldown
+                # keeps a broken server from being restarted on every read.
+                self._last_restart = _time.monotonic()
             # warm up: one dump so later calls are fast
             read_screen(self.d)
             log("connected to", TARGET)
@@ -414,18 +546,55 @@ class U2Daemon:
             gen, t0 = self._gen, _time.monotonic()
             with _t("dump rpc"):
                 xml = read_screen(self.d)
-            if not real_screen(xml):
-                # An empty read: the server is half-started. Restart it
-                # once and read again (a read changes nothing on the phone).
-                log("empty read; restarting the server")
-                self.connect()
-                with _t("dump rpc (after restart)"):
-                    xml = read_screen(self.d)
+            if blank_screen(xml):
+                xml, _ = self._fix_blank_read(xml, "blank read")
             with self._cache_lock:
-                if gen == self._gen:
-                    self._cache = (t0, xml)
+                if gen == self._gen and not blank_screen(xml):
+                    self._cache = (t0, xml)  # a blank read is never reused
             self._last_xml, self._last_xml_t = xml, _time.monotonic()
         return xml
+
+    def _fix_blank_read(self, xml, what):
+        """A read with no app on it (see blank_screen) -> (xml, woke), woke
+        being True when the screen was off and has been woken.
+        Screen off: wake it (the one thing here that changes the phone)
+        and read again. Screen on, showing the system UI's bare window:
+        keep the read, the phone is mid-transition (the CLI re-reads a
+        thin screen). Screen on, no node at all: the server is broken, so
+        restart it (killed on the phone, started fresh) and read again.
+        Within the cooldown of an earlier restart it is not restarted
+        again: that restart's failure is raised, or, if it worked, the
+        empty read is kept as what the phone shows. Raises when the
+        server doesn't answer, the screen won't wake or the restart
+        fails: the caller decides what a failed read means."""
+        if screen_on(self.d) is False:
+            log("%s; the screen is off, waking it" % what)
+            self._wake()
+            with _t("dump rpc (after wake)"):
+                xml = read_screen(self.d)
+            if blank_screen(xml) and screen_on(self.d) is False:
+                raise RuntimeError("the phone's screen is off and would not wake")
+            return xml, True
+        if real_screen(xml):
+            return xml, False
+        if not restart_allowed(_time.monotonic() - self._last_restart):
+            if self._restart_error:
+                raise RuntimeError("the UI server couldn't be restarted a moment ago: %s"
+                                   % self._restart_error)
+            log("%s; the server was just restarted, keeping it" % what)
+            return xml, False
+        log("%s; restarting the server" % what)
+        self.connect()
+        with _t("dump rpc (after restart)"):
+            return read_screen(self.d), False
+
+    def _wake(self):
+        """Turn the screen on (one RPC), then give it a moment to draw."""
+        try:
+            self.d.jsonrpc.wakeUp()
+        except Exception as e:
+            raise RuntimeError("the phone's screen is off and wakeUp failed (%s)" % err_text(e, 80))
+        _time.sleep(0.4)
 
     def _reconnect(self):
         try:
@@ -455,6 +624,8 @@ class U2Daemon:
         # Match against XML-escaped form (&, <, " are escaped in dumps).
         import xml.sax.saxutils as saxutils
         h = self._dump()
+        if blank_screen(h):
+            h = self._dump(fresh=True)  # a blank read says nothing about `arg`
         esc = saxutils.escape(arg, {'"': '&quot;'})
         return b"1" if esc in h else b"0"
 
@@ -534,7 +705,8 @@ class U2Daemon:
             fresh = True
             n = find_node(xml, text)
             waited = int((_time.monotonic() - t0) * 1000)
-            if absent and n is None:
+            # a blank read shows nothing, so it can't show `text` gone
+            if absent and n is None and not blank_screen(xml):
                 return json.dumps({"gone": True, "waited_ms": waited, "polls": polls}).encode()
             if not absent and n is not None:
                 n = dict(n, found=True, waited_ms=waited, polls=polls)
@@ -662,7 +834,7 @@ class U2Daemon:
             except RuntimeError as e:
                 raise RuntimeError("act not sent: %s" % e)
         calls = act_calls(spec)
-        acted = calls[0][0] in ("click", "pressKeyCode", "setText")
+        acted = [i for i, (m, _) in enumerate(calls) if m in ACTION_METHODS]
         timeout = int(spec.get("idle", 2000)) / 1000.0 + 20
         with self._lock:
             self.invalidate()
@@ -671,21 +843,30 @@ class U2Daemon:
                     results = self._batch(calls, timeout=timeout)
                 except Exception as e:
                     raise RuntimeError("act failed after sending: %s" % str(e)[:120])
-            if acted and isinstance(results[0], Exception):
-                raise RuntimeError("act failed after sending: %s" % results[0])
+            if acted and isinstance(results[acted[0]], Exception):
+                raise RuntimeError("act failed after sending: %s" % results[acted[0]])
+            if acted and calls[0][0] == "wakeUp" and isinstance(results[0], Exception):
+                # The action went to a screen that may be off: dropped, then.
+                raise RuntimeError("act failed after sending: the wake before it failed "
+                                   "(%s), so it may have been dropped" % results[0])
             xml = results[-1]
             if isinstance(xml, Exception) or not xml:
                 raise RuntimeError("act failed after sending: no read (%s)" % xml)
-            if not real_screen(xml):
-                # The action happened; only the read is repeated, after a
-                # server restart (a half-started server reads empty).
-                log("empty read after the action; restarting the server")
-                self.connect()
-                with _t("dump rpc (after restart)"):
-                    xml = read_screen(self.d)
+            if blank_screen(xml) and not sleeps_the_screen(spec):
+                # The action happened; only the read is repeated. A read
+                # that fails here must not read as "not sent" to the CLI.
+                try:
+                    xml, woke = self._fix_blank_read(xml, "blank read after the action")
+                except Exception as e:
+                    raise RuntimeError("act failed after sending: the read after it "
+                                       "failed (%s)" % err_text(e, 100))
+                if woke and acted:
+                    raise RuntimeError("act failed after sending: the screen was off, so "
+                                       "it was probably dropped; the screen is on now")
             with self._cache_lock:
                 self._gen += 1
-                self._cache = (_time.monotonic(), xml)
+                if not blank_screen(xml):
+                    self._cache = (_time.monotonic(), xml)
             self._last_xml, self._last_xml_t = xml, _time.monotonic()
         return xml.encode()
 
@@ -716,7 +897,9 @@ class U2Daemon:
                 try:
                     self.d.info
                 except Exception:
-                    log("command %s failed (%s), reconnecting" % (cmd, e))
+                    if not restart_allowed(_time.monotonic() - self._last_restart):
+                        raise  # a restart a moment ago: no kill/relaunch loop
+                    log("command %s failed (%s), reconnecting" % (cmd, err_text(e)))
                     self.connect()
             try:
                 return fn(arg)

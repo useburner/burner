@@ -20,6 +20,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
 
@@ -138,6 +139,8 @@ def ensure(heal_fast_paths=True):
     """Make sure the tunnel is up and adb is connected. Returns True if usable.
     heal_fast_paths=False skips restarting the scrcpy/u2 helpers (up to ~45s),
     for plain adb commands that don't use them."""
+    global _phone_api_why
+    _phone_api_why = ""  # only this call's own reason gets printed below
     subprocess.run([os.path.join(ROOT, "tunnel.sh"), "start"],
                    capture_output=True, timeout=45)
     adb("connect", TARGET)
@@ -147,10 +150,26 @@ def ensure(heal_fast_paths=True):
         # below can help: say why and stop (this took 130s on Oct 4,
         # restarting adb and the helpers against a phone that was away).
         probe = probe_phone_port()
+        if probe in ("closed", "notopen"):
+            # Wireless debugging off: ask the phone's helper app to turn it
+            # back on. An explicit `burner ensure` waits longer and tries
+            # even after a recent failed try.
+            try:
+                if reenable_debugging(probe, wait=90 if heal_fast_paths else 20,
+                                      force=heal_fast_paths):
+                    probe = "open"
+                else:
+                    probe = probe_phone_port()  # a fresh answer for the advice
+            except Exception as e:
+                print("turning Wireless debugging back on failed: {}".format(e),
+                      file=sys.stderr)
         if probe not in ("open", "unknown"):
             print("phone not reachable (state: {}): {}".format(
                 r.stdout.strip() or "none", describe_unreachable(probe)),
                 file=sys.stderr)
+            if _phone_api_why:
+                print("(the phone's adb-auto-enable app: {})".format(_phone_api_why),
+                      file=sys.stderr)
             return False
         # adb daemon itself can wedge (stale server) — restart it once.
         adb("kill-server")
@@ -186,43 +205,252 @@ def parse_proxy_probe(line):
     return "open" if len(parts) >= 2 and parts[1] == "200" else "notopen"
 
 
+def _tailnet_proxy():
+    """(host, auth) of the HTTP CONNECT proxy a VM reaches the tailnet
+    through (HTTPS_PROXY, port 3130, exactly as tunnel.sh), or None when
+    this computer is on the tailnet itself."""
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    if not proxy:
+        return None
+    rest = proxy.split("://", 1)[-1].rstrip("/")
+    auth, host = rest.rsplit("@", 1) if "@" in rest else ("", rest)
+    return host.split(":")[0], auth
+
+
+def phone_connect(ip, port, timeout=4):
+    """A socket to ip:port on the tailnet, direct or through the proxy.
+    Raises ConnectionRefusedError when the phone refuses (or the proxy
+    does on its behalf: it says the same for a closed port and an
+    unreachable phone), another OSError when nothing answers."""
+    import base64
+    import socket
+    proxy = _tailnet_proxy()
+    if proxy is None:
+        return socket.create_connection((ip, int(port)), timeout)
+    host, auth = proxy
+    sock = socket.create_connection((host, 3130), timeout)
+    try:
+        req = "CONNECT {0}:{1} HTTP/1.1\r\nHost: {0}:{1}\r\n".format(ip, port)
+        if auth:
+            req += "Proxy-Authorization: Basic {}\r\n".format(
+                base64.b64encode(auth.encode()).decode())
+        sock.sendall((req + "\r\n").encode())
+        sock.settimeout(timeout)
+        line = sock.recv(256).decode("latin-1", "replace").split("\r\n")[0]
+        if parse_proxy_probe(line) != "open":
+            raise ConnectionRefusedError("proxy: " + line)
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
 def probe_phone_port(ip=None, port=None, timeout=4):
     """How the phone's debugging port answers, without adb: "open",
     "closed" (the phone is up, but nothing listens: Wireless debugging is
     off), "unreachable" (nothing on the tailnet answers), "notopen" (the
     HTTP proxy a VM reaches the tailnet through refused the connection:
-    one of the two), or "unknown" (no address to try). Uses the proxy
-    exactly as tunnel.sh does when HTTPS_PROXY is set."""
-    import base64
-    import socket
+    one of the two), or "unknown" (no address to try)."""
     ip = ip or CFG.get("PHONE_TAILSCALE_IP", "")
     port = port or CFG.get("ADB_PORT", "5555")
     if not ip or ip.startswith("YOUR_"):
         return "unknown"
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
     try:
-        if proxy:
-            rest = proxy.split("://", 1)[-1].rstrip("/")
-            auth, host = rest.rsplit("@", 1) if "@" in rest else ("", rest)
-            host = host.split(":")[0]
-            sock = socket.create_connection((host, 3130), timeout)
-            try:
-                req = "CONNECT {0}:{1} HTTP/1.1\r\nHost: {0}:{1}\r\n".format(ip, port)
-                if auth:
-                    req += "Proxy-Authorization: Basic {}\r\n".format(
-                        base64.b64encode(auth.encode()).decode())
-                sock.sendall((req + "\r\n").encode())
-                sock.settimeout(timeout)
-                line = sock.recv(256).decode("latin-1", "replace").split("\r\n")[0]
-            finally:
-                sock.close()
-            return parse_proxy_probe(line)
-        socket.create_connection((ip, int(port)), timeout).close()
+        phone_connect(ip, port, timeout).close()
         return "open"
     except ConnectionRefusedError:
-        return "closed"
+        return "closed" if _tailnet_proxy() is None else "notopen"
     except (OSError, ValueError):
         return "unreachable"
+
+
+AUTO_ENABLE_API_PORT = "9093"  # adb-auto-enable's web API on the phone
+_phone_api_why = ""  # why the last phone_api call answered None
+REENABLE_STAMP = os.path.join(ROOT, "run", "reenable.json")
+REENABLE_EVERY_S = 120.0  # one try per this, across burner processes
+_REENABLE_LOCK = threading.Lock()
+
+
+def parse_json_body(body):
+    """The JSON object in a reply body, else None. Pure."""
+    try:
+        v = json.loads((body or b"").decode("utf-8", "replace"))
+    except (ValueError, RecursionError):
+        return None
+    return v if isinstance(v, dict) else None
+
+
+def phone_http(ip, port, timeout):
+    """An HTTP connection to ip:port on the tailnet: direct, or a CONNECT
+    tunnel through the proxy a VM reaches the tailnet with (HTTPS_PROXY,
+    port 3130, as tunnel.sh). A proxy that refuses the tunnel raises
+    OSError("Tunnel connection failed: <its status line>") on use."""
+    import base64
+    import http.client
+    proxy = _tailnet_proxy()
+    if proxy is None:
+        return http.client.HTTPConnection(ip, port, timeout=timeout)
+    host, auth = proxy
+    conn = http.client.HTTPConnection(host, 3130, timeout=timeout)
+    headers = {}
+    if auth:
+        headers["Proxy-Authorization"] = "Basic " + base64.b64encode(auth.encode()).decode()
+    conn.set_tunnel(ip, port, headers=headers)
+    return conn
+
+
+def phone_api(path, timeout=6):
+    """GET a path of adb-auto-enable's web API on the phone (port 9093 on
+    every interface, so over the tailnet, no adb needed). The JSON object
+    it answered, or None with why in _phone_api_why: the app not running
+    (refused), no answer, the proxy's refusal, or the app's own error."""
+    global _phone_api_why
+    import http.client
+    _phone_api_why = ""
+    ip = CFG.get("PHONE_TAILSCALE_IP", "")
+    if not ip or ip.startswith("YOUR_"):
+        _phone_api_why = "config.env has no phone address"
+        return None
+    port = int(AUTO_ENABLE_API_PORT)
+    try:
+        conn = phone_http(ip, port, timeout)
+        try:
+            conn.request("GET", path, headers={"Connection": "close"})
+            resp = conn.getresponse()
+            status, reason, body = resp.status, resp.reason, resp.read(65536)
+        finally:
+            conn.close()
+    except ConnectionRefusedError:
+        _phone_api_why = ("the proxy refused the connection" if _tailnet_proxy() else
+                          "port {} refused (the app isn't running on the phone)".format(port))
+        return None
+    except TimeoutError:
+        _phone_api_why = "no answer on port {} within {}s".format(port, timeout)
+        return None
+    except (OSError, http.client.HTTPException) as e:
+        _phone_api_why = "port {}: {}".format(port, " ".join(str(e).split())[:120])
+        return None
+    _trace("phone api {} -> {} {}".format(path, status, reason))
+    reply = parse_json_body(body)
+    if status != 200:
+        detail = reply or {}
+        why = detail.get("error") or detail.get("message")
+        _phone_api_why = "the app answered {} {}".format(status, reason)
+        if why:
+            _phone_api_why += ": " + str(why)
+        return None
+    if reply is None:
+        _phone_api_why = "the app's answer wasn't JSON"
+        return None
+    return reply
+
+
+def recent_reenable():
+    """(seconds ago, outcome) of the last try, by any burner process, to
+    turn Wireless debugging back on, if it was within REENABLE_EVERY_S;
+    else None. It lives in a stamp file because one failing command
+    calls ensure() many times."""
+    try:
+        with open(REENABLE_STAMP) as f:
+            d = json.load(f)
+        ago = time.time() - float(d.get("t", 0))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    if 0 <= ago < REENABLE_EVERY_S:
+        return ago, str(d.get("why", ""))
+    return None
+
+
+def note_reenable(why):
+    """Stamp a try (why: what happened), or clear the stamp (why=None)."""
+    try:
+        if why is None:
+            if os.path.exists(REENABLE_STAMP):
+                os.remove(REENABLE_STAMP)
+            return
+        os.makedirs(os.path.dirname(REENABLE_STAMP), exist_ok=True)
+        with open(REENABLE_STAMP, "w") as f:
+            json.dump({"t": time.time(), "why": why}, f)
+    except OSError:
+        pass
+
+
+def reenable_debugging(probe="closed", wait=90, force=False):
+    """The debugging port doesn't answer (probe: "closed", so Wireless
+    debugging is off, or "notopen", so that or the phone is away).
+    Android turns Wireless debugging off by itself whenever the phone's
+    Wi-Fi drops for a moment or it hops to another access point, and on
+    every restart; the adb-auto-enable app on the phone only turns it
+    back on at boot. So ask that app, over the tailnet, to run its boot
+    routine again (Wireless debugging on at once; adbd pinned to port
+    5555 about a minute later, after the app's own fixed waits) and wait
+    for the port. True once the port answers. One try per
+    REENABLE_EVERY_S unless force (an explicit `burner ensure`)."""
+    global _phone_api_why
+    what = ("Wireless debugging is off" if probe == "closed" else
+            "the phone's debugging port isn't answering")
+    with _REENABLE_LOCK:
+        recent = recent_reenable()
+        if recent and not force:
+            print("{}; burner tried to turn it back on {:.0f}s ago ({}), not again "
+                  "yet. `burner ensure` tries again.".format(what, *recent), file=sys.stderr)
+            return False
+        status = phone_api("/api/status")
+        if status is None and _phone_api_why == "the app's answer wasn't JSON":
+            status = {}  # alive: its status page isn't escaped after a failed run
+        if status is None:
+            print("{}, and the phone's adb-auto-enable app isn't answering ({})."
+                  .format(what, _phone_api_why), file=sys.stderr)
+            note_reenable("the app wasn't answering: " + _phone_api_why)
+            return False
+        if status.get("adb5555Available") is True:
+            # The app sees the port open: the trouble is on the way to the
+            # phone, and the app's routine would restart adbd for nothing.
+            print("the phone's adb-auto-enable app says the debugging port is open; "
+                  "checking again.", file=sys.stderr)
+            if probe_phone_port() == "open":
+                return True
+            _phone_api_why = ("the app sees the debugging port open on the phone itself; "
+                              "the trouble is on the way there (check Tailscale on the phone)")
+            return False
+        print("{}; asking the phone's adb-auto-enable app to turn it back on ..."
+              .format(what), file=sys.stderr)
+        note_reenable("asked the app")
+        reply = phone_api("/api/test")
+        if reply is None and not _phone_api_why.startswith("no answer"):
+            print("the app didn't take the request ({}).".format(_phone_api_why),
+                  file=sys.stderr)
+            note_reenable("the app didn't take the request: " + _phone_api_why)
+            return False
+        if reply is not None and reply.get("success") is not True:
+            why = reply.get("error") or reply.get("message") or "no success in its answer"
+            print("the app didn't take the request ({}).".format(why), file=sys.stderr)
+            note_reenable("the app didn't take the request: {}".format(why))
+            return False
+        if reply is None:
+            print("the request went out but its answer was lost; waiting for the port "
+                  "anyway.", file=sys.stderr)
+        t0 = time.monotonic()
+        deadline, told = t0 + wait, 0
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            if now - t0 >= told + 15:
+                told = int(now - t0)
+                print("still waiting for the debugging port ({}s; the app's routine takes "
+                      "about a minute) ...".format(told), file=sys.stderr)
+            time.sleep(min(2.0, deadline - now))
+            if probe_phone_port() == "open":
+                print("Wireless debugging is back on ({:.0f}s).".format(
+                    time.monotonic() - t0), file=sys.stderr)
+                note_reenable(None)
+                return True
+        print("the port didn't come back within {}s; the app's routine takes about a "
+              "minute, so run `burner ensure` again in a minute.".format(wait),
+              file=sys.stderr)
+        note_reenable("the port didn't come back within {}s".format(wait))
+        return False
 
 
 UNREACHABLE_WHY = {
@@ -230,16 +458,17 @@ UNREACHABLE_WHY = {
             "`burner ensure` once more; if that fails too, the phone has "
             "forgotten this computer: pair again (setup step 5).",
     "closed": "the phone is online, but Wireless debugging is off (nothing "
-              "listens on its debugging port). After a restart, adb-auto-enable "
-              "turns it back on within about a minute; otherwise turn on "
-              "Wireless debugging in Developer options on the phone.",
+              "listens on its debugging port). burner asks the phone's "
+              "adb-auto-enable app to turn it back on; when that doesn't "
+              "work, open that app on the phone once (its service must be "
+              "running), or turn on Wireless debugging in Developer options.",
     "unreachable": "the phone can't be reached on the tailnet. Check that it's "
                    "on, on Wi-Fi, and that Tailscale is connected on it.",
     "notopen": "the phone didn't accept a connection on its debugging port: "
-               "either Wireless debugging is off (after a restart, "
-               "adb-auto-enable turns it back on within about a minute; "
-               "otherwise turn it on in Developer options), or the phone is "
-               "off the tailnet (check Tailscale on it).",
+               "either Wireless debugging is off (burner asks the phone's "
+               "adb-auto-enable app to turn it back on; otherwise open that "
+               "app once, or turn it on in Developer options), or the phone "
+               "is off the tailnet (check Tailscale on it).",
     "unknown": "config.env has no phone address yet (PHONE_TAILSCALE_IP). "
                "Check wireless debugging + Tailscale.",
 }
@@ -1219,7 +1448,13 @@ def act_and_read(action, prev_root=None, idle_ms=2000, rereads=2):
             return "failed " + _u2_status[len("err act failed after sending: "):], None, ""
         if _u2_status.startswith("err act not sent"):
             _trace("act not sent ({})".format(_u2_status[len("err act not sent: "):][:60]))
-        return "unsent", None, ""
+            return "unsent", None, ""
+        if _u2_status == "unsent" or _u2_status.startswith("err unknown command"):
+            return "unsent", None, ""
+        # Any other error came back after the helper had the request, so
+        # the action may have happened: the caller must not act again.
+        why = _u2_status[len("err "):] if _u2_status.startswith("err ") else _u2_status
+        return "failed " + why[:100], None, ""
     try:
         root = ET.fromstring(xml)
     except ET.ParseError:

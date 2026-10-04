@@ -92,7 +92,8 @@ class OfflineTestCase(unittest.TestCase):
 
     GUARDS = ["subprocess", "u2sock", "adb", "adb_or_ensure", "ui_dump",
               "fast_dump", "wake", "wake_async", "tap_center",
-              "u2_invalidate", "scrcpy_send", "ensure"]
+              "u2_invalidate", "scrcpy_send", "ensure", "phone_api",
+              "reenable_debugging"]
 
     def setUp(self):
         super().setUp()
@@ -113,6 +114,10 @@ class OfflineTestCase(unittest.TestCase):
         self.addCleanup(p.stop)
         # No test writes the real run/commands.log.
         p = mock.patch.object(pc, "log_command")
+        p.start()
+        self.addCleanup(p.stop)
+        # The reason the phone's helper app last gave doesn't leak between tests.
+        p = mock.patch.object(pc, "_phone_api_why", "")
         p.start()
         self.addCleanup(p.stop)
 
@@ -2742,15 +2747,292 @@ class UnreachableTests(OfflineTestCase):
         self.allow("subprocess")
         adb = self.allow("adb", return_value=SimpleNamespace(returncode=1, stdout="", stderr=""))
         sc = self.allow("scrcpy_send")
+        # the try fails and leaves its reason, as the real one does
+        again = self.allow("reenable_debugging", side_effect=lambda *a, **k: setattr(
+            pc, "_phone_api_why", "port 9093 refused (the app isn't running on the phone)"))
+        pc._phone_api_why = "stale reason from an earlier call"  # reset by ensure()
         with mock.patch.object(pc, "probe_phone_port", return_value="closed"), \
                 mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             ok = pc.ensure()
         self.assertFalse(ok)
+        again.assert_called_once_with("closed", wait=90, force=True)  # explicit: long wait, no skip
         self.assertIn("phone not reachable (state: none): the phone is online, but "
                       "Wireless debugging is off", err.getvalue())
+        self.assertIn("(the phone's adb-auto-enable app: port 9093 refused", err.getvalue())
+        self.assertNotIn("stale reason", err.getvalue())
+        # behind the proxy the port looks "notopen": asked just the same;
+        # a failure inside the try is printed, not fatal
+        again = self.allow("reenable_debugging", side_effect=RuntimeError("boom"))
+        with mock.patch.object(pc, "probe_phone_port", return_value="notopen"), \
+                mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertFalse(pc.ensure(heal_fast_paths=False))
+        again.assert_called_once_with("notopen", wait=20, force=False)  # implicit: short wait
+        self.assertIn("turning Wireless debugging back on failed: boom", err.getvalue())
+        self.assertIn("off the tailnet", err.getvalue())
         # no adb restart and no helper heal against a phone that isn't there
-        self.assertEqual([c[0][0] for c in adb.call_args_list], ["connect", "get-state"])
+        self.assertEqual([c[0][0] for c in adb.call_args_list], ["connect", "get-state"] * 2)
         sc.assert_not_called()
+        # a phone that is off the tailnet gets no request
+        again.reset_mock()
+        with mock.patch.object(pc, "probe_phone_port", return_value="unreachable"), \
+                mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertFalse(pc.ensure())
+        again.assert_not_called()
+
+    def test_ensure_turns_wireless_debugging_back_on(self):
+        self._guards["ensure"].stop()
+        self.allow("subprocess")
+        states = iter(["", "device"])
+        adb = self.allow("adb", side_effect=lambda *a, **k: SimpleNamespace(
+            returncode=0, stdout=next(states) if a[0] == "get-state" else "", stderr=""))
+        again = self.allow("reenable_debugging", return_value=True)
+        with mock.patch.object(pc, "probe_phone_port", return_value="closed"), \
+                mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            ok = pc.ensure(heal_fast_paths=False)
+        self.assertTrue(ok)
+        again.assert_called_once_with("closed", wait=20, force=False)
+        self.assertIn("kill-server", [c[0][0] for c in adb.call_args_list])
+
+    def test_ensure_carries_on_when_the_port_opens_by_itself(self):
+        # the try "failed" (rate-limited, say) but a fresh probe finds the
+        # port open: ensure restarts adb and goes on
+        self._guards["ensure"].stop()
+        self.allow("subprocess")
+        states = iter(["", "device"])
+        adb = self.allow("adb", side_effect=lambda *a, **k: SimpleNamespace(
+            returncode=0, stdout=next(states) if a[0] == "get-state" else "", stderr=""))
+        self.allow("reenable_debugging", return_value=False)
+        probes = iter(["closed", "open"])
+        with mock.patch.object(pc, "probe_phone_port", side_effect=lambda: next(probes)), \
+                mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertTrue(pc.ensure(heal_fast_paths=False))
+        self.assertIn("kill-server", [c[0][0] for c in adb.call_args_list])
+
+    def _stamp_dir(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        p = mock.patch.object(pc, "REENABLE_STAMP", os.path.join(tmp.name, "reenable.json"))
+        p.start()
+        self.addCleanup(p.stop)
+        return pc.REENABLE_STAMP
+
+    def test_reenable_debugging_asks_the_app_and_waits_for_the_port(self):
+        self._guards["reenable_debugging"].stop()
+        stamp = self._stamp_dir()
+        api = self.allow("phone_api", side_effect=lambda path, timeout=6:
+                         {"success": True, "message": "Boot test started"}
+                         if path == "/api/test" else {"adb5555Available": False})
+        probes = iter(["closed", "closed", "open"])
+        with mock.patch.object(pc, "probe_phone_port", side_effect=lambda: next(probes)), \
+                mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertTrue(pc.reenable_debugging())
+        self.assertEqual([c[0][0] for c in api.call_args_list], ["/api/status", "/api/test"])
+        self.assertIn("back on", err.getvalue())
+        self.assertFalse(os.path.exists(stamp))  # a success leaves no stamp
+
+    def test_reenable_debugging_once_per_two_minutes(self):
+        self._guards["reenable_debugging"].stop()
+        self._stamp_dir()
+        api = self.allow("phone_api", return_value={"success": True})
+        with mock.patch.object(pc, "probe_phone_port", return_value="closed"), \
+                mock.patch.object(pc.time, "sleep"), \
+                mock.patch.object(pc.time, "monotonic", side_effect=iter(range(0, 400, 10))), \
+                self.cap() as (out, err):
+            self.assertFalse(pc.reenable_debugging(wait=20))
+        self.assertIn("didn't come back within 20s; the app's routine takes about a minute",
+                      err.getvalue())
+        self.assertEqual(pc.recent_reenable()[1], "the port didn't come back within 20s")
+        # the next implicit try (another command, another process) skips
+        api.reset_mock()
+        with mock.patch.object(pc, "probe_phone_port") as probe, self.cap() as (out, err):
+            self.assertFalse(pc.reenable_debugging(wait=20))
+        api.assert_not_called()
+        probe.assert_not_called()
+        self.assertIn("tried to turn it back on 0s ago (the port didn't come back within 20s)",
+                      err.getvalue())
+        # an explicit `burner ensure` tries anyway
+        probes = iter(["open"])
+        with mock.patch.object(pc, "probe_phone_port", side_effect=lambda: next(probes)), \
+                mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertTrue(pc.reenable_debugging(force=True))
+        self.assertIsNone(pc.recent_reenable())
+
+    def test_reenable_debugging_failures_say_why(self):
+        self._guards["reenable_debugging"].stop()
+        self._stamp_dir()
+        # the app isn't answering: no request, no wait, the reason shown
+        def unanswered(path, timeout=6):
+            pc._phone_api_why = "port 9093 refused (the app isn't running on the phone)"
+            return None
+        api = self.allow("phone_api", side_effect=unanswered)
+        with mock.patch.object(pc, "probe_phone_port") as probe, self.cap() as (out, err):
+            self.assertFalse(pc.reenable_debugging())
+        self.assertEqual([c[0][0] for c in api.call_args_list], ["/api/status"])
+        probe.assert_not_called()
+        self.assertIn("isn't answering (port 9093 refused", err.getvalue())
+        self.assertIn("the app wasn't answering", pc.recent_reenable()[1])
+        pc.note_reenable(None)
+        # the app answers but refuses: its error shown, no wait
+        self.allow("phone_api", side_effect=lambda path, timeout=6:
+                   {"success": False, "error": "not paired"} if path == "/api/test" else {})
+        with mock.patch.object(pc, "probe_phone_port") as probe, self.cap() as (out, err):
+            self.assertFalse(pc.reenable_debugging())
+        self.assertIn("didn't take the request (not paired)", err.getvalue())
+        probe.assert_not_called()
+        pc.note_reenable(None)
+        # no success flag at all counts as refused
+        self.allow("phone_api", side_effect=lambda path, timeout=6:
+                   {"error": "busy"} if path == "/api/test" else {})
+        with mock.patch.object(pc, "probe_phone_port"), self.cap() as (out, err):
+            self.assertFalse(pc.reenable_debugging())
+        self.assertIn("didn't take the request (busy)", err.getvalue())
+        pc.note_reenable(None)
+        # /api/test refused outright (not a lost answer): no wait
+        def refused(path, timeout=6):
+            if path == "/api/test":
+                pc._phone_api_why = "the app answered 500 Error: adb error"
+                return None
+            return {}
+        self.allow("phone_api", side_effect=refused)
+        with mock.patch.object(pc, "probe_phone_port") as probe, self.cap() as (out, err):
+            self.assertFalse(pc.reenable_debugging())
+        self.assertIn("didn't take the request (the app answered 500 Error: adb error)",
+                      err.getvalue())
+        probe.assert_not_called()
+        pc.note_reenable(None)
+        # a status page that isn't JSON still means the app is alive
+        calls = []
+
+        def unescaped(path, timeout=6):
+            calls.append(path)
+            if path == "/api/status":
+                pc._phone_api_why = "the app's answer wasn't JSON"
+                return None
+            return {"success": True}
+        self.allow("phone_api", side_effect=unescaped)
+        probes = iter(["open"])
+        with mock.patch.object(pc, "probe_phone_port", side_effect=lambda: next(probes)), \
+                mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertTrue(pc.reenable_debugging())
+        self.assertEqual(calls, ["/api/status", "/api/test"])
+        # the app says the port is open: its routine isn't run, the port is probed again
+        api = self.allow("phone_api", return_value={"adb5555Available": True})
+        with mock.patch.object(pc, "probe_phone_port", return_value="open"), self.cap() as (out, err):
+            self.assertTrue(pc.reenable_debugging())
+        self.assertEqual([c[0][0] for c in api.call_args_list], ["/api/status"])
+        # ... and when the probe still fails, the advice says where to look
+        with mock.patch.object(pc, "probe_phone_port", return_value="closed"), self.cap() as (out, err):
+            self.assertFalse(pc.reenable_debugging("notopen"))
+        self.assertIn("check Tailscale on the phone", pc._phone_api_why)
+        # behind the proxy the wording claims no more than burner knows
+        def unanswered2(path, timeout=6):
+            pc._phone_api_why = "the proxy refused the connection"
+            return None
+        self.allow("phone_api", side_effect=unanswered2)
+        with mock.patch.object(pc, "probe_phone_port"), self.cap() as (out, err):
+            self.assertFalse(pc.reenable_debugging("notopen", force=True))
+        self.assertIn("the phone's debugging port isn't answering, and the phone's "
+                      "adb-auto-enable app isn't answering (the proxy refused the connection)",
+                      err.getvalue())
+        pc.note_reenable(None)
+        # the request's answer was lost: the port is still waited for
+        def lost(path, timeout=6):
+            if path == "/api/test":
+                pc._phone_api_why = "no answer on port 9093 within 6s"
+                return None
+            return {}
+        self.allow("phone_api", side_effect=lost)
+        probes = iter(["open"])
+        with mock.patch.object(pc, "probe_phone_port", side_effect=lambda: next(probes)), \
+                mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertTrue(pc.reenable_debugging())
+        self.assertIn("answer was lost; waiting for the port anyway", err.getvalue())
+
+    def test_parse_json_body(self):
+        self.assertEqual(pc.parse_json_body(b'{"a": 1}'), {"a": 1})
+        self.assertIsNone(pc.parse_json_body(b"not json"))
+        self.assertIsNone(pc.parse_json_body(b"[1]"))
+        self.assertIsNone(pc.parse_json_body(b""))
+        self.assertIsNone(pc.parse_json_body(None))
+        self.assertIsNone(pc.parse_json_body(b"[" * 100000))  # no traceback for nonsense
+
+    def test_phone_api_over_http(self):
+        import http.client
+        self._guards["phone_api"].stop()
+        made = []
+
+        class FakeConn:
+            status, reason, body = 200, "OK", b'{"success": true}'
+            fail = None
+
+            def __init__(self, host, port, timeout=None):
+                self.host, self.port, self.timeout, self.tunnel = host, port, timeout, None
+                self.closed = False
+                made.append(self)
+
+            def set_tunnel(self, host, port, headers=None):
+                self.tunnel = (host, port, headers)
+
+            def request(self, method, path, headers=None):
+                self.req = (method, path, headers)
+                if FakeConn.fail:
+                    raise FakeConn.fail
+
+            def getresponse(self):
+                return SimpleNamespace(status=FakeConn.status, reason=FakeConn.reason,
+                                       read=lambda n=-1: FakeConn.body)
+
+            def close(self):
+                self.closed = True
+        env = {"HTTPS_PROXY": "", "https_proxy": ""}
+        with mock.patch.dict(pc.CFG, {"PHONE_TAILSCALE_IP": "100.64.0.9"}), \
+                mock.patch.dict(os.environ, env), \
+                mock.patch.object(http.client, "HTTPConnection", FakeConn):
+            self.assertEqual(pc.phone_api("/api/test"), {"success": True})
+            self.assertEqual((made[-1].host, made[-1].port, made[-1].timeout), ("100.64.0.9", 9093, 6))
+            self.assertIsNone(made[-1].tunnel)
+            self.assertEqual(made[-1].req, ("GET", "/api/test", {"Connection": "close"}))
+            self.assertTrue(made[-1].closed)
+            # the app's own error in a 500 is kept
+            FakeConn.status, FakeConn.reason, FakeConn.body = 500, "Error", b'{"error": "not paired"}'
+            self.assertIsNone(pc.phone_api("/api/test"))
+            self.assertEqual(pc._phone_api_why, "the app answered 500 Error: not paired")
+            FakeConn.status, FakeConn.reason, FakeConn.body = 200, "OK", b"<html>"
+            self.assertIsNone(pc.phone_api("/api/status"))
+            self.assertEqual(pc._phone_api_why, "the app's answer wasn't JSON")
+            # refused, timed out, and the proxy's refusal each say so
+            for fail, why in ((ConnectionRefusedError(), "port 9093 refused (the app isn't running"),
+                              (TimeoutError(), "no answer on port 9093 within 6s"),
+                              (OSError("Tunnel connection failed: 403 Forbidden"),
+                               "port 9093: Tunnel connection failed: 403 Forbidden")):
+                FakeConn.fail = fail
+                self.assertIsNone(pc.phone_api("/api/status"))
+                self.assertTrue(pc._phone_api_why.startswith(why), pc._phone_api_why)
+                self.assertTrue(made[-1].closed)
+            FakeConn.fail = None
+        # through the proxy: a CONNECT tunnel with the proxy's credentials
+        with mock.patch.dict(pc.CFG, {"PHONE_TAILSCALE_IP": "100.64.0.9"}), \
+                mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://user:pw@proxy.example:3128"}), \
+                mock.patch.object(http.client, "HTTPConnection", FakeConn):
+            FakeConn.status, FakeConn.reason, FakeConn.body = 200, "OK", b"{}"
+            self.assertEqual(pc.phone_api("/api/status"), {})
+            FakeConn.fail = ConnectionRefusedError()  # the proxy itself: not "the app"
+            self.assertIsNone(pc.phone_api("/api/status"))
+            self.assertEqual(pc._phone_api_why, "the proxy refused the connection")
+            FakeConn.fail = None
+        self.assertEqual((made[-2].host, made[-2].port), ("proxy.example", 3130))
+        self.assertEqual(made[-2].tunnel, ("100.64.0.9", 9093,
+                                           {"Proxy-Authorization": "Basic dXNlcjpwdw=="}))
+
+    def test_probe_through_the_proxy_says_notopen_when_it_refuses(self):
+        import socket as _socket
+        self._guards["socket.socket"].stop()
+        fake = mock.Mock()
+        fake.recv.return_value = b"HTTP/1.1 503 Service Unavailable\r\n\r\n"
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://user:pw@proxy.example:3128"}), \
+                mock.patch.object(_socket, "create_connection", return_value=fake):
+            self.assertEqual(pc.probe_phone_port("100.64.0.9", "5555"), "notopen")
+        fake.close.assert_called_once_with()
 
     def test_ensure_restarts_adb_when_the_port_answers(self):
         self._guards["ensure"].stop()
@@ -2937,6 +3219,21 @@ class OneRoundTripTests(OfflineTestCase):
         self.allow("u2sock", side_effect=unsent)
         self.assertEqual(pc.act_and_read({"tap": [1, 2]})[0], "unsent")
 
+        def no_helper(cmd, arg="", timeout=30):
+            pc._u2_status = "unsent"
+            return None
+        self.allow("u2sock", side_effect=no_helper)
+        self.assertEqual(pc.act_and_read({"tap": [1, 2]})[0], "unsent")
+
+        # any other error came back after the helper had the request: the
+        # action may have happened, so it is "failed", never "unsent"
+        def other(cmd, arg="", timeout=30):
+            pc._u2_status = "err the phone's UI server couldn't be restarted: x"
+            return None
+        self.allow("u2sock", side_effect=other)
+        status = pc.act_and_read({"tap": [1, 2]})[0]
+        self.assertTrue(status.startswith("failed the phone's UI server"), status)
+
     def test_tap_is_one_round_trip(self):
         self.allow("wake_async", return_value=mock.Mock())
         self.allow("ui_dump", return_value=ET.fromstring(TAP_XML))
@@ -3078,12 +3375,14 @@ class OneRoundTripTests(OfflineTestCase):
             mod.batch_results({"result": 1}, 1)
         calls = mod.act_calls({"tap": [10, 20], "idle": 1500})
         self.assertEqual([c[0] for c in calls],
-                         ["click", "dumpWindowHierarchy", "waitForIdle", "dumpWindowHierarchy"])
-        self.assertEqual(calls[0][1], [10, 20])
-        self.assertEqual(calls[2][1], [1500])
+                         ["wakeUp", "click", "dumpWindowHierarchy", "waitForIdle",
+                          "dumpWindowHierarchy"])
+        self.assertEqual(calls[1][1], [10, 20])
+        self.assertEqual(calls[3][1], [1500])
         calls = mod.act_calls({"key": 4})
         self.assertEqual([c[0] for c in calls],
-                         ["pressKeyCode", "dumpWindowHierarchy", "waitForIdle", "dumpWindowHierarchy"])
+                         ["wakeUp", "pressKeyCode", "dumpWindowHierarchy", "waitForIdle",
+                          "dumpWindowHierarchy"])
         calls = mod.act_calls({})
         self.assertEqual([c[0] for c in calls], ["waitForIdle", "dumpWindowHierarchy"])
         self.assertFalse(any(c[0] == "waitForWindowUpdate" for c in mod.act_calls({"tap": [1, 1]})))
@@ -3171,7 +3470,7 @@ class LabelTapTests(OfflineTestCase):
         with self.assertRaises(RuntimeError):
             mod.label_selector(SAMPLE_XML, "Nope")
         calls = mod.act_calls({"tap_selector": {"text": "OK"}})
-        self.assertEqual(calls[0], ("click", [{"text": "OK"}]))
+        self.assertEqual(calls[1], ("click", [{"text": "OK"}]))
 
 
 class StartAndSettingsTests(OfflineTestCase):
@@ -3243,13 +3542,363 @@ class StartAndSettingsTests(OfflineTestCase):
         self.assertIn("no settings page called", err.getvalue())
 
 
+PS_LISTING = """PID ARGS
+1 init second_stage
+2843 app_process / com.wetest.uia2.Main -p 9008
+2840 sh -c CLASSPATH=/data/local/tmp/u2.jar app_process / com.wetest.uia2.Main -p 9008
+3110 com.google.android.apps.messaging
+3200 app_process /system/bin com.android.commands.uiautomator.Launcher dump /sdcard/x.xml
+3300 ps -A -o PID,ARGS
+"""
+
+EMPTY_XML = '<?xml version="1.0"?><hierarchy rotation="0" />'
+# The system UI's bare window: an off screen reads like this.
+SHADE_NODE = ('<node index="0" text="" class="android.widget.FrameLayout" '
+              'package="com.android.systemui" bounds="[0,0][1080,2400]" />')
+SHADE_XML = '<?xml version="1.0"?><hierarchy rotation="0">' + SHADE_NODE + '</hierarchy>'
+
+
+class _FakeDev:
+    """An adb device: records shells, answers `ps` with its listings in
+    turn (the last one repeats)."""
+    def __init__(self, *listings):
+        self.listings = list(listings)
+        self.shells = []
+
+    def shell(self, cmd, timeout=None):
+        self.shells.append(cmd)
+        assert timeout, "a phone shell needs a timeout"
+        if not cmd.startswith("ps"):
+            return ""
+        return self.listings.pop(0) if len(self.listings) > 1 else self.listings[0]
+
+
+class _FakeServer:
+    """A uiautomator2 device: deviceInfo and a queue of reads. One read
+    more than queued is a failed test."""
+    def __init__(self, reads, screen_on=True):
+        self.reads = list(reads)
+        self.info = {"screenOn": screen_on, "sdkInt": 35}
+        self.calls = []
+        self.jsonrpc = SimpleNamespace(wakeUp=lambda: None, getConfigurator=lambda: {},
+                                       setConfigurator=lambda cfg: None)
+
+    def jsonrpc_call(self, method, params, timeout=10):
+        self.calls.append(method)
+        return self.reads.pop(0)
+
+
 class EmptyScreenTests(OfflineTestCase):
+    def no_sleep(self, mod):
+        """The helper's waits are no-ops for this test only (its `_time`
+        is the shared time module, so a plain assignment would leak), its
+        log lines go nowhere, and its trace spans never touch run/."""
+        p = mock.patch.object(mod._time, "sleep", lambda s: None)
+        p.start()
+        self.addCleanup(p.stop)
+        mod.log = lambda *a: None
+        mod.TRACE_FILE = os.path.join(ROOT, "run", "no-such-trace.jsonl")
+
     def test_helper_real_screen(self):
         mod = _u2mux()
         self.assertTrue(mod.real_screen(SAMPLE_XML))
-        self.assertFalse(mod.real_screen('<?xml version="1.0"?><hierarchy rotation="0" />'))
+        self.assertFalse(mod.real_screen(EMPTY_XML))
         self.assertFalse(mod.real_screen(""))
         self.assertFalse(mod.real_screen(None))
+
+    def test_helper_blank_screen(self):
+        mod = _u2mux()
+        self.assertTrue(mod.blank_screen(EMPTY_XML))
+        self.assertTrue(mod.blank_screen(""))
+        self.assertTrue(mod.blank_screen(SHADE_XML))
+        self.assertTrue(mod.blank_screen(SHADE_XML.replace(SHADE_NODE, SHADE_NODE * 2)))
+        self.assertFalse(mod.blank_screen(SAMPLE_XML))
+        # an app's bare window is the app, mid-draw: not blank
+        self.assertFalse(mod.blank_screen(SHADE_XML.replace("com.android.systemui", "com.example")))
+        # a pulled-down shade or a lock screen has many nodes: not blank
+        self.assertFalse(mod.blank_screen(SHADE_XML.replace(SHADE_NODE, SHADE_NODE * 5)))
+
+    def test_helper_server_pids(self):
+        mod = _u2mux()
+        # the server, its shell wrapper and a stray uiautomator command;
+        # not the ps itself, an app, or init
+        self.assertEqual(mod.server_pids(PS_LISTING), ["2843", "2840", "3200"])
+        self.assertEqual(mod.server_pids(""), [])
+        self.assertEqual(mod.server_pids(None), [])
+
+    def test_helper_kill_server_on_phone(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        dev = _FakeDev(PS_LISTING, "PID ARGS\n1 init\n")
+        self.assertEqual(mod.kill_server_on_phone(dev), ["2843", "2840", "3200"])
+        self.assertEqual(dev.shells, ["ps -A -o PID,ARGS", "kill -9 2843 2840 3200",
+                                      "ps -A -o PID,ARGS"])
+        # nothing running: nothing killed
+        dev = _FakeDev("PID ARGS\n1 init\n")
+        self.assertEqual(mod.kill_server_on_phone(dev), [])
+        self.assertEqual(dev.shells, ["ps -A -o PID,ARGS"])
+        # the kill didn't take: said so, not "killed"
+        dev = _FakeDev(PS_LISTING)
+        with self.assertRaises(RuntimeError) as cm:
+            mod.kill_server_on_phone(dev)
+        self.assertIn("could not kill the UI server on the phone (pid 2843", str(cm.exception))
+
+    def test_helper_err_text(self):
+        mod = _u2mux()
+        self.assertEqual(mod.err_text(RuntimeError("a  b\nc")), "RuntimeError: a b c")
+        long = RuntimeError("x" * 200 + " already registered")
+        self.assertTrue(mod.err_text(long).endswith("already registered"))
+        self.assertTrue(mod.err_text(long).startswith("RuntimeError: "))
+
+    def test_helper_server_works_reads_twice(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        # a fresh server's first read is empty, the second real: it works
+        d = _FakeServer([EMPTY_XML, SAMPLE_XML])
+        self.assertTrue(mod.server_works(d))
+        self.assertEqual(d.calls, ["dumpWindowHierarchy"] * 2)
+        # empty twice: it doesn't
+        self.assertFalse(mod.server_works(_FakeServer([EMPTY_XML, EMPTY_XML])))
+        # an off screen reads blank whatever the server does: woken first
+        woke = []
+        d = _FakeServer([SAMPLE_XML], screen_on=False)
+        d.jsonrpc = SimpleNamespace(wakeUp=lambda: woke.append(1))
+        self.assertTrue(mod.server_works(d))
+        self.assertEqual((woke, d.calls), ([1], ["dumpWindowHierarchy"]))
+
+    def test_helper_restart_allowed(self):
+        mod = _u2mux()
+        self.assertFalse(mod.restart_allowed(3))
+        self.assertTrue(mod.restart_allowed(60))
+
+    def test_helper_act_calls_wake_first(self):
+        mod = _u2mux()
+        for spec in ({"tap": [1, 2]}, {"key": 4}, {"tap_selector": {"text": "OK"}}):
+            calls = mod.act_calls(spec)
+            self.assertEqual(calls[0], ("wakeUp", []), spec)
+            self.assertIn(calls[1][0], mod.ACTION_METHODS)
+            self.assertEqual([m for m, _ in calls[2:]],
+                             ["dumpWindowHierarchy", "waitForIdle", "dumpWindowHierarchy"])
+        # POWER and SLEEP turn the screen off: no wake before them
+        for key in (26, 223, "26"):
+            self.assertEqual(mod.act_calls({"key": key})[0], ("pressKeyCode", [int(key)]))
+            self.assertTrue(mod.sleeps_the_screen({"key": key}))
+        self.assertFalse(mod.sleeps_the_screen({"key": 4}))
+        self.assertFalse(mod.sleeps_the_screen({"tap": [1, 2]}))
+        # a bare read wakes nothing
+        self.assertEqual([m for m, _ in mod.act_calls({})],
+                         ["waitForIdle", "dumpWindowHierarchy"])
+
+    def test_helper_ensure_server_kills_and_relaunches(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        devs = [_FakeServer([]), _FakeServer([SAMPLE_XML])]
+        fake_u2 = SimpleNamespace(connect=lambda target: devs.pop(0))
+        adb_dev = _FakeDev(PS_LISTING, "PID ARGS\n1 init\n")  # gone after the kill
+        fake_adbutils = SimpleNamespace(adb=SimpleNamespace(device=lambda target: adb_dev))
+        works = iter([False, True])
+        mod.server_works = lambda d: next(works)
+        closed, configured = [], []
+        mod._KEEPALIVE = SimpleNamespace(close=lambda: closed.append(1))
+        mod.apply_fast_config = lambda d: configured.append(d)
+        with mock.patch.dict(sys.modules, {"uiautomator2": fake_u2, "adbutils": fake_adbutils}):
+            d = mod.ensure_server()
+        self.assertEqual(d.reads, [SAMPLE_XML])  # the relaunched device, returned
+        self.assertEqual(adb_dev.shells, ["ps -A -o PID,ARGS", "kill -9 2843 2840 3200",
+                                          "ps -A -o PID,ARGS"])
+        self.assertEqual(closed, [1])
+        self.assertEqual(len(configured), 2)  # every server it connected to
+
+    def test_helper_ensure_server_gives_up_after_two_restarts(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        fake_u2 = SimpleNamespace(connect=lambda target: _FakeServer([]))
+        adb_dev = _FakeDev("PID ARGS\n1 init\n")
+        fake_adbutils = SimpleNamespace(adb=SimpleNamespace(device=lambda target: adb_dev))
+        mod.server_works = lambda d: False
+        mod._KEEPALIVE = SimpleNamespace(close=lambda: None)
+        with mock.patch.dict(sys.modules, {"uiautomator2": fake_u2, "adbutils": fake_adbutils}):
+            with self.assertRaises(RuntimeError) as cm:
+                mod.ensure_server()
+        self.assertIn("couldn't be restarted: no server process was running", str(cm.exception))
+        self.assertIn("(at first: it reads empty screens)", str(cm.exception))
+        self.assertEqual(adb_dev.shells, ["ps -A -o PID,ARGS"] * 2)
+
+    def test_helper_connect_stamps_the_restart_even_when_it_fails(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        dm = self._daemon(mod)
+        dm.d = None
+        mod.install_keepalive = lambda: None
+        mod._KEEPALIVE = SimpleNamespace(close=lambda: None)
+        mod.ensure_server = lambda: (_ for _ in ()).throw(RuntimeError("no phone"))
+        with self.assertRaises(RuntimeError):
+            mod.U2Daemon.connect(dm)
+        self.assertGreater(dm._last_restart, 0)  # the cooldown runs from now
+        self.assertFalse(mod.restart_allowed(mod._time.monotonic() - dm._last_restart))
+        self.assertEqual(dm._restart_error, "RuntimeError: no phone")
+        # a restart that works clears it (connect reads once to warm up)
+        mod.ensure_server = lambda: _FakeServer([SAMPLE_XML])
+        mod.U2Daemon.connect(dm)
+        self.assertIsNone(dm._restart_error)
+
+    def test_helper_act_reports_a_failed_read_after_the_action(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        dm = self._daemon(mod)
+        dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()
+        dm.d = _FakeServer([], screen_on=True)
+        dm._batch = lambda calls, timeout=45.0: [None] * (len(calls) - 1) + [EMPTY_XML]
+        dm._fix_blank_read = lambda xml, what: (_ for _ in ()).throw(RuntimeError("server gone"))
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"tap": [1, 2]}))
+        self.assertTrue(str(cm.exception).startswith(
+            "act failed after sending: the read after it failed (RuntimeError: server gone)"),
+            str(cm.exception))
+        # the screen was off when the action landed: probably dropped, say so
+        dm._fix_blank_read = lambda xml, what: (SAMPLE_XML, True)
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"tap": [1, 2]}))
+        self.assertIn("the screen was off, so it was probably dropped", str(cm.exception))
+        # the wake before the action failed: the action may have been dropped
+        dm._batch = lambda calls, timeout=45.0: [RuntimeError("no wake")] + \
+            [None] * (len(calls) - 2) + [SAMPLE_XML]
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"key": 4}))
+        self.assertIn("the wake before it failed (no wake), so it may have been dropped",
+                      str(cm.exception))
+        # the action's own failure is found by method, behind the wake
+        dm._batch = lambda calls, timeout=45.0: [None, RuntimeError("no such element")] + \
+            [SAMPLE_XML] * (len(calls) - 2)
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"tap_selector": {"text": "OK"}}))
+        self.assertEqual(str(cm.exception), "act failed after sending: no such element")
+        # a POWER key's blank read after is expected: no fix, no error, no cache
+        dm._batch = lambda calls, timeout=45.0: [None] * (len(calls) - 1) + [SHADE_XML]
+        self.assertEqual(dm.cmd_act(json.dumps({"key": 26})), SHADE_XML.encode())
+        self.assertIsNone(dm._cache)
+
+    def _daemon(self, mod):
+        """A daemon object without a phone: no __init__, and a restart
+        fails the test. It has its locks and an empty cache."""
+        import threading
+        dm = mod.U2Daemon.__new__(mod.U2Daemon)
+        dm._lock, dm._cache_lock = threading.RLock(), threading.Lock()
+        dm._gen, dm._cache = 0, None
+        dm._last_restart = -1e9
+        dm._restart_error = None
+        dm.connect = lambda: self.fail("unexpected server restart")
+        return dm
+
+    def test_helper_fix_blank_read_wakes_an_off_screen(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        for blank in (EMPTY_XML, SHADE_XML):
+            dm = self._daemon(mod)
+            woke = []
+            d = _FakeServer([SAMPLE_XML], screen_on=False)
+            d.jsonrpc.wakeUp = lambda: woke.append(1)
+            dm.d = d
+            self.assertEqual(dm._fix_blank_read(blank, "blank read"), (SAMPLE_XML, True))
+            self.assertEqual(woke, [1])
+        # the screen stays off: said so, not an empty screen
+        dm = self._daemon(mod)
+        dm.d = _FakeServer([SHADE_XML], screen_on=False)
+        with self.assertRaises(RuntimeError) as cm:
+            dm._fix_blank_read(SHADE_XML, "blank read")
+        self.assertIn("would not wake", str(cm.exception))
+        # wakeUp itself failing is an error too
+        dm = self._daemon(mod)
+        dm.d = _FakeServer([], screen_on=False)
+        dm.d.jsonrpc.wakeUp = lambda: (_ for _ in ()).throw(OSError("gone"))
+        with self.assertRaises(RuntimeError) as cm:
+            dm._fix_blank_read(SHADE_XML, "blank read")
+        self.assertIn("wakeUp failed", str(cm.exception))
+
+    def test_helper_fix_blank_read_keeps_a_bare_window_when_on(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        dm = self._daemon(mod)
+        dm.d = _FakeServer([], screen_on=True)
+        self.assertEqual(dm._fix_blank_read(SHADE_XML, "blank read"), (SHADE_XML, False))
+        self.assertEqual(dm.d.calls, [])  # no re-read, no restart
+
+    def test_helper_fix_blank_read_needs_the_server_to_answer(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        dm = self._daemon(mod)
+
+        class Dead:
+            @property
+            def info(self):
+                raise OSError("timed out")
+        dm.d = Dead()
+        with self.assertRaises(OSError):  # a dead server is not "screen on"
+            dm._fix_blank_read(EMPTY_XML, "blank read")
+
+    def test_helper_fix_blank_read_restarts_once(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        dm = self._daemon(mod)
+        restarts = []
+
+        def connect():
+            restarts.append(1)
+            dm._last_restart = mod._time.monotonic()
+            dm.d = _FakeServer([SAMPLE_XML])
+        dm.connect = connect
+        dm.d = _FakeServer([])
+        self.assertEqual(dm._fix_blank_read(EMPTY_XML, "blank read"), (SAMPLE_XML, False))
+        self.assertEqual(restarts, [1])
+        # right after a restart an empty read is kept, not restarted again
+        dm.d = _FakeServer([])
+        self.assertEqual(dm._fix_blank_read(EMPTY_XML, "blank read"), (EMPTY_XML, False))
+        self.assertEqual((restarts, dm.d.calls), ([1], []))
+        # a restart that failed a moment ago is reported, not papered over
+        dm._restart_error = "RuntimeError: no phone"
+        with self.assertRaises(RuntimeError) as cm:
+            dm._fix_blank_read(EMPTY_XML, "blank read")
+        self.assertIn("couldn't be restarted a moment ago: RuntimeError: no phone", str(cm.exception))
+        self.assertEqual(restarts, [1])
+
+    def test_helper_blank_reads_are_never_cached(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        dm = self._daemon(mod)
+        dm._last_restart = mod._time.monotonic()  # inside the cooldown: kept
+        dm.d = _FakeServer([EMPTY_XML, SAMPLE_XML], screen_on=True)
+        self.assertEqual(dm._dump(), EMPTY_XML)
+        self.assertIsNone(dm._cache)
+        self.assertEqual(dm._dump(), SAMPLE_XML)  # read again, not served the blank
+        self.assertEqual(dm._cache[1], SAMPLE_XML)
+        # `wait_for ... absent` doesn't take a blank read for "gone"
+        dm._cache = None
+        dm.d = _FakeServer([EMPTY_XML, SAMPLE_XML], screen_on=True)
+        out = json.loads(dm.cmd_wait_for(json.dumps({"text": "Nope", "absent": True, "timeout": 5})))
+        self.assertTrue(out["gone"])
+        self.assertEqual(out["polls"], 2)
+
+    def test_helper_handle_does_not_reconnect_inside_the_cooldown(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        dm = self._daemon(mod)
+        dm._last_restart = mod._time.monotonic()  # a restart a moment ago
+
+        class Dead:
+            @property
+            def info(self):
+                raise OSError("dead")
+        dm.d = Dead()
+        dm.cmd_dump = lambda arg: (_ for _ in ()).throw(OSError("dead"))
+        with self.assertRaises(OSError):
+            mod.U2Daemon.handle(dm, "dump")
+        # outside the cooldown it reconnects once and retries
+        dm._last_restart = -1e9
+        reconnects = []
+        dm.connect = lambda: reconnects.append(1)
+        with self.assertRaises(OSError):
+            mod.U2Daemon.handle(dm, "dump")
+        self.assertEqual(reconnects, [1])
 
 
 if __name__ == "__main__":
