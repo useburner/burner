@@ -2585,10 +2585,37 @@ class BranchInstallTests(OfflineTestCase):
                 pc.cmd_version(self.parse(["version", "--json"]))
             self.assertEqual(json.loads(out.getvalue())["ref"], "fast")
 
+    def test_update_waits_for_the_helper(self):
+        run = self.allow("subprocess")
+        run.run.return_value = SimpleNamespace(returncode=0)
+        with mock.patch.object(pc, "install_ref", return_value="fast"), \
+                mock.patch.object(pc, "wait_for_helper", return_value=True) as wait, \
+                mock.patch.object(pc, "u2_start_background"), \
+                mock.patch.object(pc, "_stop_helper_daemons"):
+            with self.cap() as (out, err):
+                rc = pc.cmd_update(self.parse(["update"]))
+        self.assertEqual(rc, 0)
+        wait.assert_called_once_with(30)
+        self.assertIn("helpers restarted", out.getvalue())
+        self.assertIn("Re-read", out.getvalue())
+
+    def test_start_opens_the_first_screen(self):
+        adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(
+            stdout="  mFocusedApp=ActivityRecord{1 u0 com.example/.Main t3}\n",
+            stderr="", returncode=0))
+        self.allow("u2_invalidate")
+        self.allow("nav_record")
+        self.allow("u2sock", return_value="100")
+        with mock.patch.object(pc.time, "sleep"), self.cap():
+            pc.cmd_start(SimpleNamespace(package="com.example", quiet=True))
+        self.assertIn("-f 0x10008000", adb.call_args[0][1])  # NEW_TASK|CLEAR_TASK
+
     def test_update_fails_loudly_on_a_bad_download(self):
         run = self.allow("subprocess")
         run.run.return_value = SimpleNamespace(returncode=22)
         with mock.patch.object(pc, "install_ref", return_value="fast"), \
+                mock.patch.object(pc, "wait_for_helper", return_value=True), \
+                mock.patch.object(pc, "u2_start_background"), \
                 mock.patch.object(pc, "_stop_helper_daemons") as stop:
             with self.cap() as (out, err):
                 rc = pc.cmd_update(self.parse(["update"]))
