@@ -46,7 +46,7 @@ Every step you take costs a round trip, so the fewer steps, the faster.
 | The user says | Do this |
 |---|---|
 | "What's on my burner?" / "Take a screenshot of my burner" | The screen right now: `burner shot --out .` and send the image. |
-| "Use Tinder to…" (any app or service by name) | `burner apps tinder` finds its package, then `burner start <package>`: the launch prints the first screen. Use the website in the phone's browser only if the app isn't installed or walls you at sign-in. |
+| "Use Tinder to…" (any app or service by name) | `burner apps tinder` finds its package, then `burner start <package>`: the launch prints the first screen. If the app isn't installed or stops you at a sign-in wall, read the site in the phone's browser instead: `burner open "https://…" com.android.chrome` (read-only, and tell the user). |
 | "Install Snapchat" (any free app) | `PLAY_PACKAGE=com.snapchat.android burner recipe play-install` with the package (a Play Store link ends in `?id=<package>`). Name only: `APP_QUERY=Vinted burner recipe play-search`, pick the right result (`burner tap "Vinted" --index 0`), then `burner recipe play-install-current`. Never buy an app. |
 | "Turn on Bluetooth" / a phone setting | `burner start com.android.settings`, then tap the rows it printed (`burner tap "Connected devices"`). Switch rows show `(on)` or `(off)`. |
 | "Check my burner" / battery / "is it on?" | `burner status`. |
