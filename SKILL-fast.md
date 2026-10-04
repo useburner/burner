@@ -102,7 +102,7 @@ Act (each prints the screen it ends on)
   burner type "text"                type into the focused field (--field "Hint", --clear)
   burner press BACK|HOME|ENTER      press a key (--repeat N)
   burner scroll [down|up|left|right|top|bottom]   scroll the open app (--times N, --to "Text")
-  burner wait "Text"                wait for text (--timeout 30, --absent to wait for it to go)
+  burner wait "Text"                wait for text (--timeout 30, "A || B" for either, --absent to wait for it to go)
   burner start <package>            open an app
   burner open <url> [package]       open a link, in one app if a package is given
   burner dismiss                    close pop-ups: Not now, Skip, Don't allow, Got it, Close

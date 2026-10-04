@@ -578,16 +578,22 @@ def iter_nodes(xml):
 
 def find_node(xml, needle, fuzzy=True):
     """First node whose text or content-desc matches needle: exact
-    (case-insensitive) match wins, then substring if fuzzy. None on miss."""
-    nl = needle.lower()
+    (case-insensitive) match wins, then substring if fuzzy. "A || B"
+    matches any of the labels (the first found, in that order). None on
+    miss."""
+    needles = [p.strip().lower() for p in needle.split("||") if p.strip()]
     first_sub = None
-    for n in iter_nodes(xml):
-        labels = (n["text"].lower(), n["desc"].lower())
-        if nl in labels:
-            return n
-        if fuzzy and first_sub is None and any(nl in l for l in labels):
-            first_sub = n
-    return first_sub
+    nodes = list(iter_nodes(xml))
+    for nl in needles:
+        for n in nodes:
+            labels = (n["text"].lower(), n["desc"].lower())
+            if nl in labels:
+                return n
+            if fuzzy and first_sub is None and any(nl in l for l in labels):
+                first_sub = n
+        if first_sub is not None:
+            return first_sub
+    return None
 
 
 def run_daemon():

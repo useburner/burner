@@ -2722,16 +2722,70 @@ class UnreachableTests(OfflineTestCase):
         self.assertIn("CONNECT 100.64.0.9:5555 HTTP/1.1", sent)
         self.assertIn("Proxy-Authorization: Basic dXNlcjpwdw==", sent)
 
-    def test_ensure_says_why(self):
+    def test_ensure_says_why_and_stops_early(self):
         self._guards["ensure"].stop()
         self.allow("subprocess")
-        self.allow("adb", return_value=SimpleNamespace(returncode=1, stdout="", stderr=""))
+        adb = self.allow("adb", return_value=SimpleNamespace(returncode=1, stdout="", stderr=""))
+        sc = self.allow("scrcpy_send")
         with mock.patch.object(pc, "probe_phone_port", return_value="closed"), \
                 mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
-            ok = pc.ensure(heal_fast_paths=False)
+            ok = pc.ensure()
         self.assertFalse(ok)
         self.assertIn("phone not reachable (state: none): the phone is online, but "
                       "Wireless debugging is off", err.getvalue())
+        # no adb restart and no helper heal against a phone that isn't there
+        self.assertEqual([c[0][0] for c in adb.call_args_list], ["connect", "get-state"])
+        sc.assert_not_called()
+
+    def test_ensure_restarts_adb_when_the_port_answers(self):
+        self._guards["ensure"].stop()
+        self.allow("subprocess")
+        states = iter(["", "device"])
+        adb = self.allow("adb", side_effect=lambda *a, **k: SimpleNamespace(
+            returncode=0, stdout=next(states) if a[0] == "get-state" else "", stderr=""))
+        with mock.patch.object(pc, "probe_phone_port", return_value="open"), \
+                mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            ok = pc.ensure(heal_fast_paths=False)
+        self.assertTrue(ok)
+        self.assertIn("kill-server", [c[0][0] for c in adb.call_args_list])
+
+
+class WaitEitherTests(OfflineTestCase):
+    def test_legacy_wait_accepts_either_label(self):
+        self.allow("u2sock", return_value=None)  # no helper: legacy polling
+        self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
+        args = self.parse(["wait", "Install || OK", "--timeout", "2", "--quiet", "--no-evidence"])
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_wait(args)
+        self.assertEqual(rc, 0)
+        self.assertIn("found: OK", out.getvalue())
+
+    def test_helper_find_node_accepts_either_label(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "u2mux_under_test", os.path.join(ROOT, "lib", "u2", "u2mux.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        n = mod.find_node(SAMPLE_XML, "Install || OK")
+        self.assertEqual(n["text"], "OK")
+        self.assertIsNone(mod.find_node(SAMPLE_XML, "Install || Buy"))
+        self.assertEqual(mod.find_node(SAMPLE_XML, "hello")["text"], "Hello")
+
+
+class OpenLinkTests(OfflineTestCase):
+    def test_open_quotes_the_link_and_package_for_the_phone_shell(self):
+        adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(
+            returncode=0, stdout="", stderr=""))
+        self.allow("u2_invalidate")
+        args = self.parse(["open", "--quiet", "market://search?q=Vinted&c=apps",
+                           "com.android.vending"])
+        self.allow("u2sock", return_value="100")
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_open(args)
+        self.assertEqual(rc, 0)
+        script = adb.call_args[0][1]
+        self.assertIn("-d 'market://search?q=Vinted&c=apps' 'com.android.vending'", script)
+        self.assertIn("opened market://search?q=Vinted&c=apps", out.getvalue())
 
 
 if __name__ == "__main__":

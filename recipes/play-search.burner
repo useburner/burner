@@ -7,4 +7,6 @@
 # you want, then run play-install-current. Pick the app yourself: the first
 # result is sometimes an ad or a lookalike.
 open market://search?q=$APP_QUERY&c=apps com.android.vending
-wait "Install" --timeout 30
+# The results list shows Install for a new app, Open for one already on
+# the phone, so wait for either.
+wait "Install || Open" --timeout 30

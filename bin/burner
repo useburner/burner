@@ -143,6 +143,15 @@ def ensure(heal_fast_paths=True):
     adb("connect", TARGET)
     r = adb("get-state")
     if r.stdout.strip() != "device":
+        # Is the phone there at all? When its port doesn't answer, nothing
+        # below can help: say why and stop (this took 130s on Oct 4,
+        # restarting adb and the helpers against a phone that was away).
+        probe = probe_phone_port()
+        if probe not in ("open", "unknown"):
+            print("phone not reachable (state: {}): {}".format(
+                r.stdout.strip() or "none", describe_unreachable(probe)),
+                file=sys.stderr)
+            return False
         # adb daemon itself can wedge (stale server) — restart it once.
         adb("kill-server")
         time.sleep(2)
@@ -155,6 +164,7 @@ def ensure(heal_fast_paths=True):
         print("phone not reachable (state: {}): {}".format(
             r.stdout.strip() or "none", describe_unreachable(probe_phone_port())),
             file=sys.stderr)
+        return False  # the helpers can't come up without the phone
     if not heal_fast_paths:
         return ok
     # Heal the fast paths too (best effort — legacy adb still works without them).
@@ -1874,9 +1884,14 @@ def cmd_wait(args):
             return rc
     # Legacy path.
     deadline = time.time() + args.timeout
+    labels = [p.strip() for p in args.text.split("||") if p.strip()] or [args.text]
     while True:
         nodes = walk(ui_dump())
-        hits = find_nodes(nodes, args.text, exact=not args.fuzzy)
+        hits = []
+        for label in labels:
+            hits = find_nodes(nodes, label, exact=not args.fuzzy)
+            if hits:
+                break
         if args.absent and not hits:
             rc = _wait_gone(args)
             _print_waited_screen(args)
@@ -3427,13 +3442,16 @@ def cmd_apps(args):
 
 
 def cmd_open(args):
-    cmd = ["shell", "am", "start", "-a", "android.intent.action.VIEW",
-           "-d", args.url]
+    # The phone's shell re-splits what adb sends: an unquoted link with
+    # `&` was cut there (`market://search?q=x&c=apps com.android.vending`
+    # became `market://search?q=x`, and the package was lost).
+    script = "am start -a android.intent.action.VIEW -d {}".format(
+        _sh_quote(args.url))
     # A trailing package targets the intent, skipping the "Open with" chooser
     # when several apps claim the link (e.g. Play Store and Aurora Store).
     if args.package:
-        cmd.append(args.package)
-    adb_or_ensure(*cmd)
+        script += " " + _sh_quote(args.package)
+    adb_or_ensure("shell", script)
     u2_invalidate()
     print("opened {}".format(args.url))
     read_after(quiet=getattr(args, "quiet", False), idle_ms=4000)
@@ -3539,7 +3557,7 @@ def build_parser():
     p.set_defaults(fn=cmd_tap)
 
     p = sub.add_parser("wait", help="wait for text to appear (or vanish)")
-    p.add_argument("text")
+    p.add_argument("text", help='text to wait for; "A || B" waits for either')
     p.add_argument("--timeout", type=int, default=30)
     p.add_argument("--fuzzy", action="store_true")
     p.add_argument("--absent", action="store_true",
