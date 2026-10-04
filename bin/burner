@@ -3465,35 +3465,31 @@ def cmd_open(args):
 
 
 def cmd_amazon_status(args):
-    """One-shot: latest Amazon order status from the app's order list.
-    Stops at the list (no detail-page drill-in). Each step runs as a fresh
-    burner subprocess — the Amazon WebView only exposes its nodes to a new
-    u2 session after a scroll, and in-process reuse returns stale trees."""
-    import re
-    import subprocess
-    pc_bin = os.path.join(ROOT, "bin", "burner")
-
-    def run(*a):
-        r = subprocess.run([pc_bin] + [str(x) for x in a],
-                           capture_output=True, text=True, timeout=90)
-        return r.stdout or ""
-
-    run("open", "https://www.amazon.com/gp/css/order-history",
-        "com.amazon.mShop.android.shopping")  # the app, not a browser
-    time.sleep(8)
-    # scroll once to force the WebView to expose order nodes
-    subprocess.run([ADB_BIN, "-s", TARGET, "shell", "input", "swipe",
-                    "1200", "800", "1200", "300", "200"],
-                   capture_output=True, timeout=30)
-    time.sleep(3)
+    """Latest Amazon order status from the app's order list, in one call:
+    the list by deep link (the app, not a browser), a wait on the phone
+    for it to load, one settled read, and a swipe plus read only when the
+    first read holds no order yet (the Amazon web view fills in after a
+    scroll). Stops at the list: no detail page."""
     order_re = re.compile(
         r"(.+?), Order placed (.+?), (Delivered|Shipped|Arriving|Out for delivery)([^.]*\.?)",
         re.IGNORECASE)
-    for _ in range(3):
-        out = run("dump")
-        for line in out.splitlines():
-            m = order_re.search(line)
-            if m and "Buy again" not in line:
+    adb_or_ensure("shell", "am start -a android.intent.action.VIEW -d {} {}".format(
+        _sh_quote("https://www.amazon.com/gp/css/order-history"),
+        _sh_quote("com.amazon.mShop.android.shopping")))
+    u2_invalidate()
+    u2sock("wait_for", json.dumps({"text": "Your Orders || Orders || Sign in",
+                                   "timeout": 20, "absent": False}), timeout=50)
+    root = None
+    for attempt in range(4):
+        if attempt:
+            _swipe_once("down")
+        root, _note = read_after_root()
+        if root is None:
+            return 1
+        for n in walk(root):
+            words = _row_words(n)
+            m = order_re.search(words)
+            if m and "Buy again" not in words:
                 item, placed, status, extra = m.groups()
                 item = item.lstrip("[").strip()
                 item = item[:55] + "..." if len(item) > 55 else item
@@ -3502,11 +3498,8 @@ def cmd_amazon_status(args):
                 print("{} — ordered {}".format(status, placed)
                       + (" ({})".format(detail) if detail else ""))
                 return 0
-        subprocess.run([ADB_BIN, "-s", TARGET, "shell", "input", "swipe",
-                        "1200", "800", "1200", "300", "200"],
-                       capture_output=True, timeout=30)
-        time.sleep(2)
-    print("no orders found", file=sys.stderr)
+    print("no orders found on the screen; it shows:", file=sys.stderr)
+    print_screen(root)
     return 1
 
 

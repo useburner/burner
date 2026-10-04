@@ -2814,5 +2814,47 @@ class KeyboardScrollTests(OfflineTestCase):
         self.assertFalse(mod.keyboard_in(""))
 
 
+AMAZON_XML = """<hierarchy rotation="0">
+  <node text="" class="android.widget.FrameLayout" package="com.amazon.mShop.android.shopping" bounds="[0,0][1080,2400]" clickable="false" enabled="true" focused="false" checked="false">
+    <node text="Your Orders" class="android.widget.TextView" package="com.amazon.mShop.android.shopping" bounds="[100,200][500,300]" clickable="false" enabled="true" focused="false" checked="false"/>
+    <node text="" content-desc="Anker USB-C Cable, Order placed September 28, 2026, Delivered September 30. Buy again" class="android.view.View" package="com.amazon.mShop.android.shopping" bounds="[0,400][1080,700]" clickable="true" enabled="true" focused="false" checked="false"/>
+    <node text="" content-desc="Anker USB-C Cable, Order placed September 28, 2026, Delivered September 30." class="android.view.View" package="com.amazon.mShop.android.shopping" bounds="[0,400][1080,700]" clickable="true" enabled="true" focused="false" checked="false"/>
+  </node>
+</hierarchy>"""
+
+
+class AmazonStatusTests(OfflineTestCase):
+    def test_reads_the_first_order_from_one_settled_read(self):
+        adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(
+            returncode=0, stdout="", stderr=""))
+        self.allow("u2_invalidate")
+        calls = []
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30: calls.append(cmd) or "")
+        self.allow("ui_dump", return_value=ET.fromstring(AMAZON_XML))
+        swipe = mock.patch.object(pc, "_swipe_once").start()
+        self.addCleanup(mock.patch.stopall)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_amazon_status(self.parse(["amazon-status"]))
+        self.assertEqual(rc, 0)
+        self.assertIn("Anker USB-C Cable", out.getvalue())
+        self.assertIn("Delivered — ordered September 28, 2026", out.getvalue())
+        self.assertIn("'https://www.amazon.com/gp/css/order-history' 'com.amazon.mShop.android.shopping'",
+                      adb.call_args[0][1])
+        self.assertEqual(calls[0], "wait_for")
+        swipe.assert_not_called()
+
+    def test_swipes_when_the_first_read_has_no_order(self):
+        self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
+        self.allow("u2_invalidate")
+        self.allow("u2sock", return_value="")
+        self.allow("ui_dump", side_effect=[ET.fromstring(SAMPLE_XML), ET.fromstring(AMAZON_XML)])
+        swipe = mock.patch.object(pc, "_swipe_once").start()
+        self.addCleanup(mock.patch.stopall)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_amazon_status(self.parse(["amazon-status"]))
+        self.assertEqual(rc, 0)
+        swipe.assert_called_once_with("down")
+
+
 if __name__ == "__main__":
     unittest.main()
