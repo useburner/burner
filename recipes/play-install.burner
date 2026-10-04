@@ -19,4 +19,6 @@ tap "Install"
 # Downloads are slow. "Uninstall" only appears once the install finishes
 # (the button row becomes "Uninstall" + "Open"). Waiting on "Open" instead
 # would substring-match listing text like the description.
-wait "Uninstall" --timeout 600
+# After the install the button row reads "Uninstall" + "Open" (the Pixel 7
+# showed only "Open" once and the old wait sat here for 10 minutes).
+wait "Uninstall || Open" --timeout 600
