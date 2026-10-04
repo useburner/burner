@@ -3556,6 +3556,16 @@ EMPTY_XML = '<?xml version="1.0"?><hierarchy rotation="0" />'
 SHADE_NODE = ('<node index="0" text="" class="android.widget.FrameLayout" '
               'package="com.android.systemui" bounds="[0,0][1080,2400]" />')
 SHADE_XML = '<?xml version="1.0"?><hierarchy rotation="0">' + SHADE_NODE + '</hierarchy>'
+# An app's nodes without one word on them: what a badly reading server
+# returned for a Settings page (Oct 4), and what a screen mid-draw looks like.
+MUTE_XML = ('<?xml version="1.0"?><hierarchy rotation="0">'
+            '<node index="0" text="" class="android.widget.FrameLayout" package="com.android.settings"'
+            ' content-desc="" bounds="[0,0][1080,2400]">'
+            '<node index="0" text="" class="android.widget.LinearLayout" package="com.android.settings"'
+            ' content-desc="" bounds="[0,0][1080,2400]">'
+            '<node index="0" text="" class="androidx.recyclerview.widget.RecyclerView"'
+            ' package="com.android.settings" content-desc="" bounds="[0,200][1080,2400]" />'
+            '</node></node></hierarchy>')
 
 
 class _FakeDev:
@@ -3617,6 +3627,187 @@ class EmptyScreenTests(OfflineTestCase):
         self.assertFalse(mod.blank_screen(SHADE_XML.replace("com.android.systemui", "com.example")))
         # a pulled-down shade or a lock screen has many nodes: not blank
         self.assertFalse(mod.blank_screen(SHADE_XML.replace(SHADE_NODE, SHADE_NODE * 5)))
+
+    def test_helper_mute_read(self):
+        mod = _u2mux()
+        self.assertTrue(mod.mute_read(MUTE_XML))
+        self.assertFalse(mod.mute_read(SAMPLE_XML))
+        self.assertFalse(mod.mute_read(EMPTY_XML))  # that one is blank, not wordless
+        self.assertFalse(mod.mute_read(SHADE_XML))
+        # one word anywhere, as text or as a description, and it isn't mute
+        self.assertFalse(mod.mute_read(MUTE_XML.replace('content-desc="" bounds="[0,200]',
+                                                        'content-desc="Search" bounds="[0,200]')))
+        self.assertFalse(mod.mute_read(MUTE_XML.replace('text="" class="android.widget.LinearLayout"',
+                                                        'text="Pair new device" class="android.widget.LinearLayout"')))
+        # a word is a word: an entity in a text attribute counts
+        self.assertFalse(mod.mute_read(MUTE_XML.replace(' text="" class="android.widget.LinearLayout"',
+                                                        ' text="&quot;" class="android.widget.LinearLayout"')))
+        # a resource-id is never a word
+        self.assertTrue(mod.mute_read(MUTE_XML.replace('index="0" text="" class="androidx',
+                                                       'index="0" resource-id="android:id/text1" text="" class="androidx')))
+
+    def test_helper_fix_blank_read_replaces_a_wordless_server(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        clock = [1000.0]
+        p = mock.patch.object(mod._time, "monotonic", lambda: clock[0])
+        p.start()
+        self.addCleanup(p.stop)
+        # a screen loading: wordless for a few seconds, kept as it is, no
+        # extra read, no restart
+        dm = self._daemon(mod)
+        dm.d = _FakeServer([], screen_on=True)
+        self.assertEqual(dm._fix_blank_read(MUTE_XML, "wordless read"), (MUTE_XML, False))
+        self.assertEqual(dm._mute_since, 1000.0)
+        clock[0] += 5
+        self.assertEqual(dm._fix_blank_read(MUTE_XML, "wordless read"), (MUTE_XML, False))
+        self.assertEqual(dm.d.calls, [])
+        # wordless for 8s across reads: the server is replaced, by force (a
+        # wordless server passes the usual checks)
+        restarts = []
+
+        def connect(force=False):
+            restarts.append(force)
+            dm._last_restart = clock[0]
+            dm.d = _FakeServer([SAMPLE_XML])
+        dm.connect = connect
+        clock[0] += 4
+        self.assertEqual(dm._fix_blank_read(MUTE_XML, "wordless read"), (SAMPLE_XML, False))
+        self.assertEqual(restarts, [True])
+        self.assertFalse(dm._wordless_seen)  # the fresh server read words
+        # a fresh server that reads no words either settles it: the screen
+        # has none, and reads are kept, however long, until one has words
+        dm = self._daemon(mod)
+
+        def connect_mute(force=False):
+            restarts.append(force)
+            dm.d = _FakeServer([MUTE_XML])
+        dm.connect = connect_mute
+        dm._mute_since = clock[0] - 30
+        dm.d = _FakeServer([], screen_on=True)
+        self.assertEqual(dm._fix_blank_read(MUTE_XML, "wordless read"), (MUTE_XML, False))
+        self.assertTrue(dm._wordless_seen)
+        self.assertEqual(restarts, [True, True])
+        dm._last_restart = -1e9
+        clock[0] += 100
+        self.assertEqual(dm._fix_blank_read(MUTE_XML, "wordless read"), (MUTE_XML, False))
+        self.assertEqual(restarts, [True, True])
+        # a replacement that fails keeps the read and the spell's attempt:
+        # the cooldown paces the next try
+        dm = self._daemon(mod)
+        dm._mute_since = clock[0] - 30
+        dm.connect = lambda force=False: (_ for _ in ()).throw(RuntimeError("no phone"))
+        dm.d = _FakeServer([], screen_on=True)
+        self.assertEqual(dm._fix_blank_read(MUTE_XML, "wordless read"), (MUTE_XML, False))
+        self.assertFalse(dm._wordless_seen)
+        # the screen went off during the replacement: the read after it is
+        # blank, and the wake path handles it
+        dm = self._daemon(mod)
+        dm._mute_since = clock[0] - 30
+        woke = []
+
+        def connect_dark(force=False):
+            dm._last_restart = clock[0]
+            dm.d = _FakeServer([SHADE_XML, SAMPLE_XML], screen_on=False)
+            dm.d.jsonrpc.wakeUp = lambda: woke.append(1)
+        dm.connect = connect_dark
+        dm.d = _FakeServer([], screen_on=True)
+        self.assertEqual(dm._fix_blank_read(MUTE_XML, "wordless read"), (SAMPLE_XML, False))
+        self.assertEqual(woke, [1])
+        # replace=False (a wait near its deadline): kept whatever the spell
+        dm = self._daemon(mod)
+        dm._mute_since = clock[0] - 30
+        dm.d = _FakeServer([], screen_on=True)
+        self.assertEqual(dm._fix_blank_read(MUTE_XML, "wordless read", replace=False),
+                         (MUTE_XML, False))
+
+    def test_helper_wordless_spell_ends_with_a_read_with_words(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        dm = self._daemon(mod)
+        dm._mute_since, dm._wordless_seen = 1.0, True
+        dm.d = _FakeServer([SAMPLE_XML], screen_on=True)
+        self.assertEqual(dm._dump(), SAMPLE_XML)
+        self.assertEqual((dm._mute_since, dm._wordless_seen), (None, False))
+        # a blank read doesn't end it (an app with no words whose screen went off)
+        dm._mute_since, dm._wordless_seen = 1.0, True
+        dm._last_restart = mod._time.monotonic()
+        dm.d = _FakeServer([SHADE_XML], screen_on=True)
+        self.assertEqual(dm._dump(fresh=True), SHADE_XML)
+        self.assertEqual((dm._mute_since, dm._wordless_seen), (1.0, True))
+        # after an action too
+        dm._mute_since, dm._wordless_seen = 1.0, True
+        dm._batch = lambda calls, timeout=45.0: [None] * (len(calls) - 1) + [SAMPLE_XML]
+        dm.cmd_act(json.dumps({"tap": [1, 2]}))
+        self.assertEqual((dm._mute_since, dm._wordless_seen), (None, False))
+        # a wordless read after an action comes back as the screen, never as an error
+        dm.d = _FakeServer([], screen_on=True)
+        dm._batch = lambda calls, timeout=45.0: [None] * (len(calls) - 1) + [MUTE_XML]
+        self.assertEqual(dm.cmd_act(json.dumps({"tap": [1, 2]})), MUTE_XML.encode())
+        self.assertIsNotNone(dm._mute_since)
+
+    def test_helper_wait_for_on_a_wordless_screen(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        clock = [100.0]
+
+        def tick():
+            clock[0] += 0.3
+            return clock[0]
+        p = mock.patch.object(mod._time, "monotonic", tick)
+        p.start()
+        self.addCleanup(p.stop)
+        # the deadline holds: a wordless screen costs no extra reads
+        dm = self._daemon(mod)
+        dm.d = _FakeServer([MUTE_XML] * 8, screen_on=True)
+        with self.assertRaises(mod.U2NotFound):
+            dm.cmd_wait_for(json.dumps({"text": "Nope", "timeout": 1}))
+        self.assertLessEqual(len(dm.d.calls), 4)
+        # "gone" is never read off a wordless screen until a fresh server agreed
+        dm = self._daemon(mod)
+        dm.d = _FakeServer([MUTE_XML] * 8, screen_on=True)
+        with self.assertRaises(mod.U2NotFound):
+            dm.cmd_wait_for(json.dumps({"text": "Nope", "absent": True, "timeout": 1}))
+        dm._wordless_seen = True
+        dm.d = _FakeServer([MUTE_XML], screen_on=True)
+        out = json.loads(dm.cmd_wait_for(json.dumps({"text": "Nope", "absent": True, "timeout": 1})))
+        self.assertTrue(out["gone"])
+        # a long wait on a long spell replaces the server and finds the label
+        dm = self._daemon(mod)
+        dm._mute_since = clock[0] - 30
+        restarts = []
+
+        def connect(force=False):
+            restarts.append(force)
+            dm._last_restart = clock[0]
+            dm.d = _FakeServer([SAMPLE_XML] * 3)
+        dm.connect = connect
+        dm.d = _FakeServer([MUTE_XML], screen_on=True)
+        out = json.loads(dm.cmd_wait_for(json.dumps({"text": "Hello", "timeout": 30})))
+        self.assertTrue(out["found"])
+        self.assertEqual(restarts, [True])
+        # a short wait on the same spell doesn't: not worth a replacement
+        dm = self._daemon(mod)
+        dm._mute_since = clock[0] - 30
+        dm.d = _FakeServer([MUTE_XML] * 8, screen_on=True)
+        with self.assertRaises(mod.U2NotFound):
+            dm.cmd_wait_for(json.dumps({"text": "Hello", "timeout": 2}))
+
+    def test_helper_ensure_server_replaces_a_wordless_server_by_force(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        devs = [_FakeServer([SAMPLE_XML])]
+        fake_u2 = SimpleNamespace(connect=lambda target: devs.pop(0))
+        adb_dev = _FakeDev(PS_LISTING, "PID ARGS\n1 init\n")
+        fake_adbutils = SimpleNamespace(adb=SimpleNamespace(device=lambda target: adb_dev))
+        mod.server_works = lambda d: True  # the running server passes every check
+        mod._KEEPALIVE = SimpleNamespace(close=lambda: None)
+        mod.apply_fast_config = lambda d: None
+        with mock.patch.dict(sys.modules, {"uiautomator2": fake_u2, "adbutils": fake_adbutils}):
+            d = mod.ensure_server(force=True)
+        self.assertEqual(d.reads, [SAMPLE_XML])
+        self.assertEqual(adb_dev.shells, ["ps -A -o PID,ARGS", "kill -9 2843 2840 3200",
+                                          "ps -A -o PID,ARGS"])
 
     def test_helper_server_pids(self):
         mod = _u2mux()
@@ -3731,14 +3922,14 @@ class EmptyScreenTests(OfflineTestCase):
         dm.d = None
         mod.install_keepalive = lambda: None
         mod._KEEPALIVE = SimpleNamespace(close=lambda: None)
-        mod.ensure_server = lambda: (_ for _ in ()).throw(RuntimeError("no phone"))
+        mod.ensure_server = lambda force=False: (_ for _ in ()).throw(RuntimeError("no phone"))
         with self.assertRaises(RuntimeError):
             mod.U2Daemon.connect(dm)
         self.assertGreater(dm._last_restart, 0)  # the cooldown runs from now
         self.assertFalse(mod.restart_allowed(mod._time.monotonic() - dm._last_restart))
         self.assertEqual(dm._restart_error, "RuntimeError: no phone")
         # a restart that works clears it (connect reads once to warm up)
-        mod.ensure_server = lambda: _FakeServer([SAMPLE_XML])
+        mod.ensure_server = lambda force=False: _FakeServer([SAMPLE_XML])
         mod.U2Daemon.connect(dm)
         self.assertIsNone(dm._restart_error)
 
@@ -3787,7 +3978,8 @@ class EmptyScreenTests(OfflineTestCase):
         dm._gen, dm._cache = 0, None
         dm._last_restart = -1e9
         dm._restart_error = None
-        dm.connect = lambda: self.fail("unexpected server restart")
+        dm._mute_since, dm._wordless_seen = None, False
+        dm.connect = lambda force=False: self.fail("unexpected server restart")
         return dm
 
     def test_helper_fix_blank_read_wakes_an_off_screen(self):
@@ -3870,6 +4062,13 @@ class EmptyScreenTests(OfflineTestCase):
         self.assertEqual(dm._dump(), EMPTY_XML)
         self.assertIsNone(dm._cache)
         self.assertEqual(dm._dump(), SAMPLE_XML)  # read again, not served the blank
+        self.assertEqual(dm._cache[1], SAMPLE_XML)
+        # a wordless read (a screen loading) is kept but never cached either
+        dm._cache = None
+        dm.d = _FakeServer([MUTE_XML, SAMPLE_XML], screen_on=True)
+        self.assertEqual(dm._dump(), MUTE_XML)
+        self.assertIsNone(dm._cache)
+        self.assertEqual(dm._dump(), SAMPLE_XML)
         self.assertEqual(dm._cache[1], SAMPLE_XML)
         # `wait_for ... absent` doesn't take a blank read for "gone"
         dm._cache = None

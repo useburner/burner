@@ -265,6 +265,26 @@ def blank_screen(xml):
     return set(re.findall(r'package="([^"]*)"', xml)) <= {SYSTEM_UI}
 
 
+def mute_read(xml):
+    """True for a read with an app's nodes but not one word on them: no
+    text and no content-desc anywhere. The server launched on the Pixel
+    7 at 15:35 (Oct 4) read Settings pages like this for two hours
+    (containers, no labels) while screenshots showed the labels; a fresh
+    server read them in full. A screen mid-draw reads like this for a
+    moment too, so one such read proves nothing (see MUTE_SPELL_S). Pure."""
+    if blank_screen(xml):
+        return False
+    return re.search(r'\s(?:text|content-desc)="[^"]+"', xml) is None
+
+
+def has_words(xml):
+    """True for a read with an app and at least one word on it. Pure."""
+    return not blank_screen(xml) and not mute_read(xml)
+
+
+MUTE_SPELL_S = 8.0  # wordless this long across reads: the server, not a loader
+
+
 def screen_on(d):
     """deviceInfo's screenOn: True or False, None when the server doesn't
     say. One cheap RPC. Raises when the server doesn't answer (a dead
@@ -350,22 +370,28 @@ def apply_fast_config(d):
         log("configurator tweak failed:", err_text(e))
 
 
-def ensure_server():
+def ensure_server(force=False):
     """The on-device uiautomator2 server, listening and able to read the
     screen; restarted (killed on the phone, started fresh) when it can't.
-    Returns the connected device."""
+    force: replace the running server without checking it (a server that
+    reads wordless pages passes every check). Returns the connected
+    device."""
     import adbutils
     import uiautomator2 as u2
-    first = "it reads empty screens"
-    try:
-        d = u2.connect(TARGET)  # starts a dead server (and pushes a new jar)
-        apply_fast_config(d)
-        if server_works(d):
-            return d
-        log("server answers but reads empty screens; restarting it")
-    except Exception as e:
-        first = err_text(e)
-        log("server not responding (%s); restarting it" % first)
+    if force:
+        first = "its reads held no words"
+        log("replacing the server: %s" % first)
+    else:
+        first = "it reads empty screens"
+        try:
+            d = u2.connect(TARGET)  # starts a dead server (and pushes a new jar)
+            apply_fast_config(d)
+            if server_works(d):
+                return d
+            log("server answers but reads empty screens; restarting it")
+        except Exception as e:
+            first = err_text(e)
+            log("server not responding (%s); restarting it" % first)
     why = "no read"
     for attempt in (1, 2):
         try:
@@ -501,16 +527,20 @@ class U2Daemon:
         self._last_xml_t = 0.0  # when it was read (monotonic)
         self._last_restart = -1e9  # monotonic time of the last connect()
         self._restart_error = None  # why the last connect() failed, until one works
+        self._mute_since = None  # monotonic time of the first wordless read of a spell
+        self._wordless_seen = False  # a fresh server read no words either this spell
         self.d = None
         self.connect()
 
-    def connect(self):
+    def connect(self, force=False):
+        """(Re)connect to the phone's server, restarting it when it can't
+        read the screen; force: replace it whatever its checks say."""
         with self._lock:
             self.invalidate()
             install_keepalive()
             _KEEPALIVE.close()  # drop streams to a possibly-dead server
             try:
-                self.d = ensure_server()  # applies the fast configurator
+                self.d = ensure_server(force)  # applies the fast configurator
                 self._restart_error = None
             except Exception as e:
                 self._restart_error = err_text(e)
@@ -536,8 +566,10 @@ class U2Daemon:
             return c[1]
         return None
 
-    def _dump(self, fresh=False):
-        """Hierarchy XML; served from cache if < DUMP_TTL old unless fresh."""
+    def _dump(self, fresh=False, replace=True):
+        """Hierarchy XML; served from cache if < DUMP_TTL old unless fresh.
+        replace=False: a wordless read is kept without replacing the
+        server (a `wait` close to its deadline)."""
         xml = None if fresh else self._fresh_cache()
         if xml is not None:
             log("dump cache hit")
@@ -548,15 +580,22 @@ class U2Daemon:
                 xml = read_screen(self.d)
             if blank_screen(xml):
                 xml, _ = self._fix_blank_read(xml, "blank read")
+            elif mute_read(xml):
+                xml, _ = self._fix_blank_read(xml, "wordless read", replace)
+            words = has_words(xml)
             with self._cache_lock:
-                if gen == self._gen and not blank_screen(xml):
-                    self._cache = (t0, xml)  # a blank read is never reused
+                if gen == self._gen and words:
+                    self._cache = (t0, xml)  # a blank or wordless read is never reused
+            if words:
+                self._mute_since, self._wordless_seen = None, False
             self._last_xml, self._last_xml_t = xml, _time.monotonic()
         return xml
 
-    def _fix_blank_read(self, xml, what):
+    def _fix_blank_read(self, xml, what, replace=True):
         """A read with no app on it (see blank_screen) -> (xml, woke), woke
-        being True when the screen was off and has been woken.
+        being True when the screen was off and has been woken. A read with
+        an app's nodes but no words (see mute_read) goes to
+        _fix_wordless_read, and woke is False.
         Screen off: wake it (the one thing here that changes the phone)
         and read again. Screen on, showing the system UI's bare window:
         keep the read, the phone is mid-transition (the CLI re-reads a
@@ -567,6 +606,8 @@ class U2Daemon:
         empty read is kept as what the phone shows. Raises when the
         server doesn't answer, the screen won't wake or the restart
         fails: the caller decides what a failed read means."""
+        if mute_read(xml):
+            return self._fix_wordless_read(xml, what, replace), False
         if screen_on(self.d) is False:
             log("%s; the screen is off, waking it" % what)
             self._wake()
@@ -576,7 +617,7 @@ class U2Daemon:
                 raise RuntimeError("the phone's screen is off and would not wake")
             return xml, True
         if real_screen(xml):
-            return xml, False
+            return xml, False  # the system UI's bare window: mid-transition
         if not restart_allowed(_time.monotonic() - self._last_restart):
             if self._restart_error:
                 raise RuntimeError("the UI server couldn't be restarted a moment ago: %s"
@@ -587,6 +628,40 @@ class U2Daemon:
         self.connect()
         with _t("dump rpc (after restart)"):
             return read_screen(self.d), False
+
+    def _fix_wordless_read(self, xml, what, replace=True):
+        """An app's nodes with no word on them (see mute_read). A screen
+        loading reads like this for a few seconds, so the read is kept
+        until the spell has lasted MUTE_SPELL_S across reads; then the
+        server is replaced (a fresh server read the Oct 4 pages in full),
+        once per spell: when the fresh server reads no words either, the
+        screen has none (a full-screen video) and reads are kept until
+        one with words ends the spell. replace=False keeps the read
+        whatever the spell. A wordless read is still a read: whatever
+        fails here is logged and the read in hand is returned, and the
+        cooldown paces another try."""
+        now = _time.monotonic()
+        if self._mute_since is None:
+            self._mute_since = now
+        spell = now - self._mute_since
+        if (not replace or self._wordless_seen or spell < MUTE_SPELL_S
+                or not restart_allowed(now - self._last_restart)):
+            return xml
+        log("%s for %.0fs on %d nodes; replacing the server"
+            % (what, spell, xml.count("<node")))
+        try:
+            self.connect(force=True)
+            with _t("dump rpc (after restart)"):
+                again = read_screen(self.d)
+            if blank_screen(again):  # the screen may have gone off meanwhile
+                again, _ = self._fix_blank_read(again, what + ", after the restart")
+        except Exception as e:
+            log("%s; couldn't replace the server (%s); keeping it" % (what, err_text(e)))
+            return xml
+        if has_words(again):
+            return again
+        self._wordless_seen = True  # a fresh server agrees: no words on this screen
+        return again if real_screen(again) else xml
 
     def _wake(self):
         """Turn the screen on (one RPC), then give it a moment to draw."""
@@ -692,7 +767,10 @@ class U2Daemon:
         while True:
             polls += 1
             try:
-                xml = self._dump(fresh=fresh)  # first poll may use a fresh cache
+                # The first poll may use a fresh cache. Close to the
+                # deadline a wordless read isn't worth a server replacement.
+                xml = self._dump(fresh=fresh,
+                                 replace=(deadline - _time.monotonic()) >= 15)
             except Exception as e:
                 # transport hiccup mid-wait: reconnect once, keep polling
                 if healed:
@@ -705,8 +783,10 @@ class U2Daemon:
             fresh = True
             n = find_node(xml, text)
             waited = int((_time.monotonic() - t0) * 1000)
-            # a blank read shows nothing, so it can't show `text` gone
-            if absent and n is None and not blank_screen(xml):
+            # a blank read shows nothing, so it can't show `text` gone; nor
+            # can a wordless one, until a fresh server read it wordless too
+            if (absent and n is None and not blank_screen(xml)
+                    and (not mute_read(xml) or self._wordless_seen)):
                 return json.dumps({"gone": True, "waited_ms": waited, "polls": polls}).encode()
             if not absent and n is not None:
                 n = dict(n, found=True, waited_ms=waited, polls=polls)
@@ -852,21 +932,25 @@ class U2Daemon:
             xml = results[-1]
             if isinstance(xml, Exception) or not xml:
                 raise RuntimeError("act failed after sending: no read (%s)" % xml)
-            if blank_screen(xml) and not sleeps_the_screen(spec):
+            if not has_words(xml) and not sleeps_the_screen(spec):
+                what = "blank" if blank_screen(xml) else "wordless"
                 # The action happened; only the read is repeated. A read
                 # that fails here must not read as "not sent" to the CLI.
                 try:
-                    xml, woke = self._fix_blank_read(xml, "blank read after the action")
+                    xml, woke = self._fix_blank_read(xml, what + " read after the action")
                 except Exception as e:
                     raise RuntimeError("act failed after sending: the read after it "
                                        "failed (%s)" % err_text(e, 100))
                 if woke and acted:
                     raise RuntimeError("act failed after sending: the screen was off, so "
                                        "it was probably dropped; the screen is on now")
+            words = has_words(xml)
             with self._cache_lock:
                 self._gen += 1
-                if not blank_screen(xml):
+                if words:
                     self._cache = (_time.monotonic(), xml)
+            if words:
+                self._mute_since, self._wordless_seen = None, False
             self._last_xml, self._last_xml_t = xml, _time.monotonic()
         return xml.encode()
 
