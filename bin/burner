@@ -1126,7 +1126,7 @@ def looks_half_drawn(rows, prev_rows):
     return prev_rows is not None and prev_rows >= 12 and rows <= 2
 
 
-def settled_read(prev_root=None, idle_ms=2000, delay=0.45):
+def settled_read(prev_root=None, idle_ms=2000, delay=0.45, rereads=2):
     """The screen once an action has landed: a short pause (the action's
     first events haven't reached the UI yet), then a wait on the phone
     until the UI goes quiet (half a second with no changes, idle_ms at
@@ -1144,13 +1144,13 @@ def settled_read(prev_root=None, idle_ms=2000, delay=0.45):
         time.sleep(0.5)  # no UI helper: give the screen a moment
     root = ui_dump(fresh=True)
     note = ""
-    for attempt in range(3):
+    for attempt in range(rereads + 1):
         lines = screen_lines(walk(root), *screen_dims())[0]
         half = looks_half_drawn(len(lines), prev_rows)
         same = prev_lines is not None and lines == prev_lines
         if not half and not same:
             break
-        if attempt == 2:
+        if attempt == rereads:
             note = "(may still be loading)" if half else "(unchanged)"
             break
         _trace("read {}, reading again".format(
@@ -1175,13 +1175,13 @@ def _report_unreadable(e):
         str(e)[:80]), file=sys.stderr)
 
 
-def read_after_root(prev_root=None, idle_ms=2000):
+def read_after_root(prev_root=None, idle_ms=2000, rereads=2):
     """settled_read for a caller that prints the screen itself: (root,
     note), or (None, "") with a line on stderr when the screen can't be
     read. Never raises."""
     _disarm_watchdog()
     try:
-        return settled_read(prev_root, idle_ms=idle_ms)
+        return settled_read(prev_root, idle_ms=idle_ms, rereads=rereads)
     except Exception as e:
         _report_unreadable(e)
         return None, ""
@@ -1198,7 +1198,7 @@ def settle_only(idle_ms=2000, delay=0.45):
         pass
 
 
-def read_after(quiet=False, idle_ms=2000, prev_root=None):
+def read_after(quiet=False, idle_ms=2000, prev_root=None, rereads=2):
     """After an action: wait for the screen to settle, read it once and
     print it, so the assistant needn't follow the action with a read.
     With quiet, only the wait. Never fails the action: a screen that can't
@@ -1207,7 +1207,7 @@ def read_after(quiet=False, idle_ms=2000, prev_root=None):
         settle_only(idle_ms=idle_ms)
         return
     t0 = time.time()
-    root, note = read_after_root(prev_root, idle_ms=idle_ms)
+    root, note = read_after_root(prev_root, idle_ms=idle_ms, rereads=rereads)
     if root is None:
         return
     _trace("read after {:.2f}s".format(time.time() - t0))
@@ -2395,7 +2395,9 @@ def cmd_start(args):
     except Exception:
         pass
     print("launched {}".format(args.package))
-    read_after(quiet=getattr(args, "quiet", False), idle_ms=3000)
+    # A launch: a splash that keeps animating never goes idle, and its
+    # loading screen is thin, so a short wait and one re-read at most.
+    read_after(quiet=getattr(args, "quiet", False), idle_ms=2500, rereads=1)
     return 0
 
 
@@ -3460,7 +3462,7 @@ def cmd_open(args):
     adb_or_ensure("shell", script)
     u2_invalidate()
     print("opened {}".format(args.url))
-    read_after(quiet=getattr(args, "quiet", False), idle_ms=4000)
+    read_after(quiet=getattr(args, "quiet", False), idle_ms=2500, rereads=1)
     return 0
 
 

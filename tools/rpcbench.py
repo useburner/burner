@@ -19,7 +19,9 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VENV = os.path.join(ROOT, ".venv", "bin", "python")
-if os.path.exists(VENV) and os.path.realpath(sys.executable) != os.path.realpath(VENV):
+# The venv's python is a symlink to the system one, so compare the venv
+# itself (sys.prefix), not the interpreter's real path.
+if os.path.exists(VENV) and os.path.realpath(sys.prefix) != os.path.realpath(os.path.dirname(os.path.dirname(VENV))):
     os.execv(VENV, [VENV, os.path.abspath(__file__)] + sys.argv[1:])
 
 import gzip  # noqa: E402
@@ -139,10 +141,33 @@ def main():
     def idle():
         post(rpc("waitForIdle", [500]))
 
+    def window_update():
+        # Does the server have waitForWindowUpdate (returns once a window
+        # content event arrives, or after the timeout)? With no action in
+        # flight it should take about the timeout.
+        wire, data = post(rpc("waitForWindowUpdate", [None, 300]))
+        parsed = json.loads(data)
+        return "result {}".format(parsed.get("result", parsed.get("error", "?")))[:60]
+
+    def act_batch():
+        # The shape an action would use: wait for the UI to react, settle,
+        # read, all in one round trip.
+        body = json.dumps([
+            {"jsonrpc": "2.0", "id": 1, "method": "waitForWindowUpdate", "params": [None, 300]},
+            {"jsonrpc": "2.0", "id": 2, "method": "waitForIdle", "params": [500]},
+            {"jsonrpc": "2.0", "id": 3, "method": "dumpWindowHierarchy", "params": [False, None]},
+        ])
+        wire, data = post(body)
+        parsed = json.loads(data)
+        ok = isinstance(parsed, list) and len(parsed) == 3 and "result" in parsed[2]
+        return "batch OK, {}B wire".format(wire) if ok else "no: {}".format(str(parsed)[:80])
+
     timed("deviceInfo RPC", device_info)
     timed("waitForIdle(500) RPC", idle)
+    timed("waitForWindowUpdate(300) RPC", window_update)
     timed("dumpWindowHierarchy RPC", dump)
     timed("batch [waitForIdle, dump]", batch)
+    timed("batch [windowUpdate, idle, dump]", act_batch)
     if os.path.exists(SOCK):
         timed("helper: screen", lambda: helper("screen"))
         timed("helper: dump fresh", lambda: helper("dump fresh"))

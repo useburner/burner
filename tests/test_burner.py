@@ -2856,5 +2856,21 @@ class AmazonStatusTests(OfflineTestCase):
         swipe.assert_called_once_with("down")
 
 
+class LaunchReadBudgetTests(OfflineTestCase):
+    def test_open_rereads_a_thin_screen_once_only(self):
+        self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
+        self.allow("u2_invalidate")
+        idles = []
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30: idles.append(arg) or "100")
+        empty = ET.fromstring('<hierarchy rotation="0"></hierarchy>')
+        dump = self.allow("ui_dump", return_value=empty)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_open(self.parse(["open", "https://example.com"]))
+        self.assertEqual(rc, 0)
+        self.assertEqual(dump.call_count, 2)  # the read and one re-read
+        self.assertEqual(idles[0], "2500")
+        self.assertIn("(may still be loading)", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
