@@ -152,8 +152,9 @@ def ensure(heal_fast_paths=True):
         r = adb("get-state")
     ok = r.stdout.strip() == "device"
     if not ok:
-        print("phone not reachable (state: {}). Check wireless debugging + Tailscale.".format(
-            r.stdout.strip() or "none"), file=sys.stderr)
+        print("phone not reachable (state: {}): {}".format(
+            r.stdout.strip() or "none", describe_unreachable(probe_phone_port())),
+            file=sys.stderr)
     if not heal_fast_paths:
         return ok
     # Heal the fast paths too (best effort — legacy adb still works without them).
@@ -166,6 +167,77 @@ def ensure(heal_fast_paths=True):
     except Exception as e:
         print("u2 mux heal failed: {}".format(e), file=sys.stderr)
     return ok
+
+
+def parse_proxy_probe(line):
+    """The CONNECT reply's first line -> "open" for 200, else "notopen"
+    (a proxy says the same for a closed port and an unreachable host)."""
+    parts = (line or "").split()
+    return "open" if len(parts) >= 2 and parts[1] == "200" else "notopen"
+
+
+def probe_phone_port(ip=None, port=None, timeout=4):
+    """How the phone's debugging port answers, without adb: "open",
+    "closed" (the phone is up, but nothing listens: Wireless debugging is
+    off), "unreachable" (nothing on the tailnet answers), "notopen" (the
+    HTTP proxy a VM reaches the tailnet through refused the connection:
+    one of the two), or "unknown" (no address to try). Uses the proxy
+    exactly as tunnel.sh does when HTTPS_PROXY is set."""
+    import base64
+    import socket
+    ip = ip or CFG.get("PHONE_TAILSCALE_IP", "")
+    port = port or CFG.get("ADB_PORT", "5555")
+    if not ip or ip.startswith("YOUR_"):
+        return "unknown"
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    try:
+        if proxy:
+            rest = proxy.split("://", 1)[-1].rstrip("/")
+            auth, host = rest.rsplit("@", 1) if "@" in rest else ("", rest)
+            host = host.split(":")[0]
+            sock = socket.create_connection((host, 3130), timeout)
+            try:
+                req = "CONNECT {0}:{1} HTTP/1.1\r\nHost: {0}:{1}\r\n".format(ip, port)
+                if auth:
+                    req += "Proxy-Authorization: Basic {}\r\n".format(
+                        base64.b64encode(auth.encode()).decode())
+                sock.sendall((req + "\r\n").encode())
+                sock.settimeout(timeout)
+                line = sock.recv(256).decode("latin-1", "replace").split("\r\n")[0]
+            finally:
+                sock.close()
+            return parse_proxy_probe(line)
+        socket.create_connection((ip, int(port)), timeout).close()
+        return "open"
+    except ConnectionRefusedError:
+        return "closed"
+    except (OSError, ValueError):
+        return "unreachable"
+
+
+UNREACHABLE_WHY = {
+    "open": "the phone's debugging port answers, but adb can't use it. Run "
+            "`burner ensure` once more; if that fails too, the phone has "
+            "forgotten this computer: pair again (setup step 5).",
+    "closed": "the phone is online, but Wireless debugging is off (nothing "
+              "listens on its debugging port). After a restart, adb-auto-enable "
+              "turns it back on within about a minute; otherwise turn on "
+              "Wireless debugging in Developer options on the phone.",
+    "unreachable": "the phone can't be reached on the tailnet. Check that it's "
+                   "on, on Wi-Fi, and that Tailscale is connected on it.",
+    "notopen": "the phone didn't accept a connection on its debugging port: "
+               "either Wireless debugging is off (after a restart, "
+               "adb-auto-enable turns it back on within about a minute; "
+               "otherwise turn it on in Developer options), or the phone is "
+               "off the tailnet (check Tailscale on it).",
+    "unknown": "config.env has no phone address yet (PHONE_TAILSCALE_IP). "
+               "Check wireless debugging + Tailscale.",
+}
+
+
+def describe_unreachable(state):
+    """One sentence for a probe_phone_port result. Pure."""
+    return UNREACHABLE_WHY.get(state, UNREACHABLE_WHY["unknown"])
 
 
 def adb_or_ensure(*args, **kwargs):

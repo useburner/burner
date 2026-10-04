@@ -2650,5 +2650,62 @@ class SystemDialogRowsTests(OfflineTestCase):
         self.assertIn("couldn't read the screen afterwards", err.getvalue())
 
 
+# --------------------------------- 14. a phone that can't be reached
+
+class UnreachableTests(OfflineTestCase):
+    def test_parse_proxy_probe(self):
+        self.assertEqual(pc.parse_proxy_probe("HTTP/1.1 200 Connection established"), "open")
+        self.assertEqual(pc.parse_proxy_probe("HTTP/1.1 503 Service Unavailable"), "notopen")
+        self.assertEqual(pc.parse_proxy_probe(""), "notopen")
+
+    def test_describe_unreachable(self):
+        self.assertIn("Wireless debugging is off", pc.describe_unreachable("closed"))
+        self.assertIn("tailnet", pc.describe_unreachable("unreachable"))
+        self.assertIn("pair again", pc.describe_unreachable("open"))
+        self.assertIn("off the tailnet", pc.describe_unreachable("notopen"))
+        self.assertIn("PHONE_TAILSCALE_IP", pc.describe_unreachable("unknown"))
+        self.assertIn("PHONE_TAILSCALE_IP", pc.describe_unreachable("???"))
+
+    def test_probe_without_an_address(self):
+        with mock.patch.dict(pc.CFG, {"PHONE_TAILSCALE_IP": "YOUR_PHONE_TAILSCALE_IP"}):
+            self.assertEqual(pc.probe_phone_port(), "unknown")
+
+    def test_probe_closed_port_direct(self):
+        import socket as _socket
+        self._guards["socket.socket"].stop()
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": "", "https_proxy": ""}), \
+                mock.patch.object(_socket, "create_connection",
+                                  side_effect=ConnectionRefusedError()):
+            self.assertEqual(pc.probe_phone_port("100.64.0.9", "5555"), "closed")
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": "", "https_proxy": ""}), \
+                mock.patch.object(_socket, "create_connection",
+                                  side_effect=TimeoutError()):
+            self.assertEqual(pc.probe_phone_port("100.64.0.9", "5555"), "unreachable")
+
+    def test_probe_through_the_proxy(self):
+        import socket as _socket
+        self._guards["socket.socket"].stop()
+        fake = mock.Mock()
+        fake.recv.return_value = b"HTTP/1.1 200 Connection established\r\n\r\n"
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://user:pw@proxy.example:3128"}), \
+                mock.patch.object(_socket, "create_connection", return_value=fake) as cc:
+            self.assertEqual(pc.probe_phone_port("100.64.0.9", "5555"), "open")
+        cc.assert_called_once_with(("proxy.example", 3130), 4)
+        sent = fake.sendall.call_args[0][0].decode()
+        self.assertIn("CONNECT 100.64.0.9:5555 HTTP/1.1", sent)
+        self.assertIn("Proxy-Authorization: Basic dXNlcjpwdw==", sent)
+
+    def test_ensure_says_why(self):
+        self._guards["ensure"].stop()
+        self.allow("subprocess")
+        self.allow("adb", return_value=SimpleNamespace(returncode=1, stdout="", stderr=""))
+        with mock.patch.object(pc, "probe_phone_port", return_value="closed"), \
+                mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            ok = pc.ensure(heal_fast_paths=False)
+        self.assertFalse(ok)
+        self.assertIn("phone not reachable (state: none): the phone is online, but "
+                      "Wireless debugging is off", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
