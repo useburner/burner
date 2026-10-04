@@ -273,6 +273,7 @@ class U2Daemon:
         self._cache_lock = threading.Lock()
         self._cache = None   # (monotonic ts at RPC start, xml)
         self._gen = 0        # bumped on invalidate; stale in-flight dumps aren't cached
+        self._last_xml = ""  # the newest read, however old: a hint for `screen`
         self.d = None
         self.connect()
 
@@ -324,6 +325,7 @@ class U2Daemon:
             with self._cache_lock:
                 if gen == self._gen:
                     self._cache = (t0, xml)
+            self._last_xml = xml
         return xml
 
     def _reconnect(self):
@@ -465,13 +467,20 @@ class U2Daemon:
         self.invalidate()
         return str(int((_time.monotonic() - t0) * 1000)).encode()
 
+    IME_HINTS = ("inputmethod", "keyboard", "honeyboard", "swiftkey", ".ime.", "latinime")
+
     def cmd_screen(self, _):
-        """"w h pkg": the screen at its current rotation and the app in
-        front, from one small deviceInfo RPC (a full dump costs ~0.8s)."""
+        """"w h pkg [kbd]": the screen at its current rotation and the app
+        in front, from one small deviceInfo RPC (a full dump costs ~0.8s),
+        plus "kbd" when the newest read showed a keyboard (a swipe must
+        then start above it: on the keys, Gboard glide-types)."""
         with self._lock:
             i = self.d.jsonrpc.deviceInfo()
-        return "{} {} {}".format(i["displayWidth"], i["displayHeight"],
-                                 i.get("currentPackageName") or "").strip().encode()
+        out = "{} {} {}".format(i["displayWidth"], i["displayHeight"],
+                                i.get("currentPackageName") or "").strip()
+        if keyboard_in(self._last_xml):
+            out += " kbd"
+        return out.encode()
 
     def cmd_shot(self, arg):
         """Screenshot as base64. One RPC returning a JPEG (a few hundred KB)
@@ -480,10 +489,12 @@ class U2Daemon:
         about 1568px anyway, so full size only costs transfer time."""
         import base64
         png = arg.strip() == "png"
+        # 0.6 scale, quality 75: about half the bytes of 0.7/80, and the
+        # vision models that read it shrink it further anyway.
         with self._lock:
             with _t("shot rpc"):
-                data = self.d.jsonrpc.takeScreenshot(1 if png else 0.7,
-                                                     100 if png else 80)
+                data = self.d.jsonrpc.takeScreenshot(1 if png else 0.6,
+                                                     100 if png else 75)
         if not data:
             raise RuntimeError("takeScreenshot returned nothing")
         if png:
@@ -574,6 +585,15 @@ def iter_nodes(xml):
                "bounds": n.get("bounds"), "center": [(x1 + x2) // 2, (y1 + y2) // 2],
                "enabled": n.get("enabled") != "false",
                "clickable": n.get("clickable") == "true"}
+
+
+def keyboard_in(xml):
+    """True if a dump holds a keyboard app's window. Pure."""
+    for part in (xml or "").lower().split('package="')[1:]:
+        pkg = part.split('"', 1)[0]
+        if any(h in pkg for h in U2Daemon.IME_HINTS):
+            return True
+    return False
 
 
 def find_node(xml, needle, fuzzy=True):

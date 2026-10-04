@@ -307,13 +307,14 @@ def _screen_for_tap():
 
 
 _screen_pkg = None  # app in front, from the last live_screen_dims()
+_screen_kbd = False  # keyboard open at the helper's newest read
 
 
 def live_screen_dims():
     """(w, h) at the current rotation from the UI helper's small device-info
     call, so a plain scroll needn't dump the screen. Also notes the app in
     front in _screen_pkg (None from an older helper). None if unavailable."""
-    global _screen_wh, _screen_pkg
+    global _screen_wh, _screen_pkg, _screen_kbd
     parts = (u2sock("screen", timeout=10) or "").split()
     try:
         w, h = int(parts[0]), int(parts[1])
@@ -322,7 +323,8 @@ def live_screen_dims():
     if w < 300 or h < 300:
         return None
     _screen_wh = "{} {}".format(w, h)
-    _screen_pkg = parts[2] if len(parts) > 2 else None
+    _screen_pkg = parts[2] if len(parts) > 2 and parts[2] != "kbd" else None
+    _screen_kbd = "kbd" in parts[2:]
     return w, h
 
 
@@ -3069,6 +3071,10 @@ def _swipe_coords(direction):
     w, h = screen_dims()
     cx, cy = w // 2, h // 2
     dx, dy = w * 3 // 10, h * 3 // 10
+    if _screen_kbd:
+        # The keyboard covers the bottom 40% or so: a swipe that starts on
+        # its keys is glide typing, not a scroll. Swipe in the top half.
+        cy, dy = h * 3 // 10, h // 5
     x1, y1, x2, y2 = {
         "down": (cx, cy + dy, cx, cy - dy),
         "up": (cx, cy - dy, cx, cy + dy),

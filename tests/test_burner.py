@@ -2788,5 +2788,31 @@ class OpenLinkTests(OfflineTestCase):
         self.assertIn("opened market://search?q=Vinted&c=apps", out.getvalue())
 
 
+class KeyboardScrollTests(OfflineTestCase):
+    def test_swipe_stays_above_an_open_keyboard(self):
+        self.allow("u2sock", return_value="1080 2400 com.example kbd")
+        self.assertEqual(pc.live_screen_dims(), (1080, 2400))
+        self.assertEqual(pc._screen_pkg, "com.example")
+        self.assertTrue(pc._screen_kbd)
+        x1, y1, x2, y2 = pc._swipe_coords("down")
+        self.assertLessEqual(max(y1, y2), 2400 * 0.5)  # never on the keys
+        self.assertGreater(y1, y2)  # still a scroll down (finger moves up)
+        self.allow("u2sock", return_value="1080 2400 com.example")
+        pc.live_screen_dims()
+        self.assertFalse(pc._screen_kbd)
+        x1, y1, x2, y2 = pc._swipe_coords("down")
+        self.assertEqual((y1, y2), (1920, 480))
+
+    def test_helper_reports_a_keyboard_in_its_newest_read(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "u2mux_under_test", os.path.join(ROOT, "lib", "u2", "u2mux.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertTrue(mod.keyboard_in(SCREEN_XML))
+        self.assertFalse(mod.keyboard_in(SAMPLE_XML))
+        self.assertFalse(mod.keyboard_in(""))
+
+
 if __name__ == "__main__":
     unittest.main()
