@@ -229,22 +229,41 @@ def install_keepalive():
     _KEEPALIVE.start_warmer()
 
 
+DUMP_RPC_TIMEOUT = 25.0   # a screen read never takes this long; a hung server does
+PROBE_TIMEOUT = 12.0      # the server check's read
+
+
+def read_screen(d, timeout=DUMP_RPC_TIMEOUT):
+    """One screen read with a bound. (A server that still answers
+    deviceInfo but hangs on reads is what a bad batch left behind on
+    Oct 4; without a bound, every command sat on it.)"""
+    return d.jsonrpc_call("dumpWindowHierarchy", [False, None], timeout=timeout)
+
+
+def server_works(d):
+    """True if the on-device server answers and can read the screen."""
+    d.info  # cheap deviceInfo RPC — raises if the server is dead
+    xml = read_screen(d, timeout=PROBE_TIMEOUT)
+    return bool(xml) and "<hierarchy" in xml
+
+
 def ensure_server():
-    """Make sure the on-device uiautomator2 server is listening."""
+    """Make sure the on-device uiautomator2 server is listening and can
+    read the screen; restart it when it can't."""
     import uiautomator2 as u2
     try:
-        d = u2.connect(TARGET)
-        d.info  # cheap deviceInfo RPC — raises if server is dead
-        return
+        if server_works(u2.connect(TARGET)):
+            return
+        log("server answers but can't read the screen; restarting it")
     except Exception as e:
         log("server not responding (%s), (re)initing" % e)
-        # The old server process can linger half-dead (this is the
-        # "ApplicationSharedMemory not initialized" error). Stop it before
-        # pushing a new one so the restart is clean and happens once.
-        try:
-            u2.connect(TARGET).stop_uiautomator()
-        except Exception as e2:
-            log("stop_uiautomator failed (%s)" % e2)
+    # The old server process can linger half-dead (this is the
+    # "ApplicationSharedMemory not initialized" error). Stop it before
+    # pushing a new one so the restart is clean and happens once.
+    try:
+        u2.connect(TARGET).stop_uiautomator()
+    except Exception as e2:
+        log("stop_uiautomator failed (%s)" % e2)
     # Pass the serial: with one, init only pushes u2.jar. Without it, init
     # also installs the ATX keyboard app, which Android 14+ blocks as an
     # "unsafe app" (it targets an old Android). burner doesn't need it.
@@ -252,7 +271,8 @@ def ensure_server():
         [VENV_PY, "-m", "uiautomator2", "init", "--serial", TARGET],
         capture_output=True, text=True, timeout=120)
     d = u2.connect(TARGET)
-    d.info
+    if not server_works(d):
+        raise RuntimeError("the phone's UI server came back but can't read the screen")
     log("server (re)started")
 
 
@@ -340,7 +360,7 @@ class U2Daemon:
             except Exception as e:
                 log("configurator tweak failed:", e)
             # warm up: one dump so later calls are fast
-            self.d.dump_hierarchy()
+            read_screen(self.d)
             log("connected to", TARGET)
 
     def invalidate(self):
@@ -365,7 +385,7 @@ class U2Daemon:
         with self._lock:
             gen, t0 = self._gen, _time.monotonic()
             with _t("dump rpc"):
-                xml = self.d.dump_hierarchy()
+                xml = read_screen(self.d)
             with self._cache_lock:
                 if gen == self._gen:
                     self._cache = (t0, xml)
@@ -374,8 +394,9 @@ class U2Daemon:
 
     def _reconnect(self):
         try:
-            self.d.info  # cheap RPC — raises if the server died
-            return True
+            if server_works(self.d):
+                return True
+            raise RuntimeError("server can't read the screen")
         except Exception:
             log("server check failed, reconnecting")
             try:
@@ -594,7 +615,7 @@ class U2Daemon:
         spec = json.loads(arg) if arg.strip() else {}
         calls = act_calls(spec)
         acted = calls[0][0] in ("click", "pressKeyCode", "setText")
-        timeout = int(spec.get("idle", 2000)) / 1000.0 + 40
+        timeout = int(spec.get("idle", 2000)) / 1000.0 + 20
         with self._lock:
             self.invalidate()
             with _t("act batch"):

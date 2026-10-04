@@ -1211,7 +1211,7 @@ def act_and_read(action, prev_root=None, idle_ms=2000, rereads=2):
     spec["idle"] = idle_ms
     _disarm_watchdog()
     t0 = time.time()
-    xml = u2sock("act", json.dumps(spec), timeout=idle_ms / 1000.0 + 50)
+    xml = u2sock("act", json.dumps(spec), timeout=idle_ms / 1000.0 + 30)
     if xml is None:
         if _u2_status == "lost":
             return "lost", None, ""
