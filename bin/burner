@@ -1217,6 +1217,8 @@ def act_and_read(action, prev_root=None, idle_ms=2000, rereads=2):
             return "lost", None, ""
         if _u2_status.startswith("err act failed after sending"):
             return "failed " + _u2_status[len("err act failed after sending: "):], None, ""
+        if _u2_status.startswith("err act not sent"):
+            _trace("act not sent ({})".format(_u2_status[len("err act not sent: "):][:60]))
         return "unsent", None, ""
     try:
         root = ET.fromstring(xml)
@@ -1770,6 +1772,24 @@ def cmd_tap(args):
         except ValueError as e:
             return _tap_fail(args, str(e))
     waker = wake_async()
+    plain = (args.xy is None and snap_xy is None and not args.fuzzy
+             and args.index is None and not args.settle and not args.quiet
+             and not as_json(args) and not args.no_occlusion_check)
+    if plain:
+        # The screen the assistant was just shown is the helper's newest
+        # read: when the label is on it exactly once, the helper taps it
+        # by label and returns the settled screen in one round trip. Any
+        # other case (two matches, an older read) reads first, below.
+        status, root, note = act_and_read({"tap_label": args.text})
+        if status != "unsent":
+            waker.join()
+            snap_invalidate()
+            try:
+                nav_record(None, 'tap "{}"'.format(args.text), None, ok=True)
+            except Exception:
+                pass
+            rc = _tap_ok(args, args.text, None, via="label")
+            return print_act(status, root, note, "tap") or rc
     if args.no_occlusion_check and args.xy is None and snap_xy is None \
             and not args.fuzzy and args.index is None and not args.settle:
         r = u2sock("click_text", args.text, timeout=20)
@@ -2488,6 +2508,28 @@ def parse_front(text):
 
 
 def cmd_start(args):
+    quiet = getattr(args, "quiet", False)
+    # Fastest: the scrcpy helper's open connection starts the app in a few
+    # milliseconds ("+": a fresh start on its first screen). The read
+    # after says which app is in front; adb only when the helper is away.
+    try:
+        started = scrcpy_send("startapp +" + args.package)
+    except Exception:
+        started = False
+    if started:
+        u2_invalidate()
+        try:
+            nav_record(None, 'start {}'.format(args.package), None, ok=True)
+        except Exception:
+            pass
+        print("launched {}".format(args.package))
+        front = launch_read(quiet)
+        if front and front != args.package:
+            print("{} didn't come to the front; {} is still open. Try "
+                  "`burner press BACK` or `burner press HOME`, then start it "
+                  "again.".format(args.package, front), file=sys.stderr)
+            return 1
+        return 0
     # Another app (the Play Store's transparent screen, a dialog host) can
     # keep the front after a launch. Check, and if so go Home first and
     # launch again before reporting success.
@@ -2515,19 +2557,23 @@ def cmd_start(args):
 def launch_read(quiet):
     """The screen after a launch or a link: one round trip that waits for
     the new window, lets it go quiet (2.5s at most: a splash that keeps
-    animating never does) and reads it, re-reading a thin screen once."""
+    animating never does) and reads it, re-reading a thin screen once.
+    Returns the package in front, or None when it isn't known."""
     if quiet:
         read_after(quiet=True, idle_ms=2500)
-        return
+        return None
     time.sleep(0.3)  # the launch's first window is still coming
     status, root, note = act_and_read({}, idle_ms=2500, rereads=1)
     if status == "unsent":
-        read_after(idle_ms=2500, rereads=1)
-    elif status == "ok":
-        print_screen(root, note=note)
-    else:
+        root, note = read_after_root(idle_ms=2500, rereads=1)
+        if root is None:
+            return None
+    elif status != "ok":
         print("couldn't read the screen afterwards ({}); run burner state".format(
             status), file=sys.stderr)
+        return None
+    print_screen(root, note=note)
+    return dump_package(root)
 
 
 def shot_fast(out):
@@ -3578,6 +3624,63 @@ def cmd_apps(args):
     return 0 if (pkgs or not args.match) else 1
 
 
+SETTINGS_PAGES = {
+    "home": "android.settings.SETTINGS",
+    "wifi": "android.settings.WIFI_SETTINGS",
+    "bluetooth": "android.settings.BLUETOOTH_SETTINGS",
+    "display": "android.settings.DISPLAY_SETTINGS",
+    "sound": "android.settings.SOUND_SETTINGS",
+    "apps": "android.settings.APPLICATION_SETTINGS",
+    "battery": "android.intent.action.POWER_USAGE_SUMMARY",
+    "location": "android.settings.LOCATION_SOURCE_SETTINGS",
+    "notifications": "android.settings.NOTIFICATION_SETTINGS",
+    "storage": "android.settings.INTERNAL_STORAGE_SETTINGS",
+    "date": "android.settings.DATE_SETTINGS",
+    "language": "android.settings.LOCALE_SETTINGS",
+    "keyboard": "android.settings.INPUT_METHOD_SETTINGS",
+    "accessibility": "android.settings.ACCESSIBILITY_SETTINGS",
+    "security": "android.settings.SECURITY_SETTINGS",
+    "privacy": "android.settings.PRIVACY_SETTINGS",
+    "accounts": "android.settings.SYNC_SETTINGS",
+    "airplane": "android.settings.AIRPLANE_MODE_SETTINGS",
+    "nfc": "android.settings.NFC_SETTINGS",
+    "vpn": "android.settings.VPN_SETTINGS",
+    "cast": "android.settings.CAST_SETTINGS",
+    "data": "android.settings.DATA_USAGE_SETTINGS",
+    "wireless": "android.settings.WIRELESS_SETTINGS",
+    "developer": "android.settings.APPLICATION_DEVELOPMENT_SETTINGS",
+    "about": "android.settings.DEVICE_INFO_SETTINGS",
+}
+
+
+def cmd_settings(args):
+    """Open a Settings page by name in one call (Android's own intents),
+    instead of tapping through the Settings menus. `app <package>` opens
+    that app's info page (permissions, storage, notifications)."""
+    page = (args.page or "").strip().lower()
+    if not page:
+        print("pages: " + ", ".join(sorted(SETTINGS_PAGES)) + ", app <package>")
+        return 0
+    if page == "app":
+        if not args.package:
+            print("settings app needs a package, e.g. burner settings app com.tinder",
+                  file=sys.stderr)
+            return 1
+        script = "am start -a android.settings.APPLICATION_DETAILS_SETTINGS -d {}".format(
+            _sh_quote("package:" + args.package))
+    elif page in SETTINGS_PAGES:
+        script = "am start -a {}".format(_sh_quote(SETTINGS_PAGES[page]))
+    else:
+        print("no settings page called {!r}. Pages: {}, app <package>".format(
+            page, ", ".join(sorted(SETTINGS_PAGES))), file=sys.stderr)
+        return 1
+    adb_or_ensure("shell", script)
+    u2_invalidate()
+    print("opened settings: {}".format(page if page != "app" else "app " + args.package))
+    launch_read(getattr(args, "quiet", False))
+    return 0
+
+
 def cmd_open(args):
     # The phone's shell re-splits what adb sends: an unquoted link with
     # `&` was cut there (`market://search?q=x&c=apps com.android.vending`
@@ -3766,6 +3869,14 @@ def build_parser():
     p.add_argument("--all", action="store_true",
                    help="include system apps, not just ones the user installed")
     p.set_defaults(fn=cmd_apps)
+
+    p = sub.add_parser("settings", help="open a Settings page by name (bluetooth, wifi, display...)")
+    p.add_argument("page", nargs="?", default="",
+                   help="which page; none lists them; `app <package>` is an app's info page")
+    p.add_argument("package", nargs="?", default=None, help="for `app`: the package")
+    p.add_argument("--quiet", "-q", action="store_true",
+                   help="don't print the screen afterwards")
+    p.set_defaults(fn=cmd_settings)
 
     p = sub.add_parser("start", help="launch app by package")
     p.add_argument("package")
@@ -3974,7 +4085,7 @@ def cmd_recipes(args):
 
 
 SAVE_VERBS = {"tap", "type", "press", "wait", "start", "open", "scroll",
-              "shot", "state", "dump", "snap", "dismiss", "sleep", "apps"}
+              "shot", "state", "dump", "snap", "dismiss", "sleep", "apps", "settings"}
 
 
 def check_save_steps(steps, allow_text=False):
@@ -5240,7 +5351,7 @@ def cmd_uninstall(args):
 
 
 LOCKED_COMMANDS = {"tap", "type", "press", "scroll", "start", "open", "do",
-                   "recipe", "replay", "dismiss", "notifications"}
+                   "recipe", "replay", "dismiss", "notifications", "settings"}
 
 
 def _acquire_lock(path=None, timeout=120):

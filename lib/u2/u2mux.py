@@ -302,6 +302,25 @@ def batch_results(replies, n):
     return out
 
 
+def label_selector(xml, label):
+    """A uiautomator selector for the one node on this read whose text or
+    description is `label` (case-insensitive exact; "A || B" tries each).
+    Raises RuntimeError when there is no such node or more than one."""
+    nodes = list(iter_nodes(xml or ""))
+    for alt in [p.strip() for p in label.split("||") if p.strip()]:
+        low = alt.lower()
+        hits = [n for n in nodes if low in (n["text"].lower(), n["desc"].lower())]
+        if len(hits) == 1:
+            n = hits[0]
+            from uiautomator2._selector import Selector
+            if n["text"].lower() == low:
+                return dict(Selector(text=n["text"]))
+            return dict(Selector(description=n["desc"]))
+        if len(hits) > 1:
+            raise RuntimeError("%d rows read %r" % (len(hits), alt))
+    raise RuntimeError("not on the last read")
+
+
 def act_calls(spec):
     """The JSON-RPC calls for an `act` spec: the action (tap, key or
     set_text, if any), then a read that serves as the on-device pause
@@ -314,6 +333,8 @@ def act_calls(spec):
     if "tap" in spec:
         x, y = spec["tap"]
         calls.append(("click", [int(x), int(y)]))
+    elif "tap_selector" in spec:
+        calls.append(("click", [spec["tap_selector"]]))
     elif "key" in spec:
         calls.append(("pressKeyCode", [int(spec["key"])]))
     elif "set_text" in spec:
@@ -338,6 +359,7 @@ class U2Daemon:
         self._cache = None   # (monotonic ts at RPC start, xml)
         self._gen = 0        # bumped on invalidate; stale in-flight dumps aren't cached
         self._last_xml = ""  # the newest read, however old: a hint for `screen`
+        self._last_xml_t = 0.0  # when it was read (monotonic)
         self.d = None
         self.connect()
 
@@ -389,7 +411,7 @@ class U2Daemon:
             with self._cache_lock:
                 if gen == self._gen:
                     self._cache = (t0, xml)
-            self._last_xml = xml
+            self._last_xml, self._last_xml_t = xml, _time.monotonic()
         return xml
 
     def _reconnect(self):
@@ -613,6 +635,19 @@ class U2Daemon:
         returned and cached. Never replayed after an error: the action may
         have happened. "act failed after sending: ..." means just that."""
         spec = json.loads(arg) if arg.strip() else {}
+        if "tap_label" in spec:
+            # Tap what the assistant was just shown: the label must be on
+            # the newest read, read under 30s ago, exactly once. Anything
+            # else is "not sent": the caller reads the screen and taps by
+            # coordinates instead.
+            spec = dict(spec)
+            label = spec.pop("tap_label")
+            if _time.monotonic() - self._last_xml_t > 30:
+                raise RuntimeError("act not sent: the last read is too old")
+            try:
+                spec["tap_selector"] = label_selector(self._last_xml, label)
+            except RuntimeError as e:
+                raise RuntimeError("act not sent: %s" % e)
         calls = act_calls(spec)
         acted = calls[0][0] in ("click", "pressKeyCode", "setText")
         timeout = int(spec.get("idle", 2000)) / 1000.0 + 20
@@ -631,7 +666,7 @@ class U2Daemon:
             with self._cache_lock:
                 self._gen += 1
                 self._cache = (_time.monotonic(), xml)
-            self._last_xml = xml
+            self._last_xml, self._last_xml_t = xml, _time.monotonic()
         return xml.encode()
 
     def cmd_health(self, _):

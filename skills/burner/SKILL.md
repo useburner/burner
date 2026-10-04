@@ -209,6 +209,7 @@ Apps and links
   burner apps [name]                installed apps (--all includes system apps)
   burner notifications              read the phone's notifications (changes nothing)
   burner start <package>            open an app
+  burner settings [page]            open a Settings page by name (bluetooth, wifi, display, battery...)
   burner open <url> [package]       open a link, in one app if a package is given
 
 Flows

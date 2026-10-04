@@ -2154,6 +2154,7 @@ class FastPathTests(OfflineTestCase):
 
 
     def test_start_one_adb_call_when_app_comes_up(self):
+        self.allow("scrcpy_send", side_effect=RuntimeError("no scrcpy"))
         adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(
             stdout="  mFocusedApp=ActivityRecord{1 u0 com.example/.Main t3}\n",
             stderr="", returncode=0))
@@ -2255,6 +2256,7 @@ class FastPathTests(OfflineTestCase):
         self.assertIn("scroll left com.example", err.getvalue())
 
     def test_start_retries_from_home_when_another_app_stays_in_front(self):
+        self.allow("scrcpy_send", side_effect=RuntimeError("no scrcpy"))
         other = SimpleNamespace(
             stdout="  mFocusedApp=ActivityRecord{1 u0 com.android.vending/.X t3}\n",
             stderr="", returncode=0)
@@ -2612,6 +2614,7 @@ class BranchInstallTests(OfflineTestCase):
         self.assertIn("Re-read", out.getvalue())
 
     def test_start_opens_the_first_screen(self):
+        self.allow("scrcpy_send", side_effect=RuntimeError("no scrcpy"))
         adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(
             stdout="  mFocusedApp=ActivityRecord{1 u0 com.example/.Main t3}\n",
             stderr="", returncode=0))
@@ -2949,7 +2952,7 @@ class OneRoundTripTests(OfflineTestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(calls, ["act"])
         tc.assert_not_called()
-        self.assertIn("tapped Not now @ (200, 300)", out.getvalue())
+        self.assertIn("tapped Not now (label)", out.getvalue())
         self.assertIn("screen: com.example", out.getvalue())
 
     def test_tap_falls_back_to_two_steps_with_an_old_helper(self):
@@ -3084,6 +3087,160 @@ class OneRoundTripTests(OfflineTestCase):
         calls = mod.act_calls({})
         self.assertEqual([c[0] for c in calls], ["waitForIdle", "dumpWindowHierarchy"])
         self.assertFalse(any(c[0] == "waitForWindowUpdate" for c in mod.act_calls({"tap": [1, 1]})))
+
+
+# --------------------------------- 16. primitives in one round trip
+
+class LabelTapTests(OfflineTestCase):
+    def test_tap_by_label_is_one_round_trip_with_no_read_before(self):
+        self.allow("wake_async", return_value=mock.Mock())
+        dump = self.allow("ui_dump")
+        tc = self.allow("tap_center")
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append((cmd, json.loads(arg)))
+            return SAMPLE_XML
+        self.allow("u2sock", side_effect=u2)
+        self.allow("nav_record")
+        with self.cap() as (out, err):
+            rc = pc.cmd_tap(self.parse(["tap", "OK"]))
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [("act", {"tap_label": "OK", "idle": 2000})])
+        dump.assert_not_called()
+        tc.assert_not_called()
+        self.assertIn("tapped OK (label)", out.getvalue())
+        self.assertIn("screen: com.example", out.getvalue())
+
+    def test_tap_reads_first_when_the_label_is_not_on_the_last_read(self):
+        self.allow("wake_async", return_value=mock.Mock())
+        self.allow("ui_dump", return_value=ET.fromstring(TAP_XML))
+        self.allow("tap_center")
+        self.allow("nav_record")
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            spec = json.loads(arg)
+            calls.append(spec)
+            if "tap_label" in spec:
+                pc._u2_status = "err act not sent: not on the last read"
+                return None
+            return SAMPLE_XML
+        self.allow("u2sock", side_effect=u2)
+        with self.cap() as (out, err):
+            rc = pc.cmd_tap(self.parse(["tap", "Not now"]))
+        self.assertEqual(rc, 0)
+        self.assertEqual([("tap_label" in c, "tap" in c) for c in calls], [(True, False), (False, True)])
+        self.assertIn("tapped Not now @ (200, 300)", out.getvalue())
+
+    def test_index_fuzzy_and_handles_read_first(self):
+        self.allow("wake_async", return_value=mock.Mock())
+        self.allow("ui_dump", return_value=ET.fromstring(AMBI_XML))
+        self.allow("tap_center")
+        self.allow("nav_record")
+        calls = []
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30:
+                   calls.append(json.loads(arg)) or SAMPLE_XML)
+        with self.cap():
+            pc.cmd_tap(self.parse(["tap", "OK", "--index", "1"]))
+        self.assertNotIn("tap_label", calls[0])
+
+    def test_helper_label_selector(self):
+        mod = _u2mux()
+        try:
+            import uiautomator2._selector  # noqa: F401
+        except ImportError:
+            import types
+
+            class Selector(dict):
+                def __init__(self, **kw):
+                    super().__init__(kw)
+            fake = types.ModuleType("uiautomator2._selector")
+            fake.Selector = Selector
+            pkg = types.ModuleType("uiautomator2")
+            pkg._selector = fake
+            sys.modules.setdefault("uiautomator2", pkg)
+            sys.modules["uiautomator2._selector"] = fake
+            self.addCleanup(sys.modules.pop, "uiautomator2._selector", None)
+        sel = mod.label_selector(SAMPLE_XML, "ok")
+        self.assertEqual(sel.get("text"), "OK")
+        sel = mod.label_selector(SAMPLE_XML, "Missing || Search")
+        self.assertEqual(sel.get("description"), "Search")
+        with self.assertRaises(RuntimeError):
+            mod.label_selector(AMBI_XML, "OK")  # two rows read OK
+        with self.assertRaises(RuntimeError):
+            mod.label_selector(SAMPLE_XML, "Nope")
+        calls = mod.act_calls({"tap_selector": {"text": "OK"}})
+        self.assertEqual(calls[0], ("click", [{"text": "OK"}]))
+
+
+class StartAndSettingsTests(OfflineTestCase):
+    def test_start_goes_over_scrcpy_and_reads_once(self):
+        sc = self.allow("scrcpy_send", return_value=True)
+        adb = self.allow("adb_or_ensure")
+        self.allow("u2_invalidate")
+        self.allow("nav_record")
+        calls = []
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30:
+                   calls.append(cmd) or SAMPLE_XML)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_start(self.parse(["start", "com.example"]))
+        self.assertEqual(rc, 0)
+        sc.assert_called_once_with("startapp +com.example")
+        adb.assert_not_called()
+        self.assertEqual(calls, ["act"])
+        self.assertIn("launched com.example", out.getvalue())
+        self.assertIn("screen: com.example", out.getvalue())
+
+    def test_start_reports_another_app_in_front(self):
+        self.allow("scrcpy_send", return_value=True)
+        self.allow("u2_invalidate")
+        self.allow("nav_record")
+        self.allow("u2sock", return_value=SAMPLE_XML)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_start(self.parse(["start", "com.other"]))
+        self.assertEqual(rc, 1)
+        self.assertIn("com.other didn't come to the front; com.example is still open",
+                      err.getvalue())
+
+    def test_start_uses_adb_without_the_scrcpy_helper(self):
+        self.allow("scrcpy_send", side_effect=RuntimeError("no scrcpy"))
+        adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(
+            stdout="  mFocusedApp=ActivityRecord{1 u0 com.example/.Main t3}\n",
+            stderr="", returncode=0))
+        self.allow("u2_invalidate")
+        self.allow("nav_record")
+        self.allow("u2sock", return_value="100")
+        with mock.patch.object(pc.time, "sleep"), self.cap():
+            rc = pc.cmd_start(SimpleNamespace(package="com.example", quiet=True))
+        self.assertEqual(rc, 0)
+        self.assertIn("-f 0x10008000", adb.call_args[0][1])
+
+    def test_settings_page_by_name(self):
+        adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
+        self.allow("u2_invalidate")
+        self.allow("u2sock", return_value=SAMPLE_XML)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_settings(self.parse(["settings", "bluetooth"]))
+        self.assertEqual(rc, 0)
+        self.assertIn("am start -a 'android.settings.BLUETOOTH_SETTINGS'", adb.call_args[0][1])
+        self.assertIn("opened settings: bluetooth", out.getvalue())
+        self.assertIn("screen: com.example", out.getvalue())
+
+    def test_settings_app_page_and_listing(self):
+        adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
+        self.allow("u2_invalidate")
+        self.allow("u2sock", return_value=SAMPLE_XML)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_settings(self.parse(["settings", "app", "com.tinder"]))
+        self.assertEqual(rc, 0)
+        self.assertIn("APPLICATION_DETAILS_SETTINGS -d 'package:com.tinder'", adb.call_args[0][1])
+        with self.cap() as (out, err):
+            self.assertEqual(pc.cmd_settings(self.parse(["settings"])), 0)
+        self.assertIn("bluetooth", out.getvalue())
+        with self.cap() as (out, err):
+            self.assertEqual(pc.cmd_settings(self.parse(["settings", "nope"])), 1)
+        self.assertIn("no settings page called", err.getvalue())
 
 
 if __name__ == "__main__":
