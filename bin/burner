@@ -1126,7 +1126,8 @@ def looks_half_drawn(rows, prev_rows):
     return prev_rows is not None and prev_rows >= 12 and rows <= 2
 
 
-def settled_read(prev_root=None, idle_ms=2000, delay=0.45, rereads=2):
+def settled_read(prev_root=None, idle_ms=2000, delay=0.45, rereads=2,
+                 first_root=None):
     """The screen once an action has landed: a short pause (the action's
     first events haven't reached the UI yet), then a wait on the phone
     until the UI goes quiet (half a second with no changes, idle_ms at
@@ -1139,10 +1140,13 @@ def settled_read(prev_root=None, idle_ms=2000, delay=0.45, rereads=2):
     if prev_root is not None:
         prev_lines = screen_lines(walk(prev_root), *screen_dims())[0]
     prev_rows = None if prev_lines is None else len(prev_lines)
-    time.sleep(delay)
-    if u2sock("idle", str(idle_ms), timeout=idle_ms / 1000.0 + 10) is None:
-        time.sleep(0.5)  # no UI helper: give the screen a moment
-    root = ui_dump(fresh=True)
+    if first_root is not None:
+        root = first_root  # the action's own round trip read it
+    else:
+        time.sleep(delay)
+        if u2sock("idle", str(idle_ms), timeout=idle_ms / 1000.0 + 10) is None:
+            time.sleep(0.5)  # no UI helper: give the screen a moment
+        root = ui_dump(fresh=True)
     note = ""
     for attempt in range(rereads + 1):
         lines = screen_lines(walk(root), *screen_dims())[0]
@@ -1175,13 +1179,83 @@ def _report_unreadable(e):
         str(e)[:80]), file=sys.stderr)
 
 
+KEY_CODES = {"BACK": 4, "HOME": 3, "ENTER": 66, "DEL": 67, "DELETE": 67, "TAB": 61,
+             "SPACE": 62, "ESCAPE": 111, "APP_SWITCH": 187, "RECENT": 187, "MENU": 82,
+             "SEARCH": 84, "DPAD_UP": 19, "DPAD_DOWN": 20, "DPAD_LEFT": 21,
+             "DPAD_RIGHT": 22, "DPAD_CENTER": 23, "VOLUME_UP": 24, "VOLUME_DOWN": 25,
+             "WAKEUP": 224, "POWER": 26, "PAGE_UP": 92, "PAGE_DOWN": 93,
+             "MOVE_HOME": 122, "MOVE_END": 123}
+
+
+def key_code(name):
+    """Android key code for "BACK", "KEYCODE_BACK" or "4"; None if unknown."""
+    n = (name or "").strip().upper()
+    if n.startswith("KEYCODE_"):
+        n = n[len("KEYCODE_"):]
+    if n.isdigit():
+        return int(n)
+    return KEY_CODES.get(n)
+
+
+def act_and_read(action, prev_root=None, idle_ms=2000, rereads=2):
+    """An action and its settled read in one round trip to the phone: the
+    UI helper sends the action (a tap, a key, or text into the focused
+    field; or none, after a launch), a wait for the UI to react, a wait
+    for it to go quiet and the read as one request.
+    Returns (status, root, note): "ok" with the screen; "lost" when the
+    helper took the action but the reply never came (the caller must not
+    act again); "failed <why>" when the helper says the action failed
+    (same rule); "unsent" when the helper couldn't be asked (not running,
+    or an older one): the caller then acts the two-step way."""
+    spec = dict(action)
+    spec["idle"] = idle_ms
+    _disarm_watchdog()
+    t0 = time.time()
+    xml = u2sock("act", json.dumps(spec), timeout=idle_ms / 1000.0 + 50)
+    if xml is None:
+        if _u2_status == "lost":
+            return "lost", None, ""
+        if _u2_status.startswith("err act failed after sending"):
+            return "failed " + _u2_status[len("err act failed after sending: "):], None, ""
+        return "unsent", None, ""
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return "failed unreadable screen", None, ""
+    _update_screen_from_dump(root)
+    _trace("act {:.2f}s".format(time.time() - t0))
+    root, note = settled_read(prev_root, idle_ms=idle_ms, rereads=rereads,
+                              first_root=root)
+    return "ok", root, note
+
+
+def print_act(status, root, note, what):
+    """Print an act_and_read outcome that wasn't "unsent": the screen, or
+    why there is none. Returns the exit code."""
+    if status == "ok":
+        print_screen(root, note=note)
+        return 0
+    if status == "lost":
+        print("burner: the UI helper didn't confirm the {}, so it isn't done "
+              "again; run burner state to see the screen".format(what), file=sys.stderr)
+        return 1
+    print("burner: the {} failed on the phone ({}); run burner state to see "
+          "the screen".format(what, status[len("failed "):][:100]), file=sys.stderr)
+    return 1
+
+
 def read_after_root(prev_root=None, idle_ms=2000, rereads=2):
     """settled_read for a caller that prints the screen itself: (root,
     note), or (None, "") with a line on stderr when the screen can't be
-    read. Never raises."""
+    read. One round trip through the UI helper when it can. Never raises."""
     _disarm_watchdog()
     try:
-        return settled_read(prev_root, idle_ms=idle_ms, rereads=rereads)
+        time.sleep(0.2)  # let the action's first events reach the UI
+        status, root, note = act_and_read({}, prev_root=prev_root, idle_ms=idle_ms,
+                                          rereads=rereads)
+        if status == "ok":
+            return root, note
+        return settled_read(prev_root, idle_ms=idle_ms, rereads=rereads, delay=0.25)
     except Exception as e:
         _report_unreadable(e)
         return None, ""
@@ -1738,17 +1812,15 @@ def cmd_tap(args):
         prev_lines = visible_lines(nodes) if args.settle else None
         prev_fp = screen_fingerprint(nodes)  # for nav memory (no extra dump)
         from_nodes = nodes  # for nav recording
-        tap_center(x, y)
         if args.settle:
+            tap_center(x, y)
             added, removed, final_fp = settle_lines(prev_lines, prev_fp=prev_fp)
             # Record full transition: we know both from and to screens
             nav_record_action(from_nodes, 'tap "{}"'.format(tap_label), to_fp=final_fp, ok=True)
             return _tap_settled_ok(args, tap_label, (x, y), added, removed, final_fp)
         # No settle: record action taken, destination unknown (no extra round-trip)
         nav_record_action(from_nodes, 'tap "{}"'.format(tap_label), to_fp=None, ok=True)
-        rc = _tap_ok(args, tap_label, (x, y))
-        read_after(quiet=args.quiet or as_json(args), prev_root=root)
-        return rc
+        return _tap_then_read(args, tap_label, (x, y), root)
 
     w, h = _screen_for_tap()
     plan = plan_tap(nodes, w, h, text=args.text, fuzzy=args.fuzzy,
@@ -1768,17 +1840,34 @@ def cmd_tap(args):
     prev_lines = visible_lines(nodes) if args.settle else None
     prev_fp = screen_fingerprint(nodes)  # for nav memory (no extra dump)
     from_nodes = nodes  # for nav recording
-    tap_center(*xy)
     if args.settle:
+        tap_center(*xy)
         added, removed, final_fp = settle_lines(prev_lines, prev_fp=prev_fp)
         # Record full transition: we know both from and to screens
         nav_record_action(from_nodes, 'tap "{}"'.format(tap_label), to_fp=final_fp, ok=True)
         return _tap_settled_ok(args, tap_label, xy, added, removed, final_fp)
     # No settle: record action taken, destination unknown (no extra round-trip)
     nav_record_action(from_nodes, 'tap "{}"'.format(tap_label), to_fp=None, ok=True)
-    rc = _tap_ok(args, tap_label, xy)
-    read_after(quiet=args.quiet or as_json(args), prev_root=root)
-    return rc
+    return _tap_then_read(args, tap_label, xy, root)
+
+
+def _tap_then_read(args, label, xy, root):
+    """The tap and the screen it ends on. One round trip through the UI
+    helper when it can; else the tap over scrcpy and a read after."""
+    if args.quiet or as_json(args):
+        tap_center(*xy)
+        rc = _tap_ok(args, label, xy)
+        read_after(quiet=True)
+        return rc
+    status, after, note = act_and_read({"tap": [xy[0], xy[1]]}, prev_root=root)
+    if status == "unsent":
+        tap_center(*xy)
+        rc = _tap_ok(args, label, xy)
+        read_after(prev_root=root)
+        return rc
+    snap_invalidate()
+    rc = _tap_ok(args, label, xy)
+    return print_act(status, after, note, "tap") or rc
 
 
 def nav_record_action(from_nodes, action_desc, to_fp=None, ok=True):
@@ -2047,6 +2136,17 @@ def cmd_type(args):
     # the UI helper (it finds the field itself, so there is no screen read
     # first). set_text replaces the content, so --clear is implicit.
     no_focus = False
+    if not args.slow and not quiet:
+        # One round trip: the text into the focused field, the wait, the read.
+        status, root, note = act_and_read({"set_text": args.text})
+        if status == "ok" or status == "lost":
+            print("typed {} chars".format(len(args.text)))
+            return print_act(status, root, note, "typing")
+        if status.startswith("failed") and "no editable field" not in status \
+                and "UiObjectNotFound" not in status:
+            print("typed {} chars".format(len(args.text)))
+            return print_act(status, root, note, "typing")
+        # "unsent" (an older helper) or no focused field: the paths below
     if not args.slow:
         out = u2sock("set_text", json.dumps({"text": args.text}), timeout=40)
         if out is not None:
@@ -2191,6 +2291,19 @@ def cmd_press(args):
         mods.append("KEYCODE_META_LEFT")
     repeat = max(1, getattr(args, "repeat", 1) or 1)
     delay_ms = getattr(args, "delay", 120) or 0
+    quiet = getattr(args, "quiet", False)
+    code = key_code(args.key)
+    if not mods and repeat == 1 and code is not None and not quiet:
+        # One round trip: the key, the wait for the screen, the read.
+        status, root, note = act_and_read({"key": code})
+        if status != "unsent":
+            u2_invalidate()
+            try:
+                nav_record(None, 'press {}'.format(args.key), None, ok=True)
+            except Exception:
+                pass
+            print("pressed {}".format(args.key))
+            return print_act(status, root, note, "key press")
 
     def send_one(key):
         try:
@@ -2395,10 +2508,26 @@ def cmd_start(args):
     except Exception:
         pass
     print("launched {}".format(args.package))
-    # A launch: a splash that keeps animating never goes idle, and its
-    # loading screen is thin, so a short wait and one re-read at most.
-    read_after(quiet=getattr(args, "quiet", False), idle_ms=2500, rereads=1)
+    launch_read(getattr(args, "quiet", False))
     return 0
+
+
+def launch_read(quiet):
+    """The screen after a launch or a link: one round trip that waits for
+    the new window, lets it go quiet (2.5s at most: a splash that keeps
+    animating never does) and reads it, re-reading a thin screen once."""
+    if quiet:
+        read_after(quiet=True, idle_ms=2500)
+        return
+    time.sleep(0.3)  # the launch's first window is still coming
+    status, root, note = act_and_read({}, idle_ms=2500, rereads=1)
+    if status == "unsent":
+        read_after(idle_ms=2500, rereads=1)
+    elif status == "ok":
+        print_screen(root, note=note)
+    else:
+        print("couldn't read the screen afterwards ({}); run burner state".format(
+            status), file=sys.stderr)
 
 
 def shot_fast(out):
@@ -3462,7 +3591,7 @@ def cmd_open(args):
     adb_or_ensure("shell", script)
     u2_invalidate()
     print("opened {}".format(args.url))
-    read_after(quiet=getattr(args, "quiet", False), idle_ms=2500, rereads=1)
+    launch_read(getattr(args, "quiet", False))
     return 0
 
 

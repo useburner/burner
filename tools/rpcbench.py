@@ -141,19 +141,13 @@ def main():
     def idle():
         post(rpc("waitForIdle", [500]))
 
-    def window_update():
-        # Does the server have waitForWindowUpdate (returns once a window
-        # content event arrives, or after the timeout)? With no action in
-        # flight it should take about the timeout.
-        wire, data = post(rpc("waitForWindowUpdate", [None, 300]))
-        parsed = json.loads(data)
-        return "result {}".format(parsed.get("result", parsed.get("error", "?")))[:60]
-
     def act_batch():
-        # The shape an action would use: wait for the UI to react, settle,
-        # read, all in one round trip.
+        # The shape an action uses (minus the action): a read as the
+        # on-device pause, the wait for the UI to go quiet, the read that
+        # comes back. (waitForWindowUpdate is never batched: inside a
+        # batch it crashed the phone's server on Oct 4.)
         body = json.dumps([
-            {"jsonrpc": "2.0", "id": 1, "method": "waitForWindowUpdate", "params": [None, 300]},
+            {"jsonrpc": "2.0", "id": 1, "method": "dumpWindowHierarchy", "params": [False, None]},
             {"jsonrpc": "2.0", "id": 2, "method": "waitForIdle", "params": [500]},
             {"jsonrpc": "2.0", "id": 3, "method": "dumpWindowHierarchy", "params": [False, None]},
         ])
@@ -164,10 +158,9 @@ def main():
 
     timed("deviceInfo RPC", device_info)
     timed("waitForIdle(500) RPC", idle)
-    timed("waitForWindowUpdate(300) RPC", window_update)
     timed("dumpWindowHierarchy RPC", dump)
     timed("batch [waitForIdle, dump]", batch)
-    timed("batch [windowUpdate, idle, dump]", act_batch)
+    timed("batch [dump, idle, dump]", act_batch)
     if os.path.exists(SOCK):
         timed("helper: screen", lambda: helper("screen"))
         timed("helper: dump fresh", lambda: helper("dump fresh"))

@@ -260,7 +260,51 @@ DUMP_TTL = 2.0  # seconds a cached hierarchy dump stays valid
 
 
 # Commands that change the screen: never replayed after an error.
-NO_RETRY = {"tap", "click_text", "set_text"}
+NO_RETRY = {"tap", "click_text", "set_text", "act"}
+
+
+def batch_results(replies, n):
+    """One entry per call from a JSON-RPC batch reply: the result, or an
+    Exception for a call that failed. Pure."""
+    if not isinstance(replies, list):
+        raise RuntimeError("no batch support: %s" % str(replies)[:80])
+    by_id = {}
+    for r in replies:
+        if isinstance(r, dict):
+            by_id[r.get("id")] = r
+    out = []
+    for i in range(1, n + 1):
+        r = by_id.get(i, {})
+        if "error" in r:
+            out.append(RuntimeError(str(r["error"])[:200]))
+        else:
+            out.append(r.get("result"))
+    return out
+
+
+def act_calls(spec):
+    """The JSON-RPC calls for an `act` spec: the action (tap, key or
+    set_text, if any), then a read that serves as the on-device pause
+    while the action's first events arrive (waitForIdle returns at once
+    when the last event is older than its quiet window), the wait for
+    the UI to go quiet, and the read that is returned. No
+    waitForWindowUpdate: inside a batch it crashed the phone's server
+    (Oct 4). Pure."""
+    calls = []
+    if "tap" in spec:
+        x, y = spec["tap"]
+        calls.append(("click", [int(x), int(y)]))
+    elif "key" in spec:
+        calls.append(("pressKeyCode", [int(spec["key"])]))
+    elif "set_text" in spec:
+        from uiautomator2._selector import Selector
+        sel = dict(Selector(focused=True, className="android.widget.EditText"))
+        calls.append(("setText", [sel, str(spec["set_text"])]))
+    if calls:
+        calls.append(("dumpWindowHierarchy", [False, None]))
+    calls.append(("waitForIdle", [int(spec.get("idle", 2000))]))
+    calls.append(("dumpWindowHierarchy", [False, None]))
+    return calls
 
 
 class U2Daemon:
@@ -531,6 +575,43 @@ class U2Daemon:
             el.set_text(p["text"])
             self.invalidate()
         return b""
+
+    def _batch(self, calls, timeout=45.0):
+        """Several JSON-RPC calls in one HTTP round trip; the server runs
+        them in order. One result per call (an Exception for a failed one)."""
+        body = [{"jsonrpc": "2.0", "id": i + 1, "method": m, "params": p}
+                for i, (m, p) in enumerate(calls)]
+        resp = _KEEPALIVE.request(self.d._dev, self.d._device_server_port,
+                                  "POST", "/jsonrpc/0", data=body, timeout=timeout)
+        return batch_results(resp.json(), len(calls))
+
+    def cmd_act(self, arg):
+        """arg: JSON {"tap": [x, y] | "key": code | "set_text": "..."
+        (one or none), "idle": ms}. One round trip: the action, a wait for
+        the UI to go quiet (`idle` ms at most) and a read, whose XML is
+        returned and cached. Never replayed after an error: the action may
+        have happened. "act failed after sending: ..." means just that."""
+        spec = json.loads(arg) if arg.strip() else {}
+        calls = act_calls(spec)
+        acted = calls[0][0] in ("click", "pressKeyCode", "setText")
+        timeout = int(spec.get("idle", 2000)) / 1000.0 + 40
+        with self._lock:
+            self.invalidate()
+            with _t("act batch"):
+                try:
+                    results = self._batch(calls, timeout=timeout)
+                except Exception as e:
+                    raise RuntimeError("act failed after sending: %s" % str(e)[:120])
+            if acted and isinstance(results[0], Exception):
+                raise RuntimeError("act failed after sending: %s" % results[0])
+            xml = results[-1]
+            if isinstance(xml, Exception) or not xml:
+                raise RuntimeError("act failed after sending: no read (%s)" % xml)
+            with self._cache_lock:
+                self._gen += 1
+                self._cache = (_time.monotonic(), xml)
+            self._last_xml = xml
+        return xml.encode()
 
     def cmd_health(self, _):
         with self._lock:
