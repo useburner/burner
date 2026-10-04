@@ -39,7 +39,9 @@ Every step you take costs a round trip, so the fewer steps, the faster.
    taps that field first). It prints the screen, so check the text there before
    any Send, Post, Buy or Submit tap, and only tap it with the user's go-ahead.
 8. A command that fails or hangs: run `burner ensure` once and try again. If it
-   still fails, tell the user plainly what you see.
+   still fails, tell the user plainly what it printed (it says what is wrong).
+   When the user asks why something was slow, `burner log --last 20` shows
+   each command's time; paste it rather than guessing.
 
 ## Common requests
 
@@ -118,6 +120,7 @@ Codes, health, upkeep
   burner ensure                     reconnect everything (about 5 seconds)
   burner update                     update burner (stays on this version)
   burner version                    build, branch and skill rev
+  burner log                        the last commands run, how long each took, exit codes
   burner uninstall [--yes]          undo the phone changes setup made
 ```
 
