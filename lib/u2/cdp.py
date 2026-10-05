@@ -250,8 +250,11 @@ class Page:
         self.loading = False
         self.main_frame = None
         self.url = ""
+        # bounded like a visibility probe (PROBE_S, plus the handshake's
+        # trip): a tab frozen in the background never answers the question
         res = self.call_many([("Page.enable", {}), ("Page.getFrameTree", {}),
-                              _evaluate("document.visibilityState")], raise_errors=False)
+                              _evaluate("document.visibilityState")],
+                             timeout=PROBE_S + 0.6, raise_errors=False)
         for r in res[:2]:
             if isinstance(r, Exception):
                 raise r
