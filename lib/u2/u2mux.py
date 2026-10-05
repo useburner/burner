@@ -75,9 +75,18 @@ class _NotThere(Exception):
     """A tap by words found no control on the phone: nothing was tapped."""
 
 
-class StreamUnavailable(OSError):
+try:
+    from uiautomator2.exceptions import HTTPError as _U2HTTPError
+except ImportError:  # the offline tests: no uiautomator2 here
+    _U2HTTPError = ConnectionError
+
+
+class StreamUnavailable(*((_U2HTTPError, ConnectionError) if _U2HTTPError is not ConnectionError
+                          else (ConnectionError,))):
     """No stream to the phone's UI server could be opened: nothing was
-    sent on it."""
+    sent on it. An HTTPError and a ConnectionError too, which is what
+    uiautomator2 takes as "the server isn't up" and launches it on (an
+    OSError alone left it unable to restart the server, Oct 5, 03:20)."""
 
 
 import contextlib
