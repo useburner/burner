@@ -285,9 +285,16 @@ class Page:
             self.listen(min(0.25, max(0.0, end - time.monotonic())))
         return not self.loading
 
+    def _bound(self, timeout):
+        """`timeout`, or STALE_CALL_S when nothing has proved the page on
+        screen within VISIBLE_FOR_S (see visible)."""
+        if time.monotonic() - self.visible_at > VISIBLE_FOR_S:
+            return min(timeout, STALE_CALL_S)
+        return timeout
+
     def call(self, method, timeout=10.0, **params):
         self.n += 1
-        self.ws.s.settimeout(timeout)
+        self.ws.s.settimeout(self._bound(timeout))
         self.ws.send(json.dumps({"id": self.n, "method": method, "params": params}))
         while True:
             m = json.loads(self.ws.recv())
@@ -295,6 +302,7 @@ class Page:
                 if "id" not in m:
                     self._event(m)
                 continue
+            self.visible_at = time.monotonic()  # it answered: it is on screen
             if "error" in m:
                 raise RuntimeError("%s: %s" % (method, m["error"].get("message", m["error"])))
             return m.get("result", {})
@@ -305,7 +313,7 @@ class Page:
         command that failed, after all have been answered; with
         raise_errors False, a failed command's result is its RuntimeError."""
         ids = []
-        self.ws.s.settimeout(timeout)
+        self.ws.s.settimeout(self._bound(timeout))
         for method, params in cmds:
             self.n += 1
             ids.append(self.n)
@@ -317,6 +325,7 @@ class Page:
                 got[m["id"]] = m
             elif "id" not in m:
                 self._event(m)
+        self.visible_at = time.monotonic()  # it answered: it is on screen
         out = []
         for i, (method, _) in zip(ids, cmds):
             m = got[i]
@@ -451,7 +460,7 @@ READ_JS = r"""
                 l: r.left, t: r.top + r.height * (i + 1), w: r.width, h: r.height});
     }
   }
-  return {title: document.title, url: location.href, ready: document.readyState,
+  return {title: document.title, url: location.href, ready: document.readyState, vis: document.visibilityState,
           dpr: window.devicePixelRatio || 1, vw: vw, vh: vh, rows: out, more: out.length >= cap,
           ms: Math.round(performance.now() - t0)};
 })"""
@@ -782,8 +791,11 @@ def page_xml(screen, top, screen_h=0, pkg="com.android.chrome"):
 QUIET_CAP_S = 0.5  # a wait for a quiet DOM, at most: a live page never stops changing
 LOAD_CAP_S = 1.8   # a wait for a page that is loading, at most (the caller
                    # reads again when the screen looks half drawn)
-VISIBLE_FOR_S = 6.0  # a page a probe found visible needs no new check this long: a
-                     # tap that opens another tab leaves this one hidden on its own probe
+VISIBLE_FOR_S = 45.0  # a page that answered a command is on screen (a background tab
+                      # answers only on its timeout): that proof holds this long without
+                      # another, and a read that says the document is hidden ends it
+STALE_CALL_S = 3.0    # the first command after VISIBLE_FOR_S without proof waits this
+                      # long at most: a tab frozen in the background answers nothing
 
 
 def settle(page, idle_ms=1200, poll_s=0.15, quiet_s=0.3, url=None, loading=False):

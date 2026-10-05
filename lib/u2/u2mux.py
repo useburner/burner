@@ -820,7 +820,13 @@ class U2Daemon:
 
     def _page_xml(self, screen):
         """A page read as a screen read (cdp.page_xml), placed under the
-        newest read's WebView and above its navigation bar."""
+        newest read's WebView and above its navigation bar. A read that
+        says the document is hidden (a tap opened another tab) ends the
+        page's proof of being on screen: the next command asks."""
+        page = getattr(self, "_web", None)
+        if page is not None and screen.get("vis") == "hidden":
+            page.visible_at = 0.0
+            log("the page says it is hidden now; the next command checks what is in front")
         last = getattr(self, "_last_xml", "")
         info = screen_of(last) if last else None
         return _cdp().page_xml(screen, webview_top(last), info[1] if info else 0)

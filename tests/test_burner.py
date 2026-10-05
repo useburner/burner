@@ -4121,6 +4121,38 @@ class WebPathTests(OfflineTestCase):
         self.assertTrue(cdp.is_chrome("com.android.chrome"))
         self.assertFalse(cdp.is_chrome("com.example"))
 
+    def test_an_answered_command_proves_the_page_on_screen(self):
+        cdp = _cdp()
+        answers = []
+
+        class FakeWS:
+            class s:
+                timeouts = []
+
+                @classmethod
+                def settimeout(cls, t):
+                    cls.timeouts.append(t)
+
+            def send(self, text):
+                m = json.loads(text)
+                answers.insert(0, json.dumps({"id": m["id"], "result": {"value": "visible"}}))
+
+            def recv(self):
+                return answers.pop()
+        page = object.__new__(cdp.Page)
+        page.ws, page.n, page.visible_at = FakeWS(), 0, 0.0
+        page.loading, page.main_frame, page.url = False, "F1", ""
+        # nothing proved it on screen yet: the command waits STALE_CALL_S at most
+        page.call("Runtime.evaluate", 10.0, expression="1")
+        self.assertEqual(FakeWS.s.timeouts[-1], cdp.STALE_CALL_S)
+        self.assertGreater(page.visible_at, 0.0)
+        self.assertTrue(cdp.visible(page))  # no question: the answer was the proof
+        page.call_many([("Runtime.evaluate", {"expression": "1"})], timeout=10.0)
+        self.assertEqual(FakeWS.s.timeouts[-1], 10.0)
+        self.assertEqual(page._bound(10.0), 10.0)
+        page.visible_at = 0.0
+        self.assertEqual(page._bound(10.0), cdp.STALE_CALL_S)
+
     def test_page_commands_sent_together_come_back_in_order(self):
         cdp = _cdp()
         sent, answers = [], []
@@ -4419,6 +4451,19 @@ class WebPathTests(OfflineTestCase):
         # a timeout is the usual miss
         with self.assertRaises(mod.U2NotFound):
             dm.cmd_wait_for(json.dumps({"text": "Top Stories", "timeout": 0.3}))
+
+    def test_a_read_that_says_hidden_ends_the_proof(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        self._fake_cdp(mod, [])
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm._web = _FakePage()
+        dm._web.visible_at = 1e9
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        dm._page_xml(dict(WEB_SCREEN, vis="visible"))
+        self.assertEqual(dm._web.visible_at, 1e9)
+        dm._page_xml(dict(WEB_SCREEN, vis="hidden"))  # a tap opened another tab
+        self.assertEqual(dm._web.visible_at, 0.0)
 
     def test_helper_looks_at_the_screen_when_the_page_left_the_front(self):
         mod = _u2mux()
