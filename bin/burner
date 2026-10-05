@@ -1669,6 +1669,8 @@ def looks_half_drawn(rows, prev_rows):
 # paid 2.5s on every page open and 2s after every tap).
 IDLE_ACT_MS = 1200      # the read after a tap, a key or typed text
 IDLE_LAUNCH_MS = 1000   # the read after a launch or a link
+IDLE_HOME_MS = 500      # the read after the Home key: the launcher's widgets (a clock)
+                        # never go quiet, so the full cap was paid every time (2.2s, Oct 5)
 LAUNCH_SLOW_S = 9.0     # an installed app's cold start is given this long in all before
                         # "didn't come to the front" (Airbnb, Oct 5: the Play Store still
                         # in front 4s in, and the verdict while the app was starting)
@@ -3290,7 +3292,7 @@ def cmd_press(args):
     code = key_code(args.key)
     if not mods and repeat == 1 and code is not None and not quiet:
         # One round trip: the key, the wait for the screen, the read.
-        status, root, note = act_and_read({"key": code})
+        status, root, note = act_and_read({"key": code}, idle_ms=IDLE_HOME_MS if code == 3 else IDLE_ACT_MS)
         if status != "unsent":
             u2_invalidate()
             try:

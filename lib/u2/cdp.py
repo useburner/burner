@@ -561,9 +561,14 @@ def front_page(dev, current=None, first_probe_s=None, hint=None):
         if page is not None:
             return page
         ids, found = ids + more, found + found2
-    raise RuntimeError("no visible page among Chrome's %d tabs probed: %s" % (
-        len(ids), "; ".join("%s: %s" % (_short(urls.get(i, "")), _answer(p))
-                            for i, p in zip(ids, found))))
+    # the first tabs (the current one, the hinted ones) by name, the
+    # rest counted: a log line keeps the end of a long message
+    named = [(i, p) for i, p in zip(ids, found)][:SCAN_TABS + len(hinted)]
+    rest = [_answer(p) for p in found[len(named):]]
+    tail = "; the other %d: %s" % (len(rest), ", ".join(
+        "%d %s" % (rest.count(a), a) for a in sorted(set(rest), key=rest.index))) if rest else ""
+    raise RuntimeError("no visible page among Chrome's %d tabs probed: %s%s" % (
+        len(ids), "; ".join("%s: %s" % (_short(urls.get(i, "")), _answer(p)) for i, p in named), tail))
 
 
 # ----------------------------------------------------------- page scripts

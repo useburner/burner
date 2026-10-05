@@ -7323,3 +7323,32 @@ class AirbnbRoundTests(OfflineTestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(len(reads), 1 + pc.LAUNCH_REREADS)
         self.assertIn("com.nope isn't installed", err.getvalue())
+
+    def test_front_page_names_the_first_tabs_and_counts_the_rest(self):
+        cdp = _cdp()
+
+        class Tab:
+            def __init__(self, dev, target, probe_s=None):
+                self.target, self.visible_at = target, 0.0
+                if target not in ("A", "F", "G"):
+                    raise ConnectionError("refused")
+
+            def close(self):
+                pass
+        tabs = [{"id": t, "url": "https://%s.com/" % t.lower()} for t in "ABCDEFGHIJKL"]
+        with mock.patch.object(cdp, "Page", Tab), mock.patch.object(cdp, "pages", lambda dev: tabs):
+            with self.assertRaises(RuntimeError) as cm:
+                cdp.front_page(None)
+        self.assertEqual(str(cm.exception), "no visible page among Chrome's 11 tabs probed: "
+                         "a.com: hidden; b.com: refused; c.com: refused; the other 8: 6 refused, 2 hidden")
+
+    def test_the_home_key_waits_less_for_the_launcher(self):
+        self.allow("u2_invalidate")
+        self.allow("nav_record")
+        calls = []
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30: calls.append((cmd, json.loads(arg))) or SAMPLE_XML)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertEqual(pc.cmd_press(self.parse(["press", "HOME"])), 0)
+            self.assertEqual(pc.cmd_press(self.parse(["press", "BACK"])), 0)
+        self.assertEqual([c[1] for c in calls], [{"key": 3, "idle": pc.IDLE_HOME_MS}, {"key": 4, "idle": pc.IDLE_ACT_MS}])
+        self.assertIn("pressed HOME", out.getvalue())
