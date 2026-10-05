@@ -613,6 +613,17 @@ class JsonOutputTests(OfflineTestCase):
         native = COVERED_XML.replace("android.webkit.WebView", "android.widget.FrameLayout")
         plan = pc.plan_tap(pc.walk(ET.fromstring(native)), 1080, 2400, text="Box Score")
         self.assertEqual(plan["action"], "tap")  # later is on top on a native screen
+        # a later row holding the point: a cover on a native screen, the
+        # page's own business on a page (its rows' order says nothing)
+        later = WHOLE_XML.replace("</hierarchy>", "").rstrip()
+        later = later[:later.rfind("</node>")] + (
+            '<node text="Download today" class="android.view.View" package="com.android.chrome"'
+            ' bounds="[0,400][1080,600]" clickable="true" enabled="true"/></node></hierarchy>')
+        plan = pc.plan_tap(pc.walk(ET.fromstring(later)), 1080, 2400, text="Box Score")
+        self.assertEqual((plan["action"], plan["xy"]), ("tap", (796, 491)))
+        plan = pc.plan_tap(pc.walk(ET.fromstring(later.replace("android.webkit.WebView", "android.widget.FrameLayout"))),
+                           1080, 2400, text="Box Score")
+        self.assertNotEqual((plan["action"], plan.get("moved")), ("tap", False))
         whole = pc.plan_tap(pc.walk(ET.fromstring(WHOLE_XML)), 1080, 2400, text="Box Score")
         self.assertEqual((whole["action"], whole["xy"]), ("tap", (796, 491)))
         # one control drawn twice is one row, not an ambiguity
@@ -4128,6 +4139,41 @@ class WebPathTests(OfflineTestCase):
         self.assertTrue(cdp.is_chrome("com.android.chrome"))
         self.assertFalse(cdp.is_chrome("com.example"))
 
+    def test_websocket_first_frames_ride_with_the_handshake(self):
+        import base64
+        import hashlib
+        cdp = _cdp()
+        sent = []
+
+        class Sock:
+            def __init__(self):
+                self.pending = b""
+
+            def settimeout(self, t):
+                pass
+
+            def sendall(self, data):
+                sent.append(bytes(data))
+                if b"Sec-WebSocket-Key: " in data:
+                    key = data.split(b"Sec-WebSocket-Key: ", 1)[1].split(b"\r\n", 1)[0].decode()
+                    accept = base64.b64encode(hashlib.sha1(
+                        (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
+                    self.pending += (b"HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: "
+                                     + accept + b"\r\n\r\n")
+                else:
+                    payload = b'{"id":1,"result":{"ok":true}}'
+                    self.pending += bytes([0x81, len(payload)]) + payload
+
+            def recv(self, n):
+                out, self.pending = self.pending[:n], self.pending[n:]
+                return out
+        ws = cdp.WebSocket(Sock(), "/devtools/page/X")
+        ws.send('{"id":1,"method":"Page.enable"}')  # before any reply was read
+        self.assertEqual(len(sent), 2)
+        self.assertTrue(sent[0].startswith(b"GET /devtools/page/X HTTP/1.1"))
+        self.assertEqual(ws.recv(), '{"id":1,"result":{"ok":true}}')
+        self.assertIsNone(ws._handshake_key)
+
     def test_an_answered_command_proves_the_page_on_screen(self):
         cdp = _cdp()
         answers = []
@@ -4152,12 +4198,13 @@ class WebPathTests(OfflineTestCase):
         # nothing proved it on screen yet: the command waits STALE_CALL_S at most
         page.call("Runtime.evaluate", 10.0, expression="1")
         self.assertEqual(FakeWS.s.timeouts[-1], cdp.STALE_CALL_S)
-        self.assertGreater(page.visible_at, 0.0)
-        self.assertTrue(cdp.visible(page))  # no question: the answer was the proof
+        self.assertEqual(page.visible_at, 0.0)  # an answer alone proves nothing: a read's vis does
+        page.visible_at = cdp.time.monotonic()
+        self.assertTrue(cdp.visible(page))  # no question within VISIBLE_FOR_S
         page.call_many([("Runtime.evaluate", {"expression": "1"})], timeout=10.0)
         self.assertEqual(FakeWS.s.timeouts[-1], 10.0)
         self.assertEqual(page._bound(10.0), 10.0)
-        page.visible_at = 0.0
+        page.visible_at = cdp.time.monotonic() - cdp.QUICK_AFTER_S - 1
         self.assertEqual(page._bound(10.0), cdp.STALE_CALL_S)
 
     def test_page_commands_sent_together_come_back_in_order(self):
@@ -4469,7 +4516,7 @@ class WebPathTests(OfflineTestCase):
         dm._web.visible_at = 1e9
         dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
         dm._page_xml(dict(WEB_SCREEN, vis="visible"))
-        self.assertEqual(dm._web.visible_at, 1e9)
+        self.assertLess(abs(dm._web.visible_at - mod._time.monotonic()), 5.0)  # the proof, stamped
         dm._page_xml(dict(WEB_SCREEN, vis="hidden"))  # a tap opened another tab
         self.assertEqual(dm._web.visible_at, 0.0)
 

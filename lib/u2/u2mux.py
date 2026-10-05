@@ -848,7 +848,9 @@ class U2Daemon:
         says the document is hidden (a tap opened another tab) ends the
         page's proof of being on screen: the next command asks."""
         page = getattr(self, "_web", None)
-        if page is not None and screen.get("vis") == "hidden":
+        if page is not None and screen.get("vis") == "visible":
+            page.visible_at = _time.monotonic()  # the proof it is on screen
+        elif page is not None and screen.get("vis") == "hidden":
             page.visible_at = 0.0
             log("the page says it is hidden now; the next command checks what is in front")
         last = getattr(self, "_last_xml", "")
@@ -1543,6 +1545,7 @@ class U2Daemon:
             if cmd in NO_RETRY:
                 # The phone may already have acted (the reply was lost, not
                 # the request). Replaying would tap or type twice.
+                log("%s %s: %s" % (cmd, arg[:80], err_text(e, 160)))
                 raise
             # Maybe the on-device server died — reconnect once and retry.
             # The RLock makes concurrent handlers queue behind one reconnect.

@@ -1980,6 +1980,14 @@ def _contains(outer, inner):
             and outer[2] >= inner[2] and outer[3] >= inner[3])
 
 
+def in_webview(node):
+    """True for a row inside a WebView (a browser's page, an app's web
+    content): document order says nothing about what is on top there,
+    and the page itself knows what is under a point. Pure."""
+    return any("webview" in (p.attrib.get("class") or "").lower()
+               for p in node.get("parents", ()))
+
+
 def row_over(nodes, node, hits, pt):
     """The row drawn over `pt`, the tap point of `node`, or None: a row
     with words of its own, not the same control drawn twice (see
@@ -1992,8 +2000,7 @@ def row_over(nodes, node, hits, pt):
     Oct 4: the tap meant for Box Score opened Standings). On a native
     screen later is on top (a sheet's Not now over the page's Buy now),
     and is_point_covered applies. Pure."""
-    if not any("webview" in (p.attrib.get("class") or "").lower()
-               for p in node.get("parents", ())):
+    if not in_webview(node):
         return None
     rows = [n for n in hits if n is node or _one_control(node, n)]
     rects = [r for r in (_bounds_rect(n.get("bounds")) for n in rows) if r]
@@ -2088,10 +2095,12 @@ def plan_tap(nodes, w, h, text=None, xy=None, fuzzy=False, index=None,
     if pt[0] is None:
         return {"action": "nobounds"}
     moved = False
-    if check:
-        # a row over another on a page is the page's own business: a tap
+    if check and not in_webview(node):
+        # what is over a row on a page is the page's own business: a tap
         # by label there asks the page what is under the point (the guess
-        # from the rows sent a tap nudging for 12s over a banner, Oct 5)
+        # from the rows sent a tap nudging for 12s over a banner, and the
+        # document-order one refused the next try, Oct 5); on a native
+        # screen later is on top
         cover = is_point_covered(nodes, pt[0], pt[1], node)
         if cover is not None:
             alt = find_uncovered_point(node, nodes)

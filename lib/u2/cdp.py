@@ -85,6 +85,13 @@ class WebSocket:
         self.s.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\n"
                         "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
                         "Sec-WebSocket-Version: 13\r\n\r\n" % (path, host, key)).encode())
+        # the handshake's reply is read before the first frame (see _read):
+        # frames sent meanwhile ride in the handshake's round trip, which
+        # is 0.4-0.75s from afar
+        self._handshake_key = key
+
+    def _await_handshake(self):
+        key, self._handshake_key = self._handshake_key, None
         resp = b""
         while b"\r\n\r\n" not in resp:
             chunk = self.s.recv(4096)
@@ -101,6 +108,8 @@ class WebSocket:
             raise ConnectionError("websocket handshake: wrong accept key")
 
     def _read(self, n):
+        if self._handshake_key:
+            self._await_handshake()
         while len(self.buf) < n:
             chunk = self.s.recv(65536)
             if not chunk:
@@ -241,9 +250,18 @@ class Page:
         self.loading = False
         self.main_frame = None
         self.url = ""
-        res = self.call_many([("Page.enable", {}), ("Page.getFrameTree", {})])
+        res = self.call_many([("Page.enable", {}), ("Page.getFrameTree", {}),
+                              _evaluate("document.visibilityState")], raise_errors=False)
+        for r in res[:2]:
+            if isinstance(r, Exception):
+                raise r
         frame = (res[1].get("frameTree") or {}).get("frame") or {}
         self.main_frame, self.url = frame.get("id"), frame.get("url", "")
+        try:
+            if _value(res[2]) == "visible":
+                self.visible_at = time.monotonic()
+        except RuntimeError:
+            pass
 
     def _event(self, m):
         method, p = m.get("method", ""), m.get("params") or {}
@@ -287,8 +305,8 @@ class Page:
 
     def _bound(self, timeout):
         """`timeout`, or STALE_CALL_S when nothing has proved the page on
-        screen within VISIBLE_FOR_S (see visible)."""
-        if time.monotonic() - self.visible_at > VISIBLE_FOR_S:
+        screen within QUICK_AFTER_S (see visible)."""
+        if time.monotonic() - self.visible_at > QUICK_AFTER_S:
             return min(timeout, STALE_CALL_S)
         return timeout
 
@@ -302,7 +320,6 @@ class Page:
                 if "id" not in m:
                     self._event(m)
                 continue
-            self.visible_at = time.monotonic()  # it answered: it is on screen
             if "error" in m:
                 raise RuntimeError("%s: %s" % (method, m["error"].get("message", m["error"])))
             return m.get("result", {})
@@ -325,7 +342,6 @@ class Page:
                 got[m["id"]] = m
             elif "id" not in m:
                 self._event(m)
-        self.visible_at = time.monotonic()  # it answered: it is on screen
         out = []
         for i, (method, _) in zip(ids, cmds):
             m = got[i]
@@ -525,6 +541,11 @@ FIND_JS = r"""
   // a label beside the control it labels is that control
   // a label found by its words stands for the control it labels
   controls = controls.map(el => (el.tagName === 'LABEL' && el.control) ? el.control : el).filter((el, i, a) => a.indexOf(el) === i);
+  // the parts of one link or button are one control (a thumbnail whose
+  // alt text is the title beside it: Wikipedia's suggestions, Oct 5)
+  const owners = new Map();
+  for (const el of controls) { const o = el.closest(ACTIVE) || el; if (!owners.has(o)) owners.set(o, el); }
+  controls = Array.from(owners.values());
   // text goes into a field; words on a button or a link (a search icon
   // where the page hides its box) name what opens one: that is touched
   let notField = false;
@@ -792,11 +813,12 @@ def page_xml(screen, top, screen_h=0, pkg="com.android.chrome"):
 QUIET_CAP_S = 0.5  # a wait for a quiet DOM, at most: a live page never stops changing
 LOAD_CAP_S = 1.8   # a wait for a page that is loading, at most (the caller
                    # reads again when the screen looks half drawn)
-VISIBLE_FOR_S = 45.0  # a page that answered a command is on screen (a background tab
-                      # answers only on its timeout): that proof holds this long without
-                      # another, and a read that says the document is hidden ends it
-STALE_CALL_S = 3.0    # the first command after VISIBLE_FOR_S without proof waits this
-                      # long at most: a tab frozen in the background answers nothing
+VISIBLE_FOR_S = 45.0  # a page's read says whether its document is visible: that proof
+                      # holds this long without another (no question of its own), and a
+                      # read that says hidden ends it
+QUICK_AFTER_S = 8.0   # a command QUICK_AFTER_S or more after the last proof waits
+STALE_CALL_S = 3.0    # STALE_CALL_S at most: a tab frozen in the background answers
+                      # nothing, and the caller then looks at the screen
 
 
 def settle(page, idle_ms=1200, poll_s=0.15, quiet_s=0.3, url=None, loading=False):
