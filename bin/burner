@@ -4206,11 +4206,12 @@ def cmd_amazon_status(args):
         _sh_quote("https://www.amazon.com/gp/css/order-history"),
         _sh_quote("com.amazon.mShop.android.shopping")))
     u2_invalidate()
-    # 8s, not 20: the list is web content inside the app, whose words
-    # reach the screen reader late (22s runs on Oct 5 were this wait
-    # running out); the swipe and read below find the order anyway.
+    # 3s, not 20: the list is web content inside the app, whose words
+    # reach the screen reader only after the swipe below (22s and 10s
+    # runs on Oct 5 were this wait running out); the swipe and read
+    # find the order.
     u2sock("wait_for", json.dumps({"text": "Your Orders || Orders || Sign in",
-                                   "timeout": 8, "absent": False}), timeout=40)
+                                   "timeout": 3, "absent": False}), timeout=30)
     root = None
     for attempt in range(4):
         if attempt:

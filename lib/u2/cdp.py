@@ -543,8 +543,29 @@ FIND_JS = r"""
   }
   if (!inView(r) || r.top < 0 || r.bottom > vh) { el.scrollIntoView({block: 'center', inline: 'nearest'}); r = box(el); moved = true; }
   window.__burnerTarget = el;
+  // a text field with the focus keeps the keyboard up, which pushes the
+  // visual viewport: leave it first (as a person tapping elsewhere does),
+  // and the caller takes the place afresh (PLACE_JS)
+  let blurred = false;
+  const act = document.activeElement;
+  if (act && act !== el && !el.contains(act) && act.matches('input,textarea,[contenteditable=true]')) { act.blur(); blurred = true; }
+  const vv = window.visualViewport;
   return {found: true, count: 1, used: used, label: (names(el)[0] || '').slice(0, 60),
-          x: r.left + r.width / 2, y: r.top + r.height / 2, moved: moved, url: location.href};
+          x: r.left + r.width / 2 - (vv ? vv.offsetLeft : 0), y: r.top + r.height / 2 - (vv ? vv.offsetTop : 0),
+          moved: moved, blurred: blurred, url: location.href};
+})"""
+
+# The place of the element FIND kept, against the visual viewport (what
+# a touch is aimed at), once the keyboard has gone.
+PLACE_JS = r"""
+(function(){
+  const el = window.__burnerTarget;
+  if (!el) return null;
+  const vv = window.visualViewport, vh = vv ? vv.height : innerHeight;
+  let r = el.getBoundingClientRect();
+  const top = r.top - (vv ? vv.offsetTop : 0), bottom = r.bottom - (vv ? vv.offsetTop : 0);
+  if (top < 0 || bottom > vh) { el.scrollIntoView({block: 'center', inline: 'nearest'}); r = el.getBoundingClientRect(); }
+  return {x: r.left + r.width / 2 - (vv ? vv.offsetLeft : 0), y: r.top + r.height / 2 - (vv ? vv.offsetTop : 0)};
 })"""
 
 # A settle probe: the page's readiness and a count of DOM changes, so a
@@ -774,8 +795,11 @@ def tap(page, label, index=None, idle_ms=1200):
         time.sleep(0.15)
         return {"found": True, "count": 1, "label": hit.get("label"),
                 "how": "chose" if hit.get("chose") else "focus", "screen": read(page)}
-    if hit.get("moved"):
-        time.sleep(0.3)  # the scroll into view
+    if hit.get("moved") or hit.get("blurred"):
+        time.sleep(0.35)  # the scroll into view, or the keyboard going
+        place = page.eval(_js(PLACE_JS)) or {}
+        if place.get("x") is not None:
+            hit["x"], hit["y"] = place["x"], place["y"]
     page.loading = False
     how = touch(page, hit["x"], hit["y"])
     probe = after_touch(page, hit.get("url"), idle_ms)
