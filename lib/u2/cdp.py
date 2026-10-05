@@ -594,6 +594,35 @@ def navigate(page, url, idle_ms=1000):
     return {"screen": read(page), "ready": probe.get("ready")}
 
 
+# The focused field's content selected, so inserted text replaces it.
+SELECT_JS = r"""
+(function(){
+  const el = document.activeElement;
+  if (!el || el === document.body) return false;
+  try {
+    if (typeof el.select === 'function') el.select();
+    else { const r = document.createRange(); r.selectNodeContents(el); const s = getSelection(); s.removeAllRanges(); s.addRange(r); }
+  } catch (e) {}
+  return true;
+})"""
+
+
+def type_text(page, text, idle_ms=800):
+    """Type `text` into the page's focused field, replacing its content
+    (as the screen reader's set_text does): the content selected, the
+    text inserted the way an IME commits it, a wait for the page, a
+    read. Raises NotSent when no field has the focus."""
+    try:
+        ok = page.eval(_js(SELECT_JS), timeout=5.0)
+    except Exception as e:
+        raise NotSent(str(e)[:120])
+    if not ok:
+        raise NotSent("no field has the focus on the page")
+    page.call("Input.insertText", 10.0, text=text)
+    probe = settle(page, idle_ms)
+    return {"screen": read(page), "ready": probe.get("ready")}
+
+
 def scroll(page, direction="down", times=1, fraction=0.6, idle_ms=500):
     """Scroll like a finger would, `times` times (or to an end: "top",
     "bottom"), then read once the page settles. Returns the read and how

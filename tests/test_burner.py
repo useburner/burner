@@ -3554,11 +3554,21 @@ class LabelTapTests(OfflineTestCase):
         self.allow("tap_center")
         self.allow("nav_record")
         calls = []
-        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30:
-                   calls.append(json.loads(arg)) or SAMPLE_XML)
+
+        def u2(cmd, arg="", timeout=30):
+            spec = json.loads(arg)
+            calls.append(spec)
+            if "tap_label" in spec:
+                pc._u2_status = "err act not sent: --index needs a read"  # a native screen
+                return None
+            return SAMPLE_XML
+        self.allow("u2sock", side_effect=u2)
         with self.cap():
             pc.cmd_tap(self.parse(["tap", "OK", "--index", "1"]))
-        self.assertNotIn("tap_label", calls[0])
+        # the helper is asked first (a page picks by index); a native
+        # screen says no and the second OK is read, planned and tapped
+        self.assertEqual(calls[0], {"tap_label": "OK", "index": 1, "idle": 1200})
+        self.assertEqual(calls[1]["tap"], [250, 650])
 
     def test_tap_nudges_a_cut_off_row_then_taps_it_by_label(self):
         # espn.com, Oct 4: the row is cut off at the top edge on the first
@@ -4036,6 +4046,32 @@ class WebPathTests(OfflineTestCase):
             pc.cmd_open(self.parse(["open", "--quiet", "market://details?id=x", "com.android.vending"]))
         self.assertEqual(adb.call_count, 1)
         self.assertFalse(any(isinstance(c[1], dict) and "open" in c[1] for c in calls))
+
+    def test_helper_types_into_the_page(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = self._fake_cdp(mod, calls)
+
+        def type_text(page, text, idle_ms=800):
+            calls.append(("type", text, idle_ms))
+            if text == "nowhere":
+                raise fake.NotSent("no field has the focus on the page")
+            return {"screen": WEB_SCREEN, "ready": "complete"}
+        fake.type_text = type_text
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        dm._batch = lambda calls, timeout=45.0: self.fail("typing into a page must not use the screen reader")
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        xml = dm.cmd_act(json.dumps({"set_text": "Pixel 7 battery", "idle": 800})).decode()
+        self.assertEqual(calls[-1], ("type", "Pixel 7 battery", 800))
+        self.assertIn("WebView", xml)
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"set_text": "nowhere"}))
+        self.assertEqual(str(cm.exception), "act not sent: no field has the focus on the page")
+        # a tap by label with an index: the page picks
+        xml = dm.cmd_act(json.dumps({"tap_label": "Box Score", "index": 1, "idle": 900})).decode()
+        self.assertEqual(calls[-1], ("tap", "Box Score", 1, 900))
 
     def test_helper_opens_a_link_in_the_page(self):
         mod = _u2mux()

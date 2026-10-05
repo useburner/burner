@@ -1203,7 +1203,26 @@ class U2Daemon:
                 xml = self._page_xml(r["screen"])
                 self._remember(xml)
             return xml.encode()
+        if "set_text" in spec and self._page() is not None:
+            # Text into a page's focused field, by the page (cdp.type_text).
+            with self._lock:
+                self.invalidate()
+                try:
+                    with _t("web type"):
+                        r = _cdp().type_text(self._web, str(spec["set_text"]),
+                                             int(spec.get("idle", 800)))
+                except _cdp().NotSent as e:
+                    raise RuntimeError("act not sent: %s" % e)
+                except Exception as e:
+                    self._web = None
+                    raise RuntimeError("act failed after sending: %s" % err_text(e, 120))
+                xml = self._page_xml(r["screen"])
+                self._remember(xml)
+            return xml.encode()
         if "tap_label" in spec:
+            if spec.get("index") is not None:
+                # Which of several rows: the caller reads and plans.
+                raise RuntimeError("act not sent: --index needs a read")
             # Tap the row with this label where it is now: on a fresh
             # read, not the assistant's. (A web page's rows report their
             # old place for a moment after a scroll, espn.com Oct 4: the

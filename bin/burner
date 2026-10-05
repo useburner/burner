@@ -2096,14 +2096,18 @@ def cmd_tap(args):
             return _tap_fail(args, str(e))
     waker = wake_async()
     plain = (args.xy is None and snap_xy is None and not args.fuzzy
-             and args.index is None and not args.settle and not args.quiet
+             and not args.settle and not args.quiet
              and not as_json(args) and not args.no_occlusion_check)
     if plain:
         # The screen the assistant was just shown is the helper's newest
         # read: when the label is on it exactly once, the helper taps it
-        # by label and returns the settled screen in one round trip. Any
+        # by label and returns the settled screen in one round trip (a
+        # page in Chrome picks among its matches with --index). Any
         # other case (two matches, an older read) reads first, below.
-        status, root, note = act_and_read({"tap_label": args.text})
+        spec = {"tap_label": args.text}
+        if args.index is not None:
+            spec["index"] = args.index
+        status, root, note = act_and_read(spec)
         if status != "unsent":
             waker.join()
             snap_invalidate()
