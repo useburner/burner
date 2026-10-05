@@ -3379,7 +3379,7 @@ class LaunchReadBudgetTests(OfflineTestCase):
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_open(self.parse(["open", "https://example.com"]))
         self.assertEqual(rc, 0)
-        self.assertEqual(calls[1], ("dump", "page"))  # the page asked first (an older helper's reply: not a page)
+        self.assertEqual((calls[1][0], calls[1][1].split()[0]), ("dump", "page"))  # the page asked first (an older helper's reply: not a page)
         self.assertEqual(calls[2], ("act", '{"idle": 1000}'))
         self.assertEqual(dump.call_count, 1)  # one re-read of a thin screen
         self.assertIn("(may still be loading)", out.getvalue())
@@ -4034,7 +4034,8 @@ class StartAndSettingsTests(OfflineTestCase):
         # the verdict's one adb call: the package is installed
         self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout="package:/data/app/x/base.apk\n", stderr=""))
         reads = self.allow("u2sock", return_value=SAMPLE_XML)
-        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+        with mock.patch.object(pc.time, "sleep"), mock.patch.object(pc, "LAUNCH_SLOW_S", 0), \
+                self.cap() as (out, err):
             rc = pc.cmd_start(self.parse(["start", "com.other"]))
         self.assertEqual(rc, 1)
         self.assertIn("com.other didn't come to the front; com.example is still open",
@@ -4611,7 +4612,7 @@ class WebPathTests(OfflineTestCase):
         calls = []
         fake = self._fake_cdp(mod, calls)
 
-        def down(dev, current=None):
+        def down(dev, current=None, **kw):
             raise TimeoutError("timed out")
         fake.front_page = down
         dm = EmptyScreenTests._daemon(self, mod)
@@ -4621,7 +4622,7 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(calls, [])
         self.assertGreater(dm._web_retry_at, mod._time.monotonic())
         dm._last_xml = CHROME_XML
-        fake.front_page = lambda dev, current=None: self.fail("asked again within the cooldown")
+        fake.front_page = lambda dev, current=None, **kw: self.fail("asked again within the cooldown")
         self.assertEqual(dm._dump(fresh=True), SAMPLE_XML)
 
     def test_form_rows_read_like_native_controls(self):
@@ -4684,7 +4685,7 @@ class WebPathTests(OfflineTestCase):
         fake = types.SimpleNamespace(
             is_chrome=real.is_chrome, page_xml=real.page_xml, NotSent=real.NotSent, NotDone=real.NotDone,
             CHROME_PACKAGES=real.CHROME_PACKAGES, LOAD_PROBE_S=real.LOAD_PROBE_S,
-            front_page=lambda dev, current=None: _FakePage(), visible=lambda page, timeout=1.5: True,
+            front_page=lambda dev, current=None, **kw: _FakePage(), visible=lambda page, timeout=1.5: True,
             QUICK_PROBE_S=0.7,
             read=lambda page, cap=160: calls.append(("read",)) or WEB_SCREEN,
             tap=tap, scroll=scroll)
@@ -4950,7 +4951,7 @@ class WebPathTests(OfflineTestCase):
         calls = []
         fake = self._fake_cdp(mod, calls)
         fake.visible = lambda page, timeout=1.5: False  # the page in hand is hidden now
-        fake.front_page = lambda dev, current=None: self.fail("no tab scan with another app in front")
+        fake.front_page = lambda dev, current=None, **kw: self.fail("no tab scan with another app in front")
 
         class Gone:
             def close(self):
@@ -6110,7 +6111,7 @@ class HelperReviewFixTests(OfflineTestCase):
         fake.find_read = lambda page, label, top=0, exact=False: (
             calls.append(("find", label, exact)) or {"found": False}, dict(WEB_SCREEN, vis="hidden"))
         fake.visible = lambda page, timeout=1.5: page.visible_at > 0  # a probe: hidden once the proof ended
-        fake.front_page = lambda dev, current=None: current  # the page in hand while it is visible
+        fake.front_page = lambda dev, current=None, **kw: current  # the page in hand while it is visible
         dm = EmptyScreenTests._daemon(self, mod)
         page = dm._web = _FakePage()
         page.visible_at = 1e9
@@ -6782,7 +6783,7 @@ class CoordinateTapTests(OfflineTestCase):
         fake = WebPathTests._fake_cdp(self, mod, calls)
         fake.LOAD_PROBE_S = 6.0
         fake.CHROME_PACKAGES = ("com.android.chrome",)
-        fake.front_page = lambda dev, current=None, first_probe_s=None: _FakePage()
+        fake.front_page = lambda dev, current=None, first_probe_s=None, **kw: _FakePage()
         dm = EmptyScreenTests._daemon(self, mod)
         launcher = SAMPLE_XML.replace("com.example", "com.google.android.apps.nexuslauncher")
         dm._last_xml, dm._last_xml_t = launcher, mod._time.monotonic()  # the read before: HOME
@@ -6795,7 +6796,7 @@ class CoordinateTapTests(OfflineTestCase):
         # a tab not yet visible right after the launch is asked again, then found
         answers = iter([RuntimeError("no visible page in Chrome's first 3 tabs"), _FakePage()])
 
-        def late(dev, current=None, first_probe_s=None):
+        def late(dev, current=None, first_probe_s=None, **kw):
             a = next(answers)
             if isinstance(a, Exception):
                 raise a
@@ -6815,7 +6816,7 @@ class CoordinateTapTests(OfflineTestCase):
             if cmd == "act":
                 pc._u2_status = "err act not sent: not a page"
                 return None
-            return page if arg == "page" else "100"
+            return page if arg.split(" ")[0] == "page" else "100"
         self.allow("u2sock", side_effect=u2)
         adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
         self.allow("u2_invalidate")
@@ -6824,7 +6825,7 @@ class CoordinateTapTests(OfflineTestCase):
         self.assertEqual(rc, 0, err.getvalue())
         self.assertEqual(adb.call_count, 1)
         self.assertEqual([c[0] for c in calls], ["act", "dump"])
-        self.assertEqual(calls[1], ("dump", "page"))
+        self.assertEqual((calls[1][0], calls[1][1].split()[0]), ("dump", "page"))
         self.assertIn("Box Score (click) (796,491)", out.getvalue())
         # the page can't be reached (a Chrome still starting, a native screen): the launch read, as before
         calls.clear()
@@ -6836,7 +6837,7 @@ class CoordinateTapTests(OfflineTestCase):
                     pc._u2_status = "err act not sent: not a page"
                     return None
                 return SAMPLE_XML.replace("com.example", "com.android.chrome")  # the launch read
-            return "" if arg == "page" else "100"
+            return "" if arg.split(" ")[0] == "page" else "100"
         self.allow("u2sock", side_effect=u2_none)
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_open(self.parse(["open", "https://www.espn.com/nfl/"]))
@@ -6850,7 +6851,7 @@ class CoordinateTapTests(OfflineTestCase):
         calls = []
         fake = WebPathTests._fake_cdp(self, mod, calls)
         fake.LOAD_PROBE_S = 6.0
-        fake.front_page = lambda dev, current=None, first_probe_s=None: (
+        fake.front_page = lambda dev, current=None, first_probe_s=None, **kw: (
             calls.append(("front_page", first_probe_s)) or _FakePage())
         dm = EmptyScreenTests._daemon(self, mod)
         dm.d = _FakeServer([])  # the screen reader is never asked
@@ -6864,7 +6865,7 @@ class CoordinateTapTests(OfflineTestCase):
         calls.clear()
         answers = iter([OSError("refused"), OSError("refused"), _FakePage()])
 
-        def starting(dev, current=None, first_probe_s=None):
+        def starting(dev, current=None, first_probe_s=None, **kw):
             a = next(answers)
             calls.append(("front_page", first_probe_s))
             if isinstance(a, Exception):
@@ -6923,7 +6924,7 @@ class CoordinateTapTests(OfflineTestCase):
         fake.touch_at = lambda page, x, y, screen, top, idle_ms=1200: (
             calls.append(("touch_at", x, y, top, screen is page.last_read))
             or {"screen": WEB_SCREEN, "ready": "complete", "how": "touch"})
-        fake.front_page = lambda dev, current=None: current  # the page in hand, as the real one keeps it
+        fake.front_page = lambda dev, current=None, **kw: current  # the page in hand, as the real one keeps it
         dm = EmptyScreenTests._daemon(self, mod)
         dm._web = _FakePage()
         dm._web.visible_at = 1e9
@@ -7011,3 +7012,207 @@ class CoordinateTapTests(OfflineTestCase):
             rc = pc.cmd_tap(self.parse(["tap", "--xy", "0.5,0.5"]))
         self.assertEqual(rc, 0, err.getvalue())
         self.assertEqual(calls[0], ("dump", "cached"))
+
+
+class AirbnbRoundTests(OfflineTestCase):
+    """The Airbnb cabin task through Muse, Oct 5: a card's title under its
+    link, the page's tab listed fourth, a cold start judged too soon, two
+    re-reads after every date tapped."""
+
+    def test_same_address_matches_a_link_and_chrome_s_bar(self):
+        cdp = _cdp()
+        link = "https://www.airbnb.com/s/Stillwater/homes?checkin=2026-10-09"
+        self.assertTrue(cdp.same_address(link, "airbnb.com/s/Stillwater/homes?checkin=2026-10-09…"))  # the bar's cut
+        self.assertTrue(cdp.same_address(link, "https://airbnb.com/s/Stillwater/homes/"))
+        self.assertTrue(cdp.same_address("https://www.espn.com/nfl/", "espn.com"))  # the bar shows the site alone
+        self.assertFalse(cdp.same_address("https://www.espn.com/nfl/", "https://www.airbnb.com/"))
+        self.assertFalse(cdp.same_address("", "airbnb.com"))
+        self.assertFalse(cdp.same_address("https://a.io/", "a.io"))  # too short to say
+
+    def test_front_page_probes_the_hinted_tab_with_the_first_ones(self):
+        cdp = _cdp()
+        probes = []
+
+        class Tab:
+            def __init__(self, dev, target, probe_s=None):
+                probes.append((target, probe_s))
+                # D is the one on screen (a link launched Chrome into it); the rest answer hidden
+                self.target, self.visible_at = target, (1.0 if target == "D" else 0.0)
+
+            def close(self):
+                pass
+        tabs = [{"id": "A", "url": "https://www.espn.com/"}, {"id": "B", "url": "https://x.com/"},
+                {"id": "C", "url": "https://y.com/"}, {"id": "D", "url": "https://www.airbnb.com/s/Woodbury/homes?x=1"},
+                {"id": "E", "url": "https://z.com/"}]
+        with mock.patch.object(cdp, "Page", Tab), mock.patch.object(cdp, "pages", lambda dev: tabs):
+            page = cdp.front_page(None, hint="https://www.airbnb.com/s/Woodbury/homes?x=1")
+        self.assertEqual(page.target, "D")
+        self.assertEqual(probes, [("A", None), ("B", None), ("C", None), ("D", None)])  # one round
+        # what Chrome's bar shows (no scheme, the path cut) hints the same tab
+        probes.clear()
+        with mock.patch.object(cdp, "Page", Tab), mock.patch.object(cdp, "pages", lambda dev: tabs):
+            page = cdp.front_page(None, hint="airbnb.com/s/Woodbury/ho…")
+        self.assertEqual((page.target, len(probes)), ("D", 4))
+
+    def test_front_page_sweeps_the_next_tabs_when_the_first_are_hidden(self):
+        cdp = _cdp()
+        probes = []
+
+        class Tab:
+            def __init__(self, dev, target, probe_s=None):
+                probes.append((target, probe_s))
+                self.target, self.visible_at = target, (1.0 if target == "F" else 0.0)
+
+            def close(self):
+                pass
+        tabs = [{"id": t, "url": "https://%s.com/" % t.lower()} for t in "ABCDEFGHIJKLMN"]
+        with mock.patch.object(cdp, "Page", Tab), mock.patch.object(cdp, "pages", lambda dev: tabs):
+            page = cdp.front_page(None)
+        self.assertEqual(page.target, "F")
+        # the first three; the current one answered hidden, so no long
+        # probe of it; then the next MORE_TABS at once
+        self.assertEqual([p[0] for p in probes], list("ABC") + list("DEFGHIJK"))
+        self.assertTrue(all(p[1] is None for p in probes))
+
+    def test_front_page_says_what_each_tab_answered(self):
+        cdp = _cdp()
+
+        class Tab:
+            def __init__(self, dev, target, probe_s=None):
+                self.target, self.visible_at = target, 0.0
+                if target == "B":
+                    raise TimeoutError("timed out")
+                if target == "C":
+                    raise ConnectionError("refused")
+
+            def close(self):
+                pass
+        tabs = [{"id": "A", "url": "https://www.airbnb.com/s/Woodbury/homes"},
+                {"id": "B", "url": "https://x.com/"}, {"id": "C", "url": ""}]
+        with mock.patch.object(cdp, "Page", Tab), mock.patch.object(cdp, "pages", lambda dev: tabs):
+            with self.assertRaises(RuntimeError) as cm:
+                cdp.front_page(None)
+        self.assertEqual(str(cm.exception), "no visible page among Chrome's 3 tabs probed: "
+                         "airbnb.com/s/woodbury/homes: hidden; x.com: no answer (TimeoutError); (no address): refused")
+
+    def test_url_bar_of_reads_chrome_s_address_bar(self):
+        mod = _u2mux()
+        xml = ('<hierarchy rotation="0"><node index="0" text="airbnb.com/s/Woodbury/homes?checkin=2026&amp;x=1" '
+               'resource-id="com.android.chrome:id/url_bar" class="android.widget.EditText" package="com.android.chrome" '
+               'bounds="[200,160][700,260]" clickable="true" enabled="true"/></hierarchy>')
+        self.assertEqual(mod.url_bar_of(xml), "airbnb.com/s/Woodbury/homes?checkin=2026&x=1")
+        self.assertEqual(mod.url_bar_of(SAMPLE_XML), "")
+        self.assertEqual(mod.url_bar_of(""), "")
+
+    def test_the_helper_hints_the_tab_scan_with_the_bar_or_the_link_it_couldnt_open(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = WebPathTests._fake_cdp(self, mod, calls)
+        hints = []
+        fake.front_page = lambda dev, current=None, **kw: hints.append(kw.get("hint")) or _FakePage()
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        mod.log = lambda *a: None
+        # Chrome not in front: the link is launched by the CLI, and remembered
+        dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()
+        with self.assertRaises(RuntimeError):
+            dm.cmd_act(json.dumps({"open": "https://www.airbnb.com/s/Woodbury/homes"}))
+        self.assertEqual(dm._address_hint(SAMPLE_XML), "https://www.airbnb.com/s/Woodbury/homes")
+        # Chrome's bar on the newest read comes first
+        bar = CHROME_XML.replace(
+            '<node text="" class="android.webkit.WebView"',
+            '<node text="espn.com/nfl" resource-id="com.android.chrome:id/url_bar" class="android.widget.EditText"'
+            ' package="com.android.chrome" bounds="[200,160][700,260]" clickable="true" enabled="true"/>\n'
+            '    <node text="" class="android.webkit.WebView"')
+        self.assertEqual(dm._address_hint(bar), "espn.com/nfl")
+        dm._last_xml = bar
+        dm._dump(fresh=True)
+        self.assertEqual(hints, ["espn.com/nfl"])
+        # a link just launched, told to `dump page`, is the hint and is remembered
+        dm._last_xml = SAMPLE_XML
+        self.assertIn('text="Box Score"', dm.cmd_dump("page https://www.airbnb.com/rooms/1").decode())
+        self.assertEqual(hints[-1], "https://www.airbnb.com/rooms/1")
+        self.assertEqual(dm._address_hint(SAMPLE_XML), "https://www.airbnb.com/rooms/1")
+        # no bar, nothing opened lately: no hint (an older cdp module takes none)
+        dm._opened_at = -1e9
+        fake.front_page = lambda dev, current=None: _FakePage()
+        dm._last_xml = CHROME_XML
+        self.assertIn("WebView", dm._dump(fresh=True))
+
+    def test_the_helper_logs_where_a_web_tap_went(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = WebPathTests._fake_cdp(self, mod, calls)
+        fake.tap = lambda page, label, index=None, idle_ms=1200: {
+            "found": True, "count": 1, "label": label, "how": "touch", "screen": WEB_SCREEN,
+            "at": [164.1, 458.4], "tag": "a", "over": "a", "moved": True, "covered": False}
+        logged = []
+        mod.log = lambda *a: logged.append(" ".join(str(x) for x in a))
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        dm.cmd_act(json.dumps({"tap_label": "Cabin in St. Croix Falls city"}))
+        self.assertIn("web tap: touch on <a> at 164,458 laid over the words, scrolled into view", logged)
+
+    def test_a_cold_open_tells_the_helper_the_link(self):
+        self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
+        self.allow("u2_invalidate")
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append((cmd, arg))
+            if cmd == "act":
+                pc._u2_status = "err act not sent: not a page"  # Chrome not in front
+                return None
+            return CHROME_XML if cmd == "dump" else "100"
+        self.allow("u2sock", side_effect=u2)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_open(self.parse(["open", "https://www.airbnb.com/s/Woodbury/homes"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertIn(("dump", "page https://www.airbnb.com/s/Woodbury/homes"), calls)
+        self.assertIn("screen: com.android.chrome", out.getvalue())
+
+    def test_a_coordinate_tap_rereads_an_unchanged_screen_once(self):
+        self.allow("wake_async", return_value=mock.Mock())
+        self.allow("u2_invalidate")
+        self.allow("nav_record_action")
+        reads = self.allow("ui_dump", return_value=ET.fromstring(TAP_XML))
+
+        def u2(cmd, arg="", timeout=30):
+            if cmd == "dump" and arg == "cached":
+                return TAP_XML
+            return TAP_XML if cmd == "act" else "100"  # the tap changed nothing the read shows
+        self.allow("u2sock", side_effect=u2)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_tap(self.parse(["tap", "--xy", "0.5,0.5"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual(reads.call_count, 1)  # one re-read, not two
+        self.assertIn("tapped --xy 0.5,0.5", out.getvalue())
+
+    def test_start_gives_an_installed_app_s_cold_start_longer(self):
+        self.allow("scrcpy_send", return_value=True)
+        self.allow("u2_invalidate")
+        self.allow("nav_record")
+        adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(
+            returncode=0, stdout="package:/data/app/x/base.apk\n", stderr=""))
+        play = SAMPLE_XML.replace("com.example", "com.android.vending")
+        reads = []
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30:
+                   reads.append(cmd) or (play if len(reads) <= pc.LAUNCH_REREADS + 3 else SAMPLE_XML))
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_start(self.parse(["start", "com.example"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual(len(reads), pc.LAUNCH_REREADS + 4)  # the quick reads, then more while the app started
+        self.assertEqual(adb.call_count, 1)  # asked once whether the app is installed
+        self.assertIn("screen: com.example", out.getvalue())
+        self.assertNotIn("didn't come to the front", err.getvalue())
+        # an app that isn't installed gets its verdict after the quick reads
+        self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=1, stdout="", stderr=""))
+        reads.clear()
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_start(self.parse(["start", "com.nope"]))
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(reads), 1 + pc.LAUNCH_REREADS)
+        self.assertIn("com.nope isn't installed", err.getvalue())

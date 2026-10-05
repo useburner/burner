@@ -719,6 +719,20 @@ def webview_top(xml):
     return int(m.group(2)) if m else 0
 
 
+def url_bar_of(xml):
+    """What Chrome's address bar shows on a read of the screen (the text
+    of its url_bar field), or "": the address of the tab on screen, for
+    the page scan to find that tab wherever Chrome lists it. Pure."""
+    import xml.sax.saxutils as saxutils
+    for m in re.finditer(r"<node\b[^>]*>", xml or ""):
+        tag = m.group(0)
+        if ':id/url_bar"' not in tag:
+            continue
+        t = re.search(r'\btext="([^"]*)"', tag)
+        return saxutils.unescape(t.group(1), {"&quot;": '"'}).strip() if t else ""
+    return ""
+
+
 def webview_rect(xml):
     """The rectangle (x1, y1, x2, y2) of the first WebView on a read, or
     None. Pure."""
@@ -1141,8 +1155,22 @@ class U2Daemon:
         return None
 
     LAUNCH_CONTACT_TRIES = 10  # a Chrome just launched: its DevTools side is asked this often, 0.3s apart
+    OPENED_FOR_S = 60.0        # a link the CLI launched is the tab scan's hint this long
 
-    def _page(self, assume_chrome=False):
+    def _address_hint(self, last, hint=None):
+        """Where the tab on screen is, for the tab scan: `hint` (the link
+        just opened), else what Chrome's bar shows on the newest read,
+        else the link launched OPENED_FOR_S ago at most."""
+        if hint:
+            return hint
+        bar = url_bar_of(last)
+        if bar:
+            return bar
+        if _time.monotonic() - getattr(self, "_opened_at", 0.0) < self.OPENED_FOR_S:
+            return getattr(self, "_opened", "")
+        return ""
+
+    def _page(self, assume_chrome=False, hint=None):
         """The visible page in Chrome, when Chrome is the app in front on
         the newest read and the page can be reached (cdp.front_page);
         else None: a native screen, or Chrome out of reach, and the
@@ -1150,7 +1178,8 @@ class U2Daemon:
         launched with a link (no read shows it yet): the page is
         contacted at once, its current tab given the longer probe from
         the start, and a Chrome still starting is asked again for a
-        few seconds."""
+        few seconds. hint: the link's address, for the scan (see
+        _address_hint)."""
         last = getattr(self, "_last_xml", "")
         cached = getattr(self, "_front_cache", None)
         if cached is not None and cached[0] is last:
@@ -1165,12 +1194,15 @@ class U2Daemon:
                 return None  # out of reach a moment ago: the screen reader, for now
         current = getattr(self, "_web", None)
         chrome_in_front = True
+        hint = self._address_hint(last, hint)
+        # (an older cdp module takes no hint: none passed when there is none)
+        hinted = {"hint": hint} if hint else {}
         if assume_chrome:
             for i in range(self.LAUNCH_CONTACT_TRIES):
                 try:
                     with _t("web page (after a launch)"):
                         self._web = _cdp().front_page(getattr(self.d, "_dev", None), current,
-                                                      first_probe_s=_cdp().LOAD_PROBE_S)
+                                                      first_probe_s=_cdp().LOAD_PROBE_S, **hinted)
                     return self._web
                 except Exception as e:
                     current = None
@@ -1178,7 +1210,7 @@ class U2Daemon:
                         self._web = None
                         self._web_retry_at = _time.monotonic() + WEB_BUSY_RETRY_S
                         log("the page in Chrome is out of reach after the launch (%s); the screen reader"
-                            % err_text(e, 100))
+                            % err_text(e, 300))
                         return None
                     _time.sleep(0.3)  # Chrome still starting, or its tab not yet visible
         if current is not None and not _cdp().visible(current, _cdp().QUICK_PROBE_S):
@@ -1207,14 +1239,14 @@ class U2Daemon:
                 return None
         try:
             with _t("web page"):
-                self._web = _cdp().front_page(getattr(self.d, "_dev", None), current)
+                self._web = _cdp().front_page(getattr(self.d, "_dev", None), current, **hinted)
         except Exception as e:
             self._web = None
             # Chrome in front but no page answering (busy, or a native
             # screen of Chrome's): the next command asks again soon.
             self._web_retry_at = _time.monotonic() + WEB_BUSY_RETRY_S
             log("the page in Chrome is out of reach (%s); the screen reader for %.0fs"
-                % (err_text(e, 100), WEB_BUSY_RETRY_S))
+                % (err_text(e, 300), WEB_BUSY_RETRY_S))
             return None
         return self._web
 
@@ -1252,7 +1284,7 @@ class U2Daemon:
                 xml = read_screen(self.d)
         return xml
 
-    def _page_read(self, assume_chrome=False):
+    def _page_read(self, assume_chrome=False, hint=None):
         """The page in Chrome as a screen read, or None (see _page). The
         screen reader's tree lags a finger scroll on a heavy page by
         seconds and comes back empty for a while (espn.com, Oct 4); the
@@ -1260,7 +1292,7 @@ class U2Daemon:
         app over the page (see _Look and window_over: the notification
         shade, a permission dialog): the page can't see it, and the
         screen reader's read is the screen then."""
-        page = self._page(assume_chrome)
+        page = self._page(assume_chrome, hint)
         if page is None:
             return None
         # the phone's windows, read meanwhile; after a launch the page's
@@ -1294,7 +1326,7 @@ class U2Daemon:
             self._mute_since, self._wordless_seen = None, False
         self._last_xml, self._last_xml_t = xml, _time.monotonic()
 
-    def _dump(self, fresh=False, replace=True, page_first=False):
+    def _dump(self, fresh=False, replace=True, page_first=False, hint=None):
         """Hierarchy XML; served from cache if < DUMP_TTL old unless fresh.
         replace=False: a wordless read is kept without replacing the
         server (a `wait` close to its deadline). A page in Chrome is read
@@ -1302,7 +1334,7 @@ class U2Daemon:
         launched with a link, and the page is asked without a native read
         first (that read paid 2s and showed the screen reader's lagging
         tree, Oct 5); "" when the page can't be reached, for the caller
-        to read its own way."""
+        to read its own way. hint: the link just launched."""
         xml = None if (fresh or page_first) else self._fresh_cache()
         if xml is not None:
             log("dump cache hit")
@@ -1310,7 +1342,7 @@ class U2Daemon:
         with self._lock:
             gen, t0 = self._gen, _time.monotonic()
             self._front_look = None
-            xml = self._page_read(assume_chrome=page_first)
+            xml = self._page_read(assume_chrome=page_first, hint=hint)
             if xml is None and page_first:
                 return ""
             if xml is None:
@@ -1442,9 +1474,13 @@ class U2Daemon:
         if arg.strip() == "cached":
             young = _time.monotonic() - self._last_xml_t < self.CACHED_READ_S
             return self._last_xml.encode() if young and has_words(self._last_xml) else b""
-        if arg.strip() == "page":
-            # Chrome was just launched with a link: the page, asked at once
-            return self._dump(fresh=True, page_first=True).encode()
+        if arg.strip() == "page" or arg.startswith("page "):
+            # Chrome was just launched with a link ("page <link>": that
+            # link, the hint for finding its tab): the page, asked at once
+            link = arg[5:].strip()
+            if link:
+                self._opened, self._opened_at = link, _time.monotonic()
+            return self._dump(fresh=True, page_first=True, hint=link).encode()
         return self._dump(fresh=(arg.strip() == "fresh")).encode()
 
     def cmd_invalidate(self, _):
@@ -1740,9 +1776,11 @@ class U2Daemon:
         if "open" in spec:
             # A link opened in the page in Chrome (cdp.navigate): its
             # current tab loads it. No tab for every link, no first
-            # contact with a new one. Elsewhere the CLI launches the link.
+            # contact with a new one. Elsewhere the CLI launches the link
+            # (remembered: the tab it lands in is the one to look for).
             page = self._page()
             if page is None:
+                self._opened, self._opened_at = str(spec["open"]), _time.monotonic()
                 raise RuntimeError("act not sent: not a page")
             with self._lock:
                 self.invalidate()
@@ -1794,6 +1832,15 @@ class U2Daemon:
                 except Exception as e:
                     self._web = None
                     raise RuntimeError("act failed after sending: %s" % err_text(e, 120))
+                if r.get("found") and r.get("count", 1) == 1 and r.get("at"):
+                    # where the touch went: a tap that opened nothing
+                    # left nothing to go on without it (airbnb.com, Oct 5)
+                    at = r["at"]
+                    log("web tap: %s on <%s> at %.0f,%.0f%s%s%s" % (
+                        r.get("how", "?"), r.get("tag") or "?", at[0] or 0, at[1] or 0,
+                        " laid over the words" if r.get("over") else "",
+                        ", scrolled into view" if r.get("moved") else "",
+                        ", under a cover" if r.get("covered") else ""))
                 if not r.get("found"):
                     # Chrome's own prompts (a permission ask, "Save
                     # password?") are not on the page; the screen reader

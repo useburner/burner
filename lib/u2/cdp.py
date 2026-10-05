@@ -393,6 +393,8 @@ def pages(dev):
 
 PROBE_S = 1.5    # a visibility question to a page: a background tab answers only on the timeout
 SCAN_TABS = 3    # tabs looked at for the visible page (Chrome lists the current one first)
+HINT_TABS = 3    # tabs at the hinted address (a link just opened, Chrome's bar), probed with the first
+MORE_TABS = 8    # the next tabs, probed once when none of the first ones is visible
 LOAD_PROBE_S = 6.0  # the current tab, too busy loading to answer the probe, is given this long
 
 
@@ -415,26 +417,35 @@ def visible(page, timeout=PROBE_S):
     return False
 
 
-def front_page(dev, current=None, first_probe_s=None):
-    """The page the user sees: `current` while it is still the visible
-    one, else the visible page among Chrome's first SCAN_TABS tabs (a
-    fresh session for it; Chrome lists the current tab first, and a
-    phone had 107). The tabs are asked at once, each on its own stream,
-    so the wait is one probe's, not one per tab (three in a row cost 6s
-    while a heavy page loaded, Oct 5); when none answers "visible", the
-    current tab, listed first, is given LOAD_PROBE_S once more: too busy
-    loading to answer is not hidden. With `first_probe_s` (Chrome was
-    just launched with a link: its current tab is loading it), the
-    current tab is given that long from the start. Raises RuntimeError
-    when none is visible (Chrome isn't in front, or shows a native
-    screen)."""
-    if current is not None:
-        if visible(current):
-            return current
-        current.close()
-    ids = [t["id"] for t in pages(dev)[:SCAN_TABS] if t.get("id")]
-    if not ids:
-        raise RuntimeError("no page in Chrome")
+def _address(s):
+    """A URL or what Chrome's bar shows, as one spelling: no scheme, no
+    "www.", no trailing slash or ellipsis, lower case. Pure."""
+    s = (s or "").strip().lower()
+    s = re.sub(r"^[a-z][a-z0-9+.-]*://", "", s)
+    if s.startswith("www."):
+        s = s[4:]
+    return s.rstrip("\u2026./ ")
+
+
+def same_address(url, hint):
+    """Whether a tab's URL is at the address in `hint`: a link just opened
+    (its scheme or "www." aside), or what Chrome's bar shows (no scheme,
+    a long path cut short): the shorter is the start of the longer. Pure."""
+    a, b = _address(url), _address(hint)
+    n = min(len(a), len(b))
+    return n >= 6 and a[:n] == b[:n]
+
+
+def _short(url):
+    return (_address(url) or "(no address)")[:40]
+
+
+def _probe(dev, ids, first_probe_s=None):
+    """Each tab asked whether it is the one on screen, all at once (each
+    on its own stream, so the wait is one probe's, not one per tab: three
+    in a row cost 6s while a heavy page loaded, Oct 5). By `ids`: a Page
+    (visible_at > 0 when it said visible) or the exception its probe
+    ended in (None: no answer in time)."""
     found = [None] * len(ids)
 
     def probe(i):
@@ -447,6 +458,12 @@ def front_page(dev, current=None, first_probe_s=None):
         t.start()
     for t in threads:
         t.join(max(PROBE_S, first_probe_s or 0) + 3.0)
+    return found
+
+
+def _visible_one(found):
+    """The first Page in `found` that said visible, the others closed;
+    None when none did."""
     page = None
     for p in found:
         if isinstance(p, Page):
@@ -454,16 +471,74 @@ def front_page(dev, current=None, first_probe_s=None):
                 page = p
             else:
                 p.close()
+    return page
+
+
+def _answer(p):
+    if isinstance(p, Page):
+        return "hidden"
+    if isinstance(p, ConnectionError):
+        return "refused"
+    return "no answer" if p is None else "no answer (%s)" % type(p).__name__
+
+
+def front_page(dev, current=None, first_probe_s=None, hint=None):
+    """The page the user sees: `current` while it is still the visible
+    one, else the visible page among Chrome's tabs (a fresh session for
+    it). The first SCAN_TABS tabs are probed at once (Chrome lists the
+    current one first, and a phone had 107), and with `hint` (the link
+    just opened, or the address Chrome's bar shows) the tabs at that
+    address too, wherever Chrome lists them: a link launched Chrome into
+    a tab listed fourth or later, and three probes found nothing while
+    the page was there (airbnb.com, Oct 5). When none answers "visible",
+    the current tab, listed first, is given LOAD_PROBE_S once more (too
+    busy loading to answer is not hidden), then the next MORE_TABS tabs
+    are probed once. With `first_probe_s` (Chrome was just launched with
+    a link: its current tab is loading it), the current tab is given
+    that long from the start. Raises RuntimeError, saying what each tab
+    answered, when none is visible (Chrome isn't in front, or shows a
+    native screen)."""
+    if current is not None:
+        if visible(current):
+            return current
+        current.close()
+    tabs = [t for t in pages(dev) if t.get("id")]
+    urls = {t["id"]: t.get("url", "") for t in tabs}
+    ids = [t["id"] for t in tabs[:SCAN_TABS]]
+    if hint:
+        for t in tabs[SCAN_TABS:]:
+            if same_address(t.get("url", ""), hint):
+                ids.append(t["id"])
+                if len(ids) >= SCAN_TABS + HINT_TABS:
+                    break
+    if not ids:
+        raise RuntimeError("no page in Chrome")
+    found = _probe(dev, ids, first_probe_s)
+    page = _visible_one(found)
     if page is not None:
         return page
     if (first_probe_s is None and not isinstance(found[0], Page)
             and not isinstance(found[0], ConnectionError)):
         # the current tab didn't answer in time: busy with a load, not hidden
-        p = Page(dev, ids[0], probe_s=LOAD_PROBE_S)
-        if p.visible_at > 0:
-            return p
-        p.close()
-    raise RuntimeError("no visible page in Chrome's first %d tabs" % len(ids))
+        try:
+            p = Page(dev, ids[0], probe_s=LOAD_PROBE_S)
+        except Exception as e:
+            p = e
+        if isinstance(p, Page):
+            if p.visible_at > 0:
+                return p
+            p.close()
+        found[0] = p
+    more = [t["id"] for t in tabs[SCAN_TABS:SCAN_TABS + MORE_TABS] if t["id"] not in ids]
+    if more:
+        found2 = _probe(dev, more)
+        page = _visible_one(found2)
+        if page is not None:
+            return page
+        ids, found = ids + more, found + found2
+    raise RuntimeError("no visible page among Chrome's %d tabs probed: %s" % (
+        len(ids), "; ".join("%s: %s" % (_short(urls.get(i, "")), _answer(p))
+                            for i, p in zip(ids, found))))
 
 
 # ----------------------------------------------------------- page scripts
@@ -492,6 +567,7 @@ READ_JS = r"""
   // row: an element whose descendants are all inline text elements and
   // none of them a control
   const INLINE = new Set(['B', 'STRONG', 'I', 'EM', 'SPAN', 'BDI', 'BDO', 'U', 'S', 'SMALL', 'SUB', 'SUP', 'MARK', 'ABBR', 'CODE', 'TIME', 'CITE', 'Q', 'VAR', 'KBD', 'SAMP', 'FONT', 'BR', 'WBR']);
+  const spans = (a, b) => a.left <= b.left + 2 && a.top <= b.top + 2 && a.right >= b.right - 2 && a.bottom >= b.bottom - 2;
   const run = el => { const kids = el.getElementsByTagName('*'); if (!kids.length || kids.length > 40) return null;
     for (const k of kids) if (!INLINE.has(k.tagName) || k.matches(ACTIVE) || k.hasAttribute('aria-label') || k.hasAttribute('title')) return null;
     return squash(el.textContent); };
@@ -513,11 +589,20 @@ READ_JS = r"""
     const key = text + '|' + desc + '|' + Math.round(r.left) + ',' + Math.round(r.top) + ',' + Math.round(r.right) + ',' + Math.round(r.bottom);
     if (seen.has(key)) continue;
     seen.add(key);
-    const kind = sel ? 'select' : field ? 'field' : check ? 'check' : el.matches('button,[role=button],input[type=submit],input[type=button]') ? 'button' : (active ? 'link' : 'text');
+    // a link or a button laid over the words (a card's link, drawn over
+    // its title and photo: airbnb.com, Oct 5): a finger there lands on
+    // the control, so the row is tappable, as that control
+    let over = null;
+    if (!active && !el.closest(ACTIVE)) {
+      const at = document.elementFromPoint(Math.min(vw - 1, Math.max(0, r.left + r.width / 2)), Math.min(vh - 1, Math.max(0, r.top + r.height / 2)));
+      const oc = at && at !== el && !el.contains(at) ? at.closest(ACTIVE) : null;
+      if (oc && spans(oc.getBoundingClientRect(), r)) over = oc;
+    }
+    const kind = sel ? 'select' : field ? 'field' : check ? 'check' : el.matches('button,[role=button],input[type=submit],input[type=button]') ? 'button' : (active ? 'link' : over ? (over.matches('button,[role=button]') ? 'button' : 'link') : 'text');
     out.push({text: text.slice(0, 160), desc: desc.slice(0, 160), kind: kind,
               value: field ? squash(el.value || el.textContent).slice(0, 160) : '',
               placeholder: field ? squash(el.getAttribute('placeholder')).slice(0, 80) : '',
-              click: active || !!el.closest(ACTIVE),
+              click: active || !!el.closest(ACTIVE) || !!over,
               checked: check ? (el.checked || el.getAttribute('aria-checked') === 'true') : false,
               focused: document.activeElement === el,
               selected: el.matches('[aria-selected=true],[aria-current]:not([aria-current=false])'),
@@ -571,6 +656,7 @@ FIND_JS = r"""
     : (el.checkVisibility ? el.checkVisibility({visibilityProperty: true, opacityProperty: true}) : true);
   const box = el => el.getBoundingClientRect();
   const inView = r => r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < vh && r.right > 0 && r.left < vw;
+  const spans = (a, b) => a.left <= b.left + 2 && a.top <= b.top + 2 && a.right >= b.right - 2 && a.bottom >= b.bottom - 2;
   // a run of text (words with a part in bold, a highlight, a span) is one
   // candidate with its whole text as its name: "Pixel 7" inside "Pixel 7a"
   // (a search's highlight of the typed words) is not a "Pixel 7"
@@ -688,10 +774,18 @@ FIND_JS = r"""
   const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
   const top = document.elementFromPoint(cx, cy);
   const ctl = el.closest(ACTIVE) || el;
-  const covered = !!(top && top !== el && !ctl.contains(top) && !top.contains(el));
+  let covered = !!(top && top !== el && !ctl.contains(top) && !top.contains(el));
+  // a link or a button laid over the words (a card's link, drawn over
+  // its title and photo: airbnb.com, Oct 5) is what a finger lands on,
+  // and the control for them: touched, not bypassed with the words' own
+  // click, which opens nothing. A popup over them (a date field's
+  // calendar) is not: its controls are small
+  let over = null;
+  if (covered) { const oc = top.closest(ACTIVE); if (oc && spans(box(oc), r)) { over = oc; covered = false; window.__burnerTarget = oc; } }
   return {found: true, count: 1, used: used, label: (names(el)[0] || '').slice(0, 60),
           x: cx - (vv ? vv.offsetLeft : 0), y: cy - (vv ? vv.offsetTop : 0),
-          moved: moved, blurred: blurred, covered: covered, notField: notField, tag: el.tagName.toLowerCase(),
+          moved: moved, blurred: blurred, covered: covered, notField: notField, tag: (over || el).tagName.toLowerCase(),
+          over: over ? over.tagName.toLowerCase() : '',
           cover: covered ? (top.tagName + ' ' + squash(top.innerText).slice(0, 40)) : '', url: location.href};
 })"""
 
@@ -745,8 +839,14 @@ PLACE_JS = r"""
   if (top < 0 || bottom > vh) { el.scrollIntoView({block: 'center', inline: 'nearest'}); r = el.getBoundingClientRect(); }
   const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
   const over = document.elementFromPoint(cx, cy);
-  const ctl = el.closest('a[href],button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=switch],[role=option],[onclick]') || el;
-  const covered = !!(over && over !== el && !ctl.contains(over) && !over.contains(el));
+  const ACTIVE = 'a[href],button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=switch],[role=option],[onclick]';
+  const ctl = el.closest(ACTIVE) || el;
+  let covered = !!(over && over !== el && !ctl.contains(over) && !over.contains(el));
+  if (covered) {
+    // a link or a button laid over the words is the control (see FIND_JS)
+    const oc = over.closest(ACTIVE), b = oc && oc.getBoundingClientRect();
+    if (b && b.left <= r.left + 2 && b.top <= r.top + 2 && b.right >= r.right - 2 && b.bottom >= r.bottom - 2) { covered = false; window.__burnerTarget = oc; }
+  }
   return {x: cx - (vv ? vv.offsetLeft : 0), y: cy - (vv ? vv.offsetTop : 0), covered: covered};
 })"""
 
@@ -1094,7 +1194,12 @@ def tap(page, label, index=None, idle_ms=1200):
         probe = after_touch(page, hit.get("url"), idle_ms)
         screen, ready = read(page), probe.get("ready")
     return {"found": True, "count": 1, "label": hit.get("label"), "how": how,
-            "screen": screen, "ready": ready}
+            "screen": screen, "ready": ready,
+            # where the touch went, for the helper's log: a failed tap
+            # without it left nothing to go on (airbnb.com, Oct 5)
+            "at": [hit.get("x"), hit.get("y")], "tag": hit.get("tag") or "",
+            "over": hit.get("over") or "", "moved": bool(hit.get("moved")),
+            "covered": bool(hit.get("covered"))}
 
 
 def touch_at(page, x, y, screen, top, idle_ms=1200):

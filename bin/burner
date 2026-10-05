@@ -1631,6 +1631,9 @@ def looks_half_drawn(rows, prev_rows):
 # paid 2.5s on every page open and 2s after every tap).
 IDLE_ACT_MS = 1200      # the read after a tap, a key or typed text
 IDLE_LAUNCH_MS = 1000   # the read after a launch or a link
+LAUNCH_SLOW_S = 9.0     # an installed app's cold start is given this long in all before
+                        # "didn't come to the front" (Airbnb, Oct 5: the Play Store still
+                        # in front 4s in, and the verdict while the app was starting)
 LAUNCH_REREADS = 4      # reads after a launch while another app is still in
                         # front (0.4s apart): the window takes a moment to come
 IDLE_SCROLL_MS = 500    # the read after a swipe: it stops dead, the content is
@@ -2573,7 +2576,10 @@ def _tap_then_read(args, label, xy, root):
         elif status != "ok":
             return print_act(status, None, "", "tap")
         return _tap_ok(args, label, xy)
-    status, after, note = act_and_read({"tap": [xy[0], xy[1]]}, prev_root=root)
+    # the helper's read comes once the UI went quiet (a page: a moment
+    # after the touch); an unchanged screen is read once more, not twice
+    # (two re-reads paid 1.1s on every date tapped in a calendar, Oct 5)
+    status, after, note = act_and_read({"tap": [xy[0], xy[1]]}, prev_root=root, rereads=1)
     if status == "unsent":
         tap_center(*xy)
         rc = _tap_ok(args, label, xy)
@@ -3495,17 +3501,22 @@ def cmd_start(args):
     return 0
 
 
+def app_installed(pkg):
+    """Whether the package is installed on the phone: one adb call (`pm
+    path`). True when the phone can't be asked (the usual advice then)."""
+    try:
+        r = adb_or_ensure("shell", "pm", "path", pkg, timeout=15)
+        return "package:" in (r.stdout or "")
+    except Exception:
+        return True
+
+
 def _launch_failed(pkg, front):
     """Why a launch left another app in front: the package isn't
     installed (a wrong name: `burner apps` finds the right one; the old
     advice was BACK and another try, which can't help), else the app
     that kept the front. One adb call, only here."""
-    try:
-        r = adb_or_ensure("shell", "pm", "path", pkg, timeout=15)
-        installed = "package:" in (r.stdout or "")
-    except Exception:
-        installed = True  # unknown: the usual advice
-    if not installed:
+    if not app_installed(pkg):
         word = pkg.rsplit(".", 1)[-1]
         return ("{} isn't installed on the phone. `burner apps {}` lists the packages "
                 "with that word; `burner recipe play-install` installs one.".format(pkg, word))
@@ -3520,14 +3531,18 @@ def launch_read(quiet, expect=None):
     want is drawn) and reads it, re-reading a thin screen once. With
     `expect` (the package launched), a read that still shows another
     app is repeated while the window is coming up, LAUNCH_REREADS times
-    at most (a start from the home screen read the launcher 0.8s in and
-    said the app didn't come to the front, Oct 5). Returns the package
-    in front, or None when it isn't known."""
+    (a start from the home screen read the launcher 0.8s in and said the
+    app didn't come to the front, Oct 5), and then, for an app that is
+    installed, until LAUNCH_SLOW_S have passed (a heavy app's cold start
+    takes longer than those reads: a person waits for it). Returns the
+    package in front, or None when it isn't known."""
     if quiet:
         read_after(quiet=True, idle_ms=IDLE_LAUNCH_MS)
         return None
     time.sleep(0.3)  # the launch's first window is still coming
-    for attempt in range(LAUNCH_REREADS + 1):
+    t0 = time.monotonic()
+    attempt, installed = 0, None
+    while True:
         status, root, note = act_and_read({}, idle_ms=IDLE_LAUNCH_MS, rereads=1)
         if status == "unsent":
             root, note = read_after_root(idle_ms=IDLE_LAUNCH_MS, rereads=1)
@@ -3538,7 +3553,7 @@ def launch_read(quiet, expect=None):
                 status), file=sys.stderr)
             return None
         front = dump_package(root)
-        if not expect or front == expect or attempt == LAUNCH_REREADS:
+        if not expect or front == expect:
             break
         if front and any(k in front for k in PROMPT_PKGS):
             # the app is up and asks the user something (a permission on
@@ -3547,6 +3562,14 @@ def launch_read(quiet, expect=None):
             # the front", whose advice was BACK: that answers the prompt
             front = expect
             break
+        attempt += 1
+        if attempt > LAUNCH_REREADS:
+            # the quick reads are spent: an app that is installed is still
+            # starting (one that isn't gets its verdict now)
+            if installed is None:
+                installed = app_installed(expect)
+            if not installed or time.monotonic() - t0 >= LAUNCH_SLOW_S:
+                break
         _trace("{} in front, not {} yet; reading again".format(front, expect))
         time.sleep(0.4)
     print_screen(root, note=note)
@@ -4774,7 +4797,7 @@ def cmd_open(args):
         # Chrome was just launched with the link: the page is asked at
         # once, and its read is the screen (the launch read paid 2s and
         # showed the screen reader's lagging tree first, Oct 5)
-        root = _page_after_launch()
+        root = _page_after_launch(args.url)
         if root is not None:
             print_screen(root)
             return 0
@@ -4782,13 +4805,14 @@ def cmd_open(args):
     return 0
 
 
-def _page_after_launch():
+def _page_after_launch(url=None):
     """The page, asked straight after Chrome was launched with a link
     (the helper contacts it without a native read first; see the
-    helper's `dump page`), parsed, or None when it can't be reached or
-    an older helper read something else: the launch read stands in."""
+    helper's `dump page`, told the link so it finds the link's tab
+    wherever Chrome lists it), parsed, or None when it can't be reached
+    or an older helper read something else: the launch read stands in."""
     try:
-        xml = u2sock("dump", "page", timeout=40)
+        xml = u2sock("dump", "page" + (" " + url if url else ""), timeout=40)
         if not xml or "<node" not in xml:
             return None
         root = ET.fromstring(xml)
