@@ -4068,7 +4068,8 @@ class WebPathTests(OfflineTestCase):
             return {"moved": 1200, "screen": WEB_SCREEN}
         fake = types.SimpleNamespace(
             is_chrome=real.is_chrome, page_xml=real.page_xml, NotSent=real.NotSent,
-            front_page=lambda dev, current=None: "page", visible=lambda page: True,
+            front_page=lambda dev, current=None: "page", visible=lambda page, timeout=1.5: True,
+            QUICK_PROBE_S=0.7,
             read=lambda page, cap=160: calls.append(("read",)) or WEB_SCREEN,
             tap=tap, scroll=scroll)
         mod._CDP = fake
@@ -4209,7 +4210,7 @@ class WebPathTests(OfflineTestCase):
         EmptyScreenTests.no_sleep(self, mod)
         calls = []
         fake = self._fake_cdp(mod, calls)
-        fake.visible = lambda page: False  # the page in hand is hidden now
+        fake.visible = lambda page, timeout=1.5: False  # the page in hand is hidden now
         fake.front_page = lambda dev, current=None: self.fail("no tab scan with another app in front")
 
         class Gone:

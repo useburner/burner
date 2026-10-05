@@ -342,14 +342,18 @@ PROBE_S = 1.5    # a visibility question to a page: a background tab answers onl
 SCAN_TABS = 3    # tabs looked at for the visible page (Chrome lists the current one first)
 
 
-def visible(page):
+QUICK_PROBE_S = 0.7  # the page in hand asked whether it is still on screen: a visible
+                     # page answers in a round trip, a hidden one only on the timeout
+
+
+def visible(page, timeout=PROBE_S):
     """True while `page` is the one on screen: a probe said so within
-    VISIBLE_FOR_S, or it says so now (PROBE_S at most: a background tab
-    is frozen and answers only on the timeout)."""
+    VISIBLE_FOR_S, or it says so now (`timeout` at most: a background
+    tab is frozen and answers only on the timeout)."""
     if time.monotonic() - page.visible_at < VISIBLE_FOR_S:
         return True
     try:
-        if page.eval("document.visibilityState", timeout=PROBE_S) == "visible":
+        if page.eval("document.visibilityState", timeout=timeout) == "visible":
             page.visible_at = time.monotonic()
             return True
     except Exception:

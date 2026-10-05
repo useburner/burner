@@ -740,7 +740,7 @@ class U2Daemon:
         if _time.monotonic() < getattr(self, "_web_retry_at", 0.0):
             return None  # out of reach a moment ago: the screen reader, for now
         current = getattr(self, "_web", None)
-        if current is not None and not _cdp().visible(current):
+        if current is not None and not _cdp().visible(current, _cdp().QUICK_PROBE_S):
             # The page in hand left the front. Chrome may have too: one
             # look at the screen, and another app in front means the
             # screen reader's path at once, with no scan of Chrome's tabs
