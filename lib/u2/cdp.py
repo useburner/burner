@@ -338,36 +338,46 @@ def pages(dev):
     return [t for t in http_get(dev, "/json") if t.get("type") == "page"]
 
 
+PROBE_S = 1.5    # a visibility question to a page: a background tab answers only on the timeout
+SCAN_TABS = 3    # tabs looked at for the visible page (Chrome lists the current one first)
+
+
+def visible(page):
+    """True while `page` is the one on screen: a probe said so within
+    VISIBLE_FOR_S, or it says so now (PROBE_S at most: a background tab
+    is frozen and answers only on the timeout)."""
+    if time.monotonic() - page.visible_at < VISIBLE_FOR_S:
+        return True
+    try:
+        if page.eval("document.visibilityState", timeout=PROBE_S) == "visible":
+            page.visible_at = time.monotonic()
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def front_page(dev, current=None):
     """The page the user sees: `current` while it is still the visible
-    one, else the visible page among Chrome's tabs (a fresh session for
-    it). Raises RuntimeError when no page is visible (Chrome isn't in
-    front, or shows a native screen)."""
+    one, else the visible page among Chrome's first SCAN_TABS tabs (a
+    fresh session for it; Chrome lists the current tab first, and a
+    phone had 107). Raises RuntimeError when none of them is visible
+    (Chrome isn't in front, or shows a native screen)."""
     if current is not None:
-        if time.monotonic() - current.visible_at < VISIBLE_FOR_S:
-            return current  # a probe said so lately: no round trip
-        try:
-            if current.eval("document.visibilityState", timeout=3.0) == "visible":
-                current.visible_at = time.monotonic()
-                return current
-        except Exception:
-            pass
+        if visible(current):
+            return current
         current.close()
-    for t in pages(dev):
+    for t in pages(dev)[:SCAN_TABS]:
         if not t.get("id"):
             continue
         try:
             p = Page(dev, t["id"])
         except Exception:
             continue
-        try:
-            if p.eval("document.visibilityState", timeout=3.0) == "visible":
-                p.visible_at = time.monotonic()
-                return p
-        except Exception:
-            pass
+        if visible(p):
+            return p
         p.close()
-    raise RuntimeError("no visible page in Chrome")
+    raise RuntimeError("no visible page in Chrome's first %d tabs" % SCAN_TABS)
 
 
 # ----------------------------------------------------------- page scripts
@@ -493,9 +503,9 @@ FIND_JS = r"""
     s.dispatchEvent(new Event('change', {bubbles: true}));
     return {found: true, count: 1, used: used, label: squash(el.text).slice(0, 60), chose: true, url: location.href};
   }
-  if (!query && el.tagName === 'INPUT' && /^(date|time|month|week|datetime-local|color)$/.test(el.type)) {
+  if (!query && el.tagName === 'INPUT' && /^(date|time|month|week|datetime-local|color|range)$/.test(el.type)) {
     // focused, not touched (a touch opens Chrome's native picker, which a
-    // page read can't see): `type` sets its value
+    // page read can't see; a touch on a slider moves it): `type` sets its value
     if (!inView(r)) el.scrollIntoView({block: 'center', inline: 'nearest'});
     el.focus();
     return {found: true, count: 1, used: used, label: (names(el)[0] || '').slice(0, 60), focused: true, url: location.href};
@@ -775,14 +785,14 @@ SELECT_JS = r"""
   const el = document.activeElement;
   if (!el || el === document.body) return {ok: false};
   const type = (el.type || '').toLowerCase();
-  if (/^(date|time|month|week|datetime-local|color|range|number)$/.test(type)) {
+  if (/^(date|time|month|week|datetime-local|color|range)$/.test(type)) {
     // these take no typed text: the value is set (2026-10-05, 14:30,
-    // #ff0000, 50), the page told, and the field left so the text that
-    // follows lands nowhere
+    // #ff0000, 50) and the page told. The field keeps the focus: the
+    // text that follows goes to it, and it has nowhere to put it (left,
+    // the text went into the last text field instead).
     el.value = text;
     el.dispatchEvent(new Event('input', {bubbles: true}));
     el.dispatchEvent(new Event('change', {bubbles: true}));
-    el.blur();
     return {ok: true, direct: true, value: el.value, type: type};
   }
   try {

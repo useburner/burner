@@ -2609,7 +2609,15 @@ def cmd_type(args):
 def focus_field(label):
     """Tap the field with this label: "done", "missing", or "unsure" when
     the UI helper was asked and didn't answer (it may have tapped, so
-    there is no second tap)."""
+    there is no second tap). The helper's tap by label first: on a page
+    it finds the field by its label and focuses a date, color or slider
+    field without touching it (a touch on the label opened Chrome's
+    picker, and the text went elsewhere)."""
+    status, _root, _note = act_and_read({"tap_label": label})
+    if status == "ok":
+        return "done"
+    if status == "lost" or status.startswith("failed"):
+        return "unsure"
     r = u2sock("click_text", label, timeout=20)
     if r == U2_NOT_FOUND:
         return "missing"

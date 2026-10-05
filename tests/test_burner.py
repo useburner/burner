@@ -2621,8 +2621,23 @@ class TypingSafetyTests(OfflineTestCase):
         tc.assert_not_called()
 
     def test_missing_field(self):
-        self.allow("u2sock", return_value=pc.U2_NOT_FOUND)
+        def u2(cmd, arg="", timeout=30):
+            if cmd == "act":
+                pc._u2_status = "err act not sent: not on the page"
+                return None
+            return pc.U2_NOT_FOUND
+        self.allow("u2sock", side_effect=u2)
         self.assertEqual(pc.focus_field("Search"), "missing")
+
+    def test_field_focused_by_the_helper_through_its_label(self):
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append((cmd, json.loads(arg)))
+            return SAMPLE_XML
+        self.allow("u2sock", side_effect=u2)
+        self.assertEqual(pc.focus_field("Date picker"), "done")
+        self.assertEqual(calls, [("act", {"tap_label": "Date picker", "idle": 1200})])
 
     def test_type_keys_resumes_with_adb_after_scrcpy_stops(self):
         adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(
@@ -4053,7 +4068,7 @@ class WebPathTests(OfflineTestCase):
             return {"moved": 1200, "screen": WEB_SCREEN}
         fake = types.SimpleNamespace(
             is_chrome=real.is_chrome, page_xml=real.page_xml, NotSent=real.NotSent,
-            front_page=lambda dev, current=None: "page",
+            front_page=lambda dev, current=None: "page", visible=lambda page: True,
             read=lambda page, cap=160: calls.append(("read",)) or WEB_SCREEN,
             tap=tap, scroll=scroll)
         mod._CDP = fake
@@ -4188,6 +4203,27 @@ class WebPathTests(OfflineTestCase):
         # a timeout is the usual miss
         with self.assertRaises(mod.U2NotFound):
             dm.cmd_wait_for(json.dumps({"text": "Top Stories", "timeout": 0.3}))
+
+    def test_helper_looks_at_the_screen_when_the_page_left_the_front(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = self._fake_cdp(mod, calls)
+        fake.visible = lambda page: False  # the page in hand is hidden now
+        fake.front_page = lambda dev, current=None: self.fail("no tab scan with another app in front")
+
+        class Gone:
+            def close(self):
+                calls.append(("close",))
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm._web = Gone()
+        dm.d = _FakeServer([SAMPLE_XML])  # com.example is in front now
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        self.assertIsNone(dm._page())
+        self.assertEqual(calls, [("close",)])
+        self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])
+        self.assertEqual(dm._last_xml, SAMPLE_XML)  # and that look is the newest read
+        self.assertIsNone(dm._web)
 
     def test_helper_opens_a_link_in_the_page(self):
         mod = _u2mux()

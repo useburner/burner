@@ -739,10 +739,28 @@ class U2Daemon:
             return None
         if _time.monotonic() < getattr(self, "_web_retry_at", 0.0):
             return None  # out of reach a moment ago: the screen reader, for now
+        current = getattr(self, "_web", None)
+        if current is not None and not _cdp().visible(current):
+            # The page in hand left the front. Chrome may have too: one
+            # look at the screen, and another app in front means the
+            # screen reader's path at once, with no scan of Chrome's tabs
+            # (a background tab answers a script only on its timeout).
+            current.close()
+            self._web = current = None
+            try:
+                with self._lock:
+                    with _t("dump rpc (front check)"):
+                        xml = read_screen(self.d)
+            except Exception:
+                xml = ""
+            if has_words(xml):
+                self._remember(xml)
+                self._front_cache = (xml, screen_of(xml))
+                if not _cdp().is_chrome((self._front_cache[1] or (0, 0, ""))[2]):
+                    return None
         try:
             with _t("web page"):
-                self._web = _cdp().front_page(getattr(self.d, "_dev", None),
-                                              getattr(self, "_web", None))
+                self._web = _cdp().front_page(getattr(self.d, "_dev", None), current)
         except Exception as e:
             self._web = None
             self._web_retry_at = _time.monotonic() + WEB_RETRY_S
