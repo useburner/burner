@@ -644,7 +644,7 @@ FIND_JS = r"""
 # takes it); else the field with the label (the page that opened has its
 # own box); else the one field in view (a person types into the only box).
 TARGET_JS = r"""
-(function(label){
+(function(label, waitMs){
   const squash = s => (s || '').replace(/\s+/g, ' ').trim();
   const FIELDS = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=image]):not([type=file]):not([type=checkbox]):not([type=radio]),textarea,[contenteditable=true],[role=textbox],[role=searchbox],[role=combobox]';
   const vh = innerHeight, vw = innerWidth;
@@ -656,15 +656,25 @@ TARGET_JS = r"""
     return squash(t); } catch (e) { return ''; } };
   const names = el => [el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('title'), labelOf(el), el.name]
     .map(squash).filter(Boolean).map(s => s.toLowerCase());
-  const a = document.activeElement;
-  if (a && a !== document.body && a.matches(FIELDS)) { window.__burnerTarget = a; return {ok: true, how: 'focus', label: names(a)[0] || ''}; }
-  const fields = Array.from(document.querySelectorAll(FIELDS)).filter(inView);
-  const want = squash(label).toLowerCase();
-  const named = fields.filter(el => names(el).some(n => n === want || n.includes(want)));
-  const pick = named.length === 1 ? named[0] : (!named.length && fields.length === 1 ? fields[0] : null);
-  if (!pick) return {ok: false, fields: fields.length, named: named.length};
-  window.__burnerTarget = pick;
-  return {ok: true, how: named.length === 1 ? 'label' : 'only', label: names(pick)[0] || ''};
+  const look = () => {
+    const a = document.activeElement;
+    if (a && a !== document.body && a.matches(FIELDS)) { window.__burnerTarget = a; return {ok: true, how: 'focus', label: names(a)[0] || ''}; }
+    const fields = Array.from(document.querySelectorAll(FIELDS)).filter(inView);
+    const want = squash(label).toLowerCase();
+    const named = fields.filter(el => names(el).some(n => n === want || n.includes(want)));
+    const pick = named.length === 1 ? named[0] : (!named.length && fields.length === 1 ? fields[0] : null);
+    if (!pick) return {ok: false, fields: fields.length, named: named.length};
+    window.__burnerTarget = pick;
+    return {ok: true, how: named.length === 1 ? 'label' : 'only', label: names(pick)[0] || ''};
+  };
+  // the field may still be coming (a search overlay's box is drawn by a
+  // script loaded on the tap): looked for every 50ms, waitMs at most, on
+  // the page rather than in a round trip of its own
+  return new Promise(resolve => {
+    const t0 = performance.now();
+    const tick = () => { const r = look(); if (r.ok || performance.now() - t0 >= (waitMs || 0)) resolve(r); else setTimeout(tick, 50); };
+    tick();
+  });
 })"""
 
 # The place of the element FIND kept, against the visual viewport (what
@@ -907,10 +917,13 @@ def after_touch(page, url=None, idle_ms=1200, listen_s=0.15):
     return {"ready": "complete"}
 
 
+TARGET_WAIT_MS = 700  # the field that a touch opens is waited for this long, on the page
+
+
 def _target_fill(page, label, text):
     """After a touch on what opens a field: the field (TARGET_JS) and
     its fill (FILL_JS), one round trip: (target, filled)."""
-    res = page.call_many([_evaluate(_js(TARGET_JS, label)), _evaluate(_js(FILL_JS, text))],
+    res = page.call_many([_evaluate(_js(TARGET_JS, label, TARGET_WAIT_MS)), _evaluate(_js(FILL_JS, text))],
                          raise_errors=False)
     out = []
     for r in res:
