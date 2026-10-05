@@ -4821,7 +4821,7 @@ def cmd_open(args):
                   .format(status[len("failed "):][:100] if status.startswith("failed ")
                           else status), file=sys.stderr)
             return 1
-        if not args.package:
+        if not args.package or args.package in WEB_APPS:
             # Chrome isn't in front: brought up on the tab it was left on
             # (as a tap on its icon does), and that tab loads the link,
             # through the page. No tab added: a link launched by intent
@@ -4830,11 +4830,12 @@ def cmd_open(args):
             # for no Chrome, or no page reachable once it is up.
             # (the scrcpy helper starts it in milliseconds, as `start`
             # does; adb's launch, which polls for it, when the helper is away)
+            chrome = args.package or CHROME_PKG  # (the assistant names Chrome on the command line)
             try:
-                started = scrcpy_send("startapp " + CHROME_PKG)
+                started = scrcpy_send("startapp " + chrome)
             except Exception:
                 started = False
-            if started or launch_and_check(CHROME_PKG) == CHROME_PKG:
+            if started or launch_and_check(chrome) == chrome:
                 u2_invalidate()
                 status, root, note = act_and_read({"open": args.url, "launched": True},
                                                   idle_ms=IDLE_LAUNCH_MS, rereads=1)

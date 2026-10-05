@@ -7459,6 +7459,13 @@ class AirbnbRoundTests(OfflineTestCase):
         self.assertNotIn(("dump", "page https://www.airbnb.com/s/homes"), calls)  # no intent, no launch read
         self.assertIn("opened https://www.airbnb.com/s/homes", out.getvalue())
         self.assertIn("screen: com.android.chrome", out.getvalue())
+        # the same with Chrome named on the command line, as the guide has it
+        calls.clear()
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_open(self.parse(["open", "https://www.airbnb.com/s/homes", "com.android.chrome"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual([c[1].get("launched") for c in calls if c[0] == "act"], [None, True])
+        self.assertNotIn(("dump", "page https://www.airbnb.com/s/homes"), calls)
 
     def test_the_helper_opens_a_link_after_a_launch_the_launch_way(self):
         mod = _u2mux()
