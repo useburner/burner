@@ -3105,7 +3105,8 @@ def cmd_doctor(args):
             "screen; run ./tunnel.sh start; ensure Tailscale is connected on the phone"))
     checks.append(_doctor_check(
         "u2 daemon", check_u2_daemon,
-        fix="Run `burner ensure` to restart the u2 daemon (~5s)"))
+        fix="Run `burner ensure` to restart the u2 daemon (5s; about 15s when "
+            "the on-phone server has to be replaced)"))
     checks.append(_doctor_check(
         "device state", check_device_state,
         fix="If 'unauthorized', re-run pairing (fresh code from phone). "

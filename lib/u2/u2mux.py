@@ -382,18 +382,23 @@ def apply_fast_config(d):
 
 def ensure_server(force=False):
     """The on-device uiautomator2 server, listening and able to read the
-    screen; restarted (killed on the phone, started fresh) when it can't.
-    force: replace the running server without checking it (its reads
-    held no words). A fresh server is taken once it reads a real screen,
-    words or not: a fresh one that reads no words is the spell rule's
-    job (see _fix_wordless_read). Returns the connected device."""
+    screen; restarted (killed on the phone, started fresh) when it
+    can't. The server a helper finds must read words (the one found at
+    15:35 and at 18:41 on Oct 4 read none, for hours). A fresh server is
+    taken as soon as it reads a real screen, words or not: a fresh one
+    that reads no words is the spell rule's job (see _fix_wordless_read),
+    mid-session, where relaunches read every label. Two tries, the
+    second for a launch that failed, each after a pause and with the
+    screen woken right before the launch. force (the spell rule): replace
+    the running server without checking it. Returns the connected
+    device."""
     import adbutils
     import uiautomator2 as u2
+    first = "it reads empty or wordless screens"
     if force:
         first = "its reads held no words"
-        log("replacing the server: %s" % first)
+        log("replacing the server: its reads held no words")
     else:
-        first = "it reads empty or wordless screens"
         try:
             d = u2.connect(TARGET)  # starts a dead server (and pushes a new jar)
             apply_fast_config(d)
@@ -404,10 +409,13 @@ def ensure_server(force=False):
             first = err_text(e)
             log("server not responding (%s); restarting it" % first)
     why = "no read"
-    for attempt in (1, 2):
+    for attempt, settle in ((1, 1.0), (2, 2.0)):
         try:
-            killed = kill_server_on_phone(adbutils.adb.device(TARGET))
+            dev = adbutils.adb.device(TARGET)
+            killed = kill_server_on_phone(dev)
             _KEEPALIVE.close()
+            _time.sleep(settle)
+            wake_phone(dev)  # right before the launch: the screen turns off after 10s
             d = u2.connect(TARGET)  # /ping fails now, so this launches one
             apply_fast_config(d)
             if server_works(d):
@@ -418,9 +426,17 @@ def ensure_server(force=False):
         except Exception as e:
             why = err_text(e)
         log("restart %d: %s" % (attempt, why))
-        _time.sleep(1.0)
     raise RuntimeError("the phone's UI server couldn't be restarted: %s (at first: %s)"
                        % (why, first))
+
+
+def wake_phone(dev):
+    """Turn the screen on over adb before a server starts (no server to
+    ask yet). KEYCODE_WAKEUP does nothing to a screen that is on."""
+    try:
+        dev.shell("input keyevent 224", timeout=SHELL_TIMEOUT)
+    except Exception as e:
+        log("wake over adb failed (%s)" % err_text(e, 80))
 
 
 RESTART_COOLDOWN_S = 20.0  # at most one server restart per this
