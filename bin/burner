@@ -1355,7 +1355,16 @@ def looks_half_drawn(rows, prev_rows):
     return prev_rows is not None and prev_rows >= 12 and rows <= 2
 
 
-def settled_read(prev_root=None, idle_ms=2000, delay=0.45, rereads=2,
+# How long the phone may wait for the screen to go quiet (half a second
+# with no changes) before a read. A quiet app returns in that half second;
+# a web page with ads never goes quiet and pays the whole cap, so the caps
+# are short and a thin or unchanged read is read again (Oct 4: espn.com
+# paid 2.5s on every page open and 2s after every tap).
+IDLE_ACT_MS = 1200      # the read after a tap, a key or typed text
+IDLE_LAUNCH_MS = 1000   # the read after a launch or a link
+
+
+def settled_read(prev_root=None, idle_ms=IDLE_ACT_MS, delay=0.45, rereads=2,
                  first_root=None):
     """The screen once an action has landed: a short pause (the action's
     first events haven't reached the UI yet), then a wait on the phone
@@ -1426,7 +1435,7 @@ def key_code(name):
     return KEY_CODES.get(n)
 
 
-def act_and_read(action, prev_root=None, idle_ms=2000, rereads=2):
+def act_and_read(action, prev_root=None, idle_ms=IDLE_ACT_MS, rereads=2):
     """An action and its settled read in one round trip to the phone: the
     UI helper sends the action (a tap, a key, or text into the focused
     field; or none, after a launch), a wait for the UI to react, a wait
@@ -1481,7 +1490,7 @@ def print_act(status, root, note, what):
     return 1
 
 
-def read_after_root(prev_root=None, idle_ms=2000, rereads=2):
+def read_after_root(prev_root=None, idle_ms=IDLE_ACT_MS, rereads=2):
     """settled_read for a caller that prints the screen itself: (root,
     note), or (None, "") with a line on stderr when the screen can't be
     read. One round trip through the UI helper when it can. Never raises."""
@@ -1498,7 +1507,7 @@ def read_after_root(prev_root=None, idle_ms=2000, rereads=2):
         return None, ""
 
 
-def settle_only(idle_ms=2000, delay=0.45):
+def settle_only(idle_ms=IDLE_ACT_MS, delay=0.45):
     """Wait for the action to land and the UI to go quiet, without a
     read: a chained step (`burner do`) that follows must not read the
     screen mid-transition. Never raises."""
@@ -1509,7 +1518,7 @@ def settle_only(idle_ms=2000, delay=0.45):
         pass
 
 
-def read_after(quiet=False, idle_ms=2000, prev_root=None, rereads=2):
+def read_after(quiet=False, idle_ms=IDLE_ACT_MS, prev_root=None, rereads=2):
     """After an action: wait for the screen to settle, read it once and
     print it, so the assistant needn't follow the action with a read.
     With quiet, only the wait. Never fails the action: a screen that can't
@@ -2806,16 +2815,17 @@ def cmd_start(args):
 
 def launch_read(quiet):
     """The screen after a launch or a link: one round trip that waits for
-    the new window, lets it go quiet (2.5s at most: a splash that keeps
-    animating never does) and reads it, re-reading a thin screen once.
+    the new window, lets it go quiet (IDLE_LAUNCH_MS at most: a web page
+    with ads never does, and a person reads it as soon as the part they
+    want is drawn) and reads it, re-reading a thin screen once.
     Returns the package in front, or None when it isn't known."""
     if quiet:
-        read_after(quiet=True, idle_ms=2500)
+        read_after(quiet=True, idle_ms=IDLE_LAUNCH_MS)
         return None
     time.sleep(0.3)  # the launch's first window is still coming
-    status, root, note = act_and_read({}, idle_ms=2500, rereads=1)
+    status, root, note = act_and_read({}, idle_ms=IDLE_LAUNCH_MS, rereads=1)
     if status == "unsent":
-        root, note = read_after_root(idle_ms=2500, rereads=1)
+        root, note = read_after_root(idle_ms=IDLE_LAUNCH_MS, rereads=1)
         if root is None:
             return None
     elif status != "ok":

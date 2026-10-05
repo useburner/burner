@@ -2377,7 +2377,7 @@ class ScreenRowsTests(OfflineTestCase):
         dump = self.allow("ui_dump")
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             pc.read_after()
-        self.assertEqual(calls, [("act", '{"idle": 2000}')])
+        self.assertEqual(calls, [("act", '{"idle": 1200}')])
         dump.assert_not_called()
         self.assertIn("screen: com.example", out.getvalue())
 
@@ -3184,7 +3184,7 @@ class LaunchReadBudgetTests(OfflineTestCase):
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_open(self.parse(["open", "https://example.com"]))
         self.assertEqual(rc, 0)
-        self.assertEqual(calls[0], ("act", '{"idle": 2500}'))
+        self.assertEqual(calls[0], ("act", '{"idle": 1000}'))
         self.assertEqual(dump.call_count, 1)  # one re-read of a thin screen
         self.assertIn("(may still be loading)", out.getvalue())
 
@@ -3216,7 +3216,7 @@ class OneRoundTripTests(OfflineTestCase):
         self.allow("u2sock", side_effect=u2)
         status, root, note = pc.act_and_read({"tap": [10, 20]})
         self.assertEqual(status, "ok")
-        self.assertEqual(calls, [("act", {"tap": [10, 20], "idle": 2000})])
+        self.assertEqual(calls, [("act", {"tap": [10, 20], "idle": 1200})])
         self.assertEqual(pc.dump_package(root), "com.example")
 
     def test_act_and_read_statuses(self):
@@ -3316,7 +3316,7 @@ class OneRoundTripTests(OfflineTestCase):
         with self.cap() as (out, err):
             rc = pc.cmd_press(self.parse(["press", "BACK"]))
         self.assertEqual(rc, 0)
-        self.assertEqual(calls, [("act", {"key": 4, "idle": 2000})])
+        self.assertEqual(calls, [("act", {"key": 4, "idle": 1200})])
         sc.assert_not_called()
         self.assertIn("pressed BACK", out.getvalue())
         self.assertIn("screen: com.example", out.getvalue())
@@ -3346,7 +3346,7 @@ class OneRoundTripTests(OfflineTestCase):
         with self.cap() as (out, err):
             rc = pc.cmd_type(args)
         self.assertEqual(rc, 0)
-        self.assertEqual(calls, [("act", {"set_text": "hello", "idle": 2000})])
+        self.assertEqual(calls, [("act", {"set_text": "hello", "idle": 1200})])
         self.assertIn("typed 5 chars", out.getvalue())
         self.assertIn("screen: com.example", out.getvalue())
 
@@ -3382,7 +3382,7 @@ class OneRoundTripTests(OfflineTestCase):
         with self.cap() as (out, err):
             rc = pc.cmd_open(self.parse(["open", "https://example.com"]))
         self.assertEqual(rc, 0)
-        self.assertEqual(calls, [("act", {"idle": 2500})])
+        self.assertEqual(calls, [("act", {"idle": 1000})])
         self.assertIn("screen: com.example", out.getvalue())
 
     def test_helper_batch_results_and_act_calls(self):
@@ -3424,7 +3424,7 @@ class LabelTapTests(OfflineTestCase):
         with self.cap() as (out, err):
             rc = pc.cmd_tap(self.parse(["tap", "OK"]))
         self.assertEqual(rc, 0)
-        self.assertEqual(calls, [("act", {"tap_label": "OK", "idle": 2000})])
+        self.assertEqual(calls, [("act", {"tap_label": "OK", "idle": 1200})])
         dump.assert_not_called()
         tc.assert_not_called()
         self.assertIn("tapped OK (label)", out.getvalue())
