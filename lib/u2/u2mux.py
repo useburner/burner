@@ -1374,8 +1374,16 @@ class U2Daemon:
                 log("reconnect failed:", e)
                 return False
 
+    CACHED_READ_S = 10.0  # "dump cached": the newest read, while this young
+
     def cmd_dump(self, arg):
-        # "dump fresh" bypasses the cache.
+        # "dump fresh" bypasses the cache; "dump cached" is the newest read
+        # with words, CACHED_READ_S old at most, and nothing otherwise: no
+        # round trip to the phone (a chain looks between its steps for a
+        # question the phone asks).
+        if arg.strip() == "cached":
+            young = _time.monotonic() - self._last_xml_t < self.CACHED_READ_S
+            return self._last_xml.encode() if young and has_words(self._last_xml) else b""
         return self._dump(fresh=(arg.strip() == "fresh")).encode()
 
     def cmd_invalidate(self, _):

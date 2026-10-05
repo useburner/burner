@@ -1404,9 +1404,93 @@ def screen_lines(nodes, w, h):
 SCREEN_CAP = 80
 
 
+# ------------------------------------------------- the phone asks the user
+
+PROMPT_PKGS = ("permissioncontroller", "packageinstaller")  # packages that only ever ask
+SYSTEM_DIALOG_PKGS = ("android", "com.android.settings", "com.google.android.gms",
+                      "com.android.systemui", "com.android.phone")
+PROMPT_TITLES = ("open with", "choose an app", "complete action using", "share with")
+DECISION_WORDS = ("ok", "allow", "deny", "don't allow", "no thanks", "turn on", "yes", "no",
+                  "cancel", "continue", "always", "just once", "install", "uninstall", "agree")
+
+
+def system_prompt(nodes, w, h):
+    """The question the phone is asking the user, when a system dialog is
+    up: {"text", "options", "package"} or None. A permission prompt
+    ("Allow Vinted to access this device's location?": Precise,
+    Approximate, While using the app, Only this time, Don't allow), an
+    install or uninstall confirmation, an "Open with" chooser, a "Turn
+    on …?" dialog. It is the user's to answer, so it is named on every
+    printed screen. A system app's whole screen (Settings, the
+    permission manager) is no dialog; an app's own dialogs are the app's
+    rows, which the assistant reads. Pure."""
+    by_pkg = {}
+    for i, n in enumerate(nodes):
+        pkg = n.get("package") or ""
+        if pkg and not is_ime_package(pkg):
+            by_pkg.setdefault(pkg, []).append((i, n))
+    for pkg, group in by_pkg.items():
+        always = any(k in pkg for k in PROMPT_PKGS)
+        if not always and pkg not in SYSTEM_DIALOG_PKGS:
+            continue
+        # the dialog's content: its words and its buttons (not the
+        # window's own full-screen scrim); a dialog takes part of the screen
+        rects = []
+        for _i, n in group:
+            r = _bounds_rect(n.get("bounds"))
+            if r and (_row_words(n) or (n.get("clickable") and r[3] - r[1] < 0.5 * h)):
+                rects.append(r)
+        if not rects:
+            continue
+        top, bottom = min(r[1] for r in rects), max(r[3] for r in rects)
+        if bottom - top >= 0.8 * h:
+            continue
+        texts = [_row_words(n) for _i, n in group if _row_words(n) and not n.get("clickable")]
+        questions = [t for t in texts if "?" in t]
+        message = max(questions or texts, key=len) if (questions or texts) else ""
+        options = []
+        for i, n in group:
+            if not (n.get("clickable") or n.get("checkable")) or _has_labelled_child(n, nodes, i):
+                continue
+            words = _row_words(n)
+            if words and words != message and words not in options and len(words) <= 40:
+                options.append(words)
+        if not message or not options:
+            continue
+        decided = any(o.lower() in DECISION_WORDS for o in options)
+        titled = any(message.lower().startswith(t) for t in PROMPT_TITLES)
+        if not (always or questions or decided or titled):
+            continue
+        return {"text": message, "options": options[:8], "package": pkg}
+    return None
+
+
+def asked_line(asked):
+    """The `asked:` line of a printed screen: the question, its options,
+    and that the user decides."""
+    return 'asked: {} | options: {} | the user decides: ask, then burner tap "their choice"'.format(
+        asked["text"], " / ".join(asked["options"]))
+
+
+def _asked_now():
+    """The system question on the helper's newest read of the screen (no
+    round trip to the phone: a chain looks between its steps), or None:
+    none asked, or no young read to look at."""
+    try:
+        xml = u2sock("dump", "cached", timeout=5)
+        if not xml or "<node" not in xml:
+            return None
+        root = ET.fromstring(xml)
+        _update_screen_from_dump(root)
+        return system_prompt(walk(root), *screen_dims())
+    except Exception:
+        return None
+
+
 def print_screen(root, cap=SCREEN_CAP, note=""):
-    """Print the app in front and the screen's rows (see screen_lines).
-    note: a few words about the read ("(unchanged)")."""
+    """Print the app in front and the screen's rows (see screen_lines),
+    with the phone's question first when a system dialog asks one (see
+    system_prompt). note: a few words about the read ("(unchanged)")."""
     nodes = walk(root)
     lines, keyboard = screen_lines(nodes, *screen_dims())
     app = dump_package(root)
@@ -1416,6 +1500,9 @@ def print_screen(root, cap=SCREEN_CAP, note=""):
             app = "system UI (lock screen, shade or a system dialog)"
     print("screen: {}{}{}".format(app, " (keyboard open)" if keyboard else "",
                                   " " + note if note else ""))
+    asked = system_prompt(nodes, *screen_dims())
+    if asked:
+        print("  " + asked_line(asked))
     shown, hidden = lines[:cap], lines[cap:]
     # Past the cap, keep what a next step needs most: text fields and the
     # focused row (a form's input and Send sit at the bottom).
@@ -2499,11 +2586,33 @@ def _wait_forget():
 
 def _wait_hint():
     """The progress hint from the screen as it is (the helper's last poll
-    is cached, so this costs nothing on the phone)."""
+    is cached, so this costs nothing on the phone): the phone's question
+    when a system dialog asks one, else what is under way."""
     try:
-        return progress_hint(walk(ui_dump()))
+        root = ui_dump()
+        _update_screen_from_dump(root)
+        nodes = walk(root)
+        asked = system_prompt(nodes, *screen_dims())
+        if asked:
+            return "the phone asks: {} (options: {})".format(asked["text"], " / ".join(asked["options"]))
+        return progress_hint(nodes)
     except Exception as e:
         return "the screen couldn't be read ({})".format(str(e)[:60])
+
+
+def _wait_asked(args, asked):
+    """A system dialog asks the user something while the words are waited
+    for: they won't come until it is answered. The question and its
+    options as the result (stdout), exit code WAIT_STILL_RC; the
+    assistant asks the user, taps their answer, and runs the wait again."""
+    _wait_forget()
+    if as_json(args):
+        print(json.dumps({"ok": False, "asked": asked, "text": args.text}))
+    else:
+        print('the phone asks: {} | options: {}'.format(asked["text"], " / ".join(asked["options"])))
+        print('The user decides: ask them, tap their answer (burner tap "their choice"), '
+              'then run the same wait again.')
+    return WAIT_STILL_RC
 
 
 def _wait_report(args, so_far):
@@ -2628,6 +2737,9 @@ def cmd_wait(args):
                 # an older helper answers at once rather than polling its
                 # chunk: the wait is over, as before
                 return _wait_over(args, started, total, False)
+            asked = _asked_now()
+            if asked:
+                return _wait_asked(args, asked)
             if time.monotonic() < end:
                 _wait_report(args, time.time() - started)
             continue
@@ -2668,6 +2780,9 @@ def cmd_wait(args):
             rc = _wait_found(args, n["text"], n["bounds"], n["enabled"], node=n)
             _print_waited_screen(args)
             return rc
+        asked = system_prompt(nodes, *screen_dims())
+        if asked:
+            return _wait_asked(args, asked)
         if time.monotonic() >= end:
             return _wait_over(args, started, total, sliced)
         if time.monotonic() - reported >= WAIT_REPORT_S:
@@ -3048,7 +3163,11 @@ def cmd_state(args):
     app = dump_package(root) or "?"
     if as_json(args):
         texts = [n["text"] for n in nodes if n["text"]][:25]
-        print(json.dumps({"ok": True, "app": app, "texts": texts}))
+        out = {"ok": True, "app": app, "texts": texts}
+        asked = system_prompt(nodes, *screen_dims())
+        if asked:
+            out["asked"] = asked
+        print(json.dumps(out))
         return 0
     print_screen(root)
     return 0
@@ -4841,8 +4960,9 @@ def cmd_do(args):
         print("do [{}]: {}".format(i, step), flush=True)
         rc = ns.fn(ns)
         if rc == WAIT_STILL_RC:
-            # a long wait's slice ended: the flow pauses here, and goes on
-            # from this step once the assistant has told the user
+            # a long wait's slice ended, or the phone asked the user
+            # something: the flow pauses here, and goes on from this step
+            # once the assistant has told (or asked) the user
             rest = "; ".join(steps[i - 1:])
             print("do: paused at step {} (still waiting). Tell the user, then go on with: burner do {}"
                   .format(i, shlex.quote(rest)))
@@ -4850,6 +4970,15 @@ def cmd_do(args):
         if rc:
             print("do: step {} failed, stopping".format(i), file=sys.stderr)
             return rc
+        if i < len(steps):
+            asked = _asked_now()
+            if asked:
+                # a system dialog asks the user something (a permission, an
+                # install): the steps after this one wait for their answer
+                print('do: paused after step {}: the phone asks: {} | options: {}. Ask the user, tap '
+                      'their answer, then go on with: burner do {}'.format(
+                          i, asked["text"], " / ".join(asked["options"]), shlex.quote("; ".join(steps[i:]))))
+                return WAIT_STILL_RC
     return 0
 
 

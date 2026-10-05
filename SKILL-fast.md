@@ -60,6 +60,15 @@ Every step you take costs a round trip, so the fewer steps, the faster.
    Installing…, 43%`): tell the user in one line, then run the same command
    again; it continues where it was. A paused `burner do` or recipe prints the
    command to go on with. Never leave the user looking at dots for minutes.
+10. **The phone's questions are the user's to answer.** A permission prompt
+   ("Allow Vinted to access this device's location?"), an install
+   confirmation, an "Open with" chooser or a "Turn on …?" dialog prints as an
+   `asked:` line with its options (`asked: Allow Vinted to access this
+   device's location? | options: Precise / Approximate / While using the app /
+   Only this time / Don't allow`); a wait or a chain stops on it. Don't
+   choose: tell the user what the app asks for and the options as printed,
+   wait for their answer, tap it (`burner tap "Only this time"`), then go on
+   with the task (a paused chain prints the command).
 
 ## Common requests
 
@@ -67,7 +76,7 @@ Every step you take costs a round trip, so the fewer steps, the faster.
 |---|---|
 | "What's on my burner?" / "Take a screenshot of my burner" | The screen right now: `burner shot --out .` and send the image. |
 | "Use Tinder to…" (any app or service by name) | `burner apps tinder` finds its package, then `burner start <package>`: the launch prints the screen it opens on (`--fresh` for its first screen). If the app isn't installed or stops you at a sign-in wall, read the site in the phone's browser instead: `burner open "https://…" com.android.chrome` (read-only, and tell the user). |
-| "Install Snapchat" (any free app) | `PLAY_PACKAGE=com.snapchat.android burner recipe play-install` with the package (a Play Store link ends in `?id=<package>`). Name only: `APP_QUERY=Vinted burner recipe play-search`, pick the right result (`burner tap "Vinted" --index 0`), then `burner recipe play-install-current`. The recipes open the store themselves; a listing that says Open or Installed means it's already there. While the download runs the install recipe comes back every 30 seconds with what the screen shows: tell the user, then run the `burner do` line it prints. Never buy an app. |
+| "Install Snapchat" (any free app) | `PLAY_PACKAGE=com.snapchat.android burner recipe play-install` with the package (a Play Store link ends in `?id=<package>`). Name only: `APP_QUERY=Vinted burner recipe play-search`, pick the right result (`burner tap "Vinted" --index 0`), then `burner recipe play-install-current`. The recipes open the store themselves; a listing that says Open or Installed means it's already there. While the download runs the install recipe comes back every 30 seconds with what the screen shows: tell the user, then run the `burner do` line it prints. A newly installed app asks for permissions on its first start: the user decides (rule 10). Never buy an app. |
 | "Turn on Bluetooth" / a phone setting | `burner settings bluetooth` opens that page in one call (`burner settings` lists the pages: wifi, display, sound, battery, apps, location, `app <package>`...). Switch rows show `(on)` or `(off)`; tap the row to flip it. |
 | "Check my burner" / battery / "is it on?" | `burner status`. |
 | "Check my notifications" / "anything new?" | `burner notifications` prints them and changes nothing. |

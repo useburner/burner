@@ -1054,6 +1054,7 @@ class RegressionTests(OfflineTestCase):
 
     # cmd_do()
     def test_cmd_do_runs_steps(self):
+        self.allow("u2sock", return_value=None)  # the helper away: no look between steps
         args = SimpleNamespace(flow="sleep 0; sleep 0")
         with self.cap():
             rc = pc.cmd_do(args)
@@ -1071,6 +1072,7 @@ class RegressionTests(OfflineTestCase):
 
         stub = mock.Mock()
         stub.parse_args = fake_parse
+        self.allow("u2sock", return_value=None)
         with mock.patch.object(pc, "build_parser", return_value=stub):
             with self.cap():
                 rc = pc.cmd_do(SimpleNamespace(
@@ -1079,6 +1081,7 @@ class RegressionTests(OfflineTestCase):
         self.assertEqual(calls, ["step one", "fail step"])
 
     def test_cmd_do_bad_step(self):
+        self.allow("u2sock", return_value=None)
         args = SimpleNamespace(flow="sleep 0; nosuchcommand")
         with self.cap() as (out, err):
             rc = pc.cmd_do(args)
@@ -1112,6 +1115,7 @@ class RegressionTests(OfflineTestCase):
             os.makedirs(rdir)
             with open(os.path.join(rdir, "r.burner"), "w") as f:
                 f.write("sleep 0\nnosuchcmd\n")
+            self.allow("u2sock", return_value=None)
             with mock.patch.object(pc, "ROOT", d):
                 with self.cap():
                     rc = pc.cmd_recipe(SimpleNamespace(name="r"))
@@ -2589,7 +2593,10 @@ class ScreenRowsTests(OfflineTestCase):
         self.assertNotIn("screen:", out.getvalue())
 
     def test_do_reads_only_after_the_last_step(self):
+        # between its steps a chain only asks the helper for its newest
+        # read (no round trip to the phone), to see a question the phone asks
         seen = []
+        looks = self.allow("u2sock", return_value="")
 
         def fake(ns):
             seen.append(getattr(ns, "quiet", None))
@@ -2602,6 +2609,7 @@ class ScreenRowsTests(OfflineTestCase):
                 rc = pc.cmd_do(SimpleNamespace(flow="press BACK; tap X; start com.a"))
         self.assertEqual(rc, 0)
         self.assertEqual(seen, [True, True, False])
+        self.assertEqual([c[0] for c in looks.call_args_list], [("dump", "cached")] * 2)
 
     def test_log_line_masks_typed_text(self):
         line = pc.log_line(["type", "secret words", "--field", "Search"], 1234.5, 0)
@@ -6400,3 +6408,175 @@ class SlicedWaitTests(OfflineTestCase):
                       "burner do 'wait \"Uninstall || Open\" --exact --timeout 600; press BACK'", out.getvalue())
         press.assert_not_called()
         self.assertEqual(err.getvalue(), "")
+
+
+# --------------------------------- 27. the phone's questions reach the user
+
+PERMISSION_XML = """<hierarchy rotation="0">
+  <node text="" class="android.widget.FrameLayout" package="com.vinted" bounds="[0,0][1080,2400]" clickable="false" enabled="true">
+    <node text="Welcome to Vinted" class="android.widget.TextView" package="com.vinted" bounds="[100,300][900,380]" clickable="false" enabled="true"/>
+    <node text="Women" class="android.widget.TextView" package="com.vinted" bounds="[100,400][300,460]" clickable="true" enabled="true"/>
+    <node text="Men" class="android.widget.TextView" package="com.vinted" bounds="[320,400][520,460]" clickable="true" enabled="true"/>
+    <node text="Kids" class="android.widget.TextView" package="com.vinted" bounds="[540,400][740,460]" clickable="true" enabled="true"/>
+    <node text="Home" class="android.widget.TextView" package="com.vinted" bounds="[760,400][960,460]" clickable="true" enabled="true"/>
+    <node text="Search for items" class="android.widget.EditText" package="com.vinted" bounds="[100,500][980,580]" clickable="true" enabled="true"/>
+    <node text="Nike Air Max 90" class="android.widget.TextView" package="com.vinted" bounds="[100,700][500,760]" clickable="true" enabled="true"/>
+    <node text="Levi's 501" class="android.widget.TextView" package="com.vinted" bounds="[560,700][960,760]" clickable="true" enabled="true"/>
+    <node text="Inbox" class="android.widget.TextView" package="com.vinted" bounds="[400,2200][600,2260]" clickable="true" enabled="true"/>
+    <node text="Likes" class="android.widget.TextView" package="com.vinted" bounds="[100,2200][300,2260]" clickable="true" enabled="true"/>
+  </node>
+  <node text="" class="android.widget.FrameLayout" package="com.google.android.permissioncontroller" bounds="[0,0][1080,2400]" clickable="true" enabled="true">
+    <node text="" class="android.widget.LinearLayout" package="com.google.android.permissioncontroller" bounds="[60,700][1020,1900]" clickable="false" enabled="true">
+      <node text="Allow Vinted to access this device's location?" class="android.widget.TextView" package="com.google.android.permissioncontroller" bounds="[100,760][980,880]" clickable="false" enabled="true"/>
+      <node text="" content-desc="Precise" class="android.widget.ImageView" package="com.google.android.permissioncontroller" bounds="[120,950][520,1250]" clickable="true" enabled="true"/>
+      <node text="" content-desc="Approximate" class="android.widget.ImageView" package="com.google.android.permissioncontroller" bounds="[560,950][960,1250]" clickable="true" enabled="true"/>
+      <node text="While using the app" class="android.widget.Button" package="com.google.android.permissioncontroller" bounds="[100,1350][980,1480]" clickable="true" enabled="true"/>
+      <node text="Only this time" class="android.widget.Button" package="com.google.android.permissioncontroller" bounds="[100,1500][980,1630]" clickable="true" enabled="true"/>
+      <node text="Don't allow" class="android.widget.Button" package="com.google.android.permissioncontroller" bounds="[100,1650][980,1780]" clickable="true" enabled="true"/>
+    </node>
+  </node>
+</hierarchy>"""
+
+NOTIFY_XML = """<hierarchy rotation="0">
+  <node text="" class="android.widget.FrameLayout" package="com.vinted" bounds="[0,0][1080,2400]" clickable="false" enabled="true">
+    <node text="Welcome to Vinted" class="android.widget.TextView" package="com.vinted" bounds="[100,300][900,380]" clickable="false" enabled="true"/>
+  </node>
+  <node text="" class="android.widget.FrameLayout" package="com.google.android.permissioncontroller" bounds="[0,0][1080,2400]" clickable="true" enabled="true">
+    <node text="Allow Vinted to send you notifications?" class="android.widget.TextView" package="com.google.android.permissioncontroller" bounds="[100,1300][980,1400]" clickable="false" enabled="true"/>
+    <node text="Allow" class="android.widget.Button" package="com.google.android.permissioncontroller" bounds="[100,1500][980,1630]" clickable="true" enabled="true"/>
+    <node text="Don't allow" class="android.widget.Button" package="com.google.android.permissioncontroller" bounds="[100,1650][980,1780]" clickable="true" enabled="true"/>
+  </node>
+</hierarchy>"""
+
+OPEN_WITH_XML = """<hierarchy rotation="0">
+  <node text="" class="android.widget.FrameLayout" package="com.android.chrome" bounds="[0,0][1080,2400]" clickable="false" enabled="true">
+    <node text="Store" class="android.widget.TextView" package="com.android.chrome" bounds="[100,300][900,380]" clickable="false" enabled="true"/>
+  </node>
+  <node text="" class="android.widget.FrameLayout" package="android" bounds="[0,1200][1080,2400]" clickable="false" enabled="true">
+    <node text="Open with" class="android.widget.TextView" package="android" bounds="[100,1250][980,1330]" clickable="false" enabled="true"/>
+    <node text="Play Store" class="android.widget.TextView" package="android" bounds="[100,1400][500,1600]" clickable="true" enabled="true"/>
+    <node text="Aurora Store" class="android.widget.TextView" package="android" bounds="[560,1400][960,1600]" clickable="true" enabled="true"/>
+    <node text="Just once" class="android.widget.Button" package="android" bounds="[100,2000][500,2130]" clickable="true" enabled="true"/>
+    <node text="Always" class="android.widget.Button" package="android" bounds="[560,2000][960,2130]" clickable="true" enabled="true"/>
+  </node>
+</hierarchy>"""
+
+PERMISSION_MANAGER_XML = """<hierarchy rotation="0">
+  <node text="" class="android.widget.FrameLayout" package="com.google.android.permissioncontroller" bounds="[0,0][1080,2400]" clickable="false" enabled="true">
+    <node text="Permission manager" class="android.widget.TextView" package="com.google.android.permissioncontroller" bounds="[100,150][900,230]" clickable="false" enabled="true"/>
+    <node text="Location" class="android.widget.TextView" package="com.google.android.permissioncontroller" bounds="[100,400][900,500]" clickable="true" enabled="true"/>
+    <node text="Camera" class="android.widget.TextView" package="com.google.android.permissioncontroller" bounds="[100,600][900,700]" clickable="true" enabled="true"/>
+    <node text="Microphone" class="android.widget.TextView" package="com.google.android.permissioncontroller" bounds="[100,2200][900,2300]" clickable="true" enabled="true"/>
+  </node>
+</hierarchy>"""
+
+VOLUME_XML = SAMPLE_XML.replace("</hierarchy>", """  <node text="" class="android.widget.FrameLayout" package="com.android.systemui" bounds="[900,600][1080,1400]" clickable="false" enabled="true">
+    <node text="" content-desc="Media volume" class="android.widget.SeekBar" package="com.android.systemui" bounds="[920,650][1060,1300]" clickable="true" enabled="true"/>
+    <node text="" content-desc="Settings" class="android.widget.ImageButton" package="com.android.systemui" bounds="[940,1310][1040,1390]" clickable="true" enabled="true"/>
+  </node>
+</hierarchy>""")
+
+
+class PhoneAsksTests(OfflineTestCase):
+    def _nodes(self, xml):
+        root = ET.fromstring(xml)
+        pc._update_screen_from_dump(root)
+        return pc.walk(root)
+
+    def test_system_prompt(self):
+        asked = pc.system_prompt(self._nodes(PERMISSION_XML), 1080, 2400)
+        self.assertEqual(asked["text"], "Allow Vinted to access this device's location?")
+        self.assertEqual(asked["options"], ["Precise", "Approximate", "While using the app", "Only this time", "Don't allow"])
+        asked = pc.system_prompt(self._nodes(NOTIFY_XML), 1080, 2400)
+        self.assertEqual((asked["text"], asked["options"]), ("Allow Vinted to send you notifications?", ["Allow", "Don't allow"]))
+        asked = pc.system_prompt(self._nodes(OPEN_WITH_XML), 1080, 2400)
+        self.assertEqual((asked["text"], asked["options"]), ("Open with", ["Play Store", "Aurora Store", "Just once", "Always"]))
+        # a system app's whole screen is no dialog; an app's own rows are the app's
+        self.assertIsNone(pc.system_prompt(self._nodes(PERMISSION_MANAGER_XML), 1080, 2400))
+        self.assertIsNone(pc.system_prompt(self._nodes(SAMPLE_XML), 1080, 2400))
+        self.assertIsNone(pc.system_prompt(self._nodes(OVERLAY_XML), 1080, 2400))
+        # the volume panel asks nothing
+        self.assertIsNone(pc.system_prompt(self._nodes(VOLUME_XML), 1080, 2400))
+
+    def test_the_screen_names_the_question_first(self):
+        root = ET.fromstring(PERMISSION_XML)
+        pc._update_screen_from_dump(root)
+        with self.cap() as (out, err):
+            pc.print_screen(root)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(lines[0], "screen: com.vinted")
+        self.assertEqual(lines[1], "  asked: Allow Vinted to access this device's location? | options: Precise / Approximate / "
+                                   "While using the app / Only this time / Don't allow | the user decides: ask, then burner tap \"their choice\"")
+        self.assertTrue(any("Don't allow (click)" in l for l in lines[2:]))
+        # --json state carries it
+        self.allow("ui_dump", return_value=ET.fromstring(NOTIFY_XML))
+        with self.cap() as (out, err):
+            rc = pc.cmd_state(self.parse(["state", "--json"]))
+        self.assertEqual(rc, 0)
+        data = json.loads(out.getvalue())
+        self.assertEqual(data["asked"]["options"], ["Allow", "Don't allow"])
+        self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
+        with self.cap() as (out, err):
+            pc.cmd_state(self.parse(["state", "--json"]))
+        self.assertNotIn("asked", json.loads(out.getvalue()))
+
+    def test_a_wait_ends_on_the_phone_s_question(self):
+        clock = SlicedWaitTests._clock(self)
+        SlicedWaitTests._waiting_file(self)
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            if cmd == "wait_for":
+                spec = json.loads(arg)
+                calls.append(spec["timeout"])
+                clock["t"] += spec["timeout"]
+                return pc.U2_NOT_FOUND
+            return PERMISSION_XML if arg == "cached" else SAMPLE_XML
+        self.allow("u2sock", side_effect=u2)
+        self.allow("ui_dump", return_value=ET.fromstring(PERMISSION_XML))
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_wait(self.parse(["wait", "Likes", "--timeout", "600", "--no-evidence"]))
+        self.assertEqual((rc, calls), (pc.WAIT_STILL_RC, [10]))  # one chunk, then the question
+        self.assertIn("the phone asks: Allow Vinted to access this device's location? | options: Precise / Approximate / "
+                      "While using the app / Only this time / Don't allow", out.getvalue())
+        self.assertIn("tap their answer", out.getvalue())
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_wait(self.parse(["wait", "Likes", "--timeout", "600", "--json", "--no-evidence"]))
+        self.assertEqual(json.loads(out.getvalue())["asked"]["options"][-1], "Don't allow")
+        # the legacy path (no helper) sees it on its first read (words that
+        # are on the app under the dialog still count as found, as the helper's do)
+        self.allow("u2sock", return_value=None)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_wait(self.parse(["wait", "Messages", "--timeout", "600", "--no-evidence"]))
+        self.assertEqual(rc, pc.WAIT_STILL_RC)
+        self.assertIn("the phone asks:", out.getvalue())
+
+    def test_a_chain_pauses_on_the_phone_s_question(self):
+        looks = self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30: PERMISSION_XML)
+        with mock.patch.object(pc, "cmd_start", return_value=0), \
+                mock.patch.object(pc, "cmd_tap", return_value=0) as tap, \
+                self.cap() as (out, err):
+            rc = pc.cmd_do(argparse.Namespace(flow='start com.vinted; tap "Likes"; press BACK'))
+        self.assertEqual(rc, pc.WAIT_STILL_RC)
+        self.assertIn("do: paused after step 1: the phone asks: Allow Vinted to access this device's location? | options: "
+                      "Precise / Approximate / While using the app / Only this time / Don't allow. Ask the user, tap their "
+                      "answer, then go on with: burner do 'tap \"Likes\"; press BACK'", out.getvalue())
+        tap.assert_not_called()
+        self.assertEqual([c[0] for c in looks.call_args_list], [("dump", "cached")])
+        # the last step's own screen says it; no pause after the last step
+        with mock.patch.object(pc, "cmd_start", return_value=0), self.cap() as (out, err):
+            rc = pc.cmd_do(argparse.Namespace(flow="start com.vinted"))
+        self.assertEqual(rc, 0)
+
+    def test_the_helper_hands_out_its_newest_read_without_a_round_trip(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])  # never asked
+        dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()
+        self.assertEqual(dm.cmd_dump("cached"), SAMPLE_XML.encode())
+        dm._last_xml_t = mod._time.monotonic() - 11
+        self.assertEqual(dm.cmd_dump("cached"), b"")  # too old to be the screen now
+        dm._last_xml, dm._last_xml_t = "", mod._time.monotonic()
+        self.assertEqual(dm.cmd_dump("cached"), b"")
+        self.assertEqual(dm.d.calls, [])
