@@ -510,11 +510,13 @@ LOAD_CAP_S = 2.5   # a wait for a page that is loading, at most
 
 def settle(page, idle_ms=1200, poll_s=0.15, quiet_s=0.3, url=None):
     """Wait for the page after a touch or a scroll. A navigation (the url
-    differs from `url`, the one before the touch) or a load in progress
-    is waited out: until the page is complete and quiet for `quiet_s`,
-    `idle_ms` at most but at least LOAD_CAP_S. Otherwise a quiet spell of
-    the DOM is waited for QUIET_CAP_S at most (a live page never stops
-    changing; its rows can be read any time). Returns the last probe."""
+    differs from `url`, the one before the touch) or a document not yet
+    parsed (readyState "loading") is waited out: until the page is
+    parsed and quiet for `quiet_s`, `idle_ms` at most but at least
+    LOAD_CAP_S. Otherwise a quiet spell of the DOM is waited for
+    QUIET_CAP_S at most: a live page never stops changing, and a heavy
+    page stays "interactive" for many seconds while its ads load, but
+    its rows can be read any time. Returns the last probe."""
     t0 = time.monotonic()
     last, since = None, t0
     probe, loading = {}, False
@@ -526,12 +528,12 @@ def settle(page, idle_ms=1200, poll_s=0.15, quiet_s=0.3, url=None):
         except Exception:
             probe = {"ready": "?", "mut": None}
         now = time.monotonic()
-        if probe.get("ready") not in ("complete", "?") or (url and probe.get("url") != url):
+        if probe.get("ready") == "loading" or (url and probe.get("url") != url):
             loading = True
         key = (probe.get("ready"), probe.get("mut"), probe.get("url"))
         if key != last:
             last, since = key, now
-        elif probe.get("ready") == "complete" and now - since >= quiet_s:
+        elif probe.get("ready") != "loading" and now - since >= quiet_s:
             return probe
         limit = max(idle_ms / 1000.0, LOAD_CAP_S) if loading else min(idle_ms / 1000.0, QUIET_CAP_S)
         if now - t0 >= limit:
