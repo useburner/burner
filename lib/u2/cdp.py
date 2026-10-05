@@ -385,6 +385,7 @@ READ_JS = r"""
   const squash = s => (s || '').replace(/\s+/g, ' ').trim();
   const own = el => { let t = ''; for (const c of el.childNodes) if (c.nodeType === 3) t += c.nodeValue; return squash(t); };
   const attr = el => squash(el.getAttribute('aria-label') || el.getAttribute('alt') || el.getAttribute('title'));
+  const labelOf = el => { try { const l = el.labels && el.labels[0]; return l ? squash(l.innerText) : ''; } catch (e) { return ''; } };
   const ACTIVE = 'a[href],button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=switch],[role=option],[onclick]';
   const FIELD = 'input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button]):not([type=image]),textarea,[contenteditable=true]';
   const CHECK = 'input[type=checkbox],input[type=radio],[role=checkbox],[role=switch],[role=radio]';
@@ -392,10 +393,12 @@ READ_JS = r"""
     el.matches('script,style,noscript,svg,template,iframe') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT });
   for (let el = walker.nextNode(); el && out.length < cap; el = walker.nextNode()) {
     if (used.some(a => a.contains(el))) continue;
-    const field = el.matches(FIELD), check = el.matches(CHECK), active = el.matches(ACTIVE);
+    const field = el.matches(FIELD), check = el.matches(CHECK), active = el.matches(ACTIVE), sel = el.tagName === 'SELECT';
     let text = own(el), desc = attr(el), fromText = false;
-    if (!text && !desc && active && !field) { const t = squash(el.innerText); if (t && t.length <= 80) { text = t; fromText = true; } }
-    if (!text && !desc && !field && !check) continue;
+    if (sel) { const o = el.options[el.selectedIndex]; text = squash(o ? o.text : ''); desc = desc || labelOf(el); }
+    else if (field || check) desc = desc || labelOf(el);
+    if (!sel && !text && !desc && active && !field) { const t = squash(el.innerText); if (t && t.length <= 80) { text = t; fromText = true; } }
+    if (!text && !desc && !field && !check && !sel) continue;
     const r = el.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0 || r.bottom <= 0 || r.top >= vh || r.right <= 0 || r.left >= vw) continue;
     if (el.checkVisibility ? !el.checkVisibility({visibilityProperty: true, opacityProperty: true}) : false) continue;
@@ -403,7 +406,7 @@ READ_JS = r"""
     const key = text + '|' + desc + '|' + Math.round(r.left) + ',' + Math.round(r.top) + ',' + Math.round(r.right) + ',' + Math.round(r.bottom);
     if (seen.has(key)) continue;
     seen.add(key);
-    const kind = field ? 'field' : check ? 'check' : el.matches('button,[role=button],input[type=submit],input[type=button]') ? 'button' : (active ? 'link' : 'text');
+    const kind = sel ? 'select' : field ? 'field' : check ? 'check' : el.matches('button,[role=button],input[type=submit],input[type=button]') ? 'button' : (active ? 'link' : 'text');
     out.push({text: text.slice(0, 160), desc: desc.slice(0, 160), kind: kind,
               value: field ? squash(el.value || el.textContent).slice(0, 160) : '',
               placeholder: field ? squash(el.getAttribute('placeholder')).slice(0, 80) : '',
@@ -413,6 +416,13 @@ READ_JS = r"""
               selected: el.matches('[aria-selected=true],[aria-current]:not([aria-current=false])'),
               disabled: !!(el.disabled || el.getAttribute('aria-disabled') === 'true'),
               l: r.left, t: r.top, w: r.width, h: r.height});
+    if (sel && document.activeElement === el) for (let i = 0; i < el.options.length; i++) {
+      if (out.length >= cap) break;
+      const o = el.options[i];  // listed under the dropdown, as a native list would be
+      out.push({text: squash(o.text).slice(0, 160), desc: '', kind: 'option', value: '', placeholder: '', click: true,
+                checked: false, focused: false, selected: !!o.selected, disabled: !!o.disabled,
+                l: r.left, t: r.top + r.height * (i + 1), w: r.width, h: r.height});
+    }
   }
   return {title: document.title, url: location.href, ready: document.readyState,
           dpr: window.devicePixelRatio || 1, vw: vw, vh: vh, rows: out, more: out.length >= cap,
@@ -438,14 +448,24 @@ FIND_JS = r"""
   const ACTIVE = 'a[href],button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=switch],[role=option],[onclick]';
   const vw = innerWidth, vh = innerHeight;
   const skip = el => !!el.closest('script,style,noscript,svg,template');
-  const visible = el => el.checkVisibility ? el.checkVisibility({visibilityProperty: true, opacityProperty: true}) : true;
+  const labelOf = el => { try { const l = el.labels && el.labels[0]; return l ? squash(l.innerText) : ''; } catch (e) { return ''; } };
+  const focusedSelect = document.activeElement && document.activeElement.tagName === 'SELECT' ? document.activeElement : null;
+  const visible = el => el.tagName === 'OPTION' ? (!!focusedSelect && el.closest('select') === focusedSelect)
+    : (el.checkVisibility ? el.checkVisibility({visibilityProperty: true, opacityProperty: true}) : true);
   const box = el => el.getBoundingClientRect();
   const inView = r => r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < vh && r.right > 0 && r.left < vw;
   const cands = new Set();
   const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  for (let t = tw.nextNode(); t; t = tw.nextNode()) { const p = t.parentElement; if (p && squash(t.nodeValue) && !skip(p)) cands.add(p); }
+  for (let t = tw.nextNode(); t; t = tw.nextNode()) { const p = t.parentElement; if (p && squash(t.nodeValue) && !skip(p) && p.tagName !== 'OPTION') cands.add(p); }
   for (const el of document.body.querySelectorAll('[aria-label],[alt],[title],[placeholder],input,' + ACTIVE)) if (!skip(el)) cands.add(el);
-  const names = el => { const n = [own(el), attr(el)]; if (el.matches(ACTIVE)) { const t = squash(el.innerText); if (t && t.length <= 80) n.push(t); } return n.filter(Boolean).map(s => s.toLowerCase()); };
+  if (focusedSelect) for (const o of focusedSelect.options) cands.add(o);
+  const names = el => {
+    if (el.tagName === 'OPTION') return [squash(el.text).toLowerCase()].filter(Boolean);
+    const n = [own(el), attr(el)];
+    if (el.tagName === 'SELECT') { const o = el.options[el.selectedIndex]; n.push(squash(o ? o.text : '')); n.push(labelOf(el)); }
+    else if (el.matches('input,textarea')) n.push(labelOf(el));
+    else if (el.matches(ACTIVE)) { const t = squash(el.innerText); if (t && t.length <= 80) n.push(t); }
+    return n.filter(Boolean).map(s => s.toLowerCase()); };
   const alts = label.split('||').map(squash).filter(Boolean);
   let used = '';
   const find = test => { for (const alt of alts) { const want = alt.toLowerCase(); const h = [];
@@ -463,6 +483,21 @@ FIND_JS = r"""
   }
   const el = controls[pick || 0];
   let r = box(el), moved = false;
+  if (!query && el.tagName === 'OPTION') {
+    // picked without Chrome's native popup: the dropdown takes the value
+    const s = el.closest('select');
+    s.value = el.value;
+    s.dispatchEvent(new Event('input', {bubbles: true}));
+    s.dispatchEvent(new Event('change', {bubbles: true}));
+    return {found: true, count: 1, used: used, label: squash(el.text).slice(0, 60), chose: true, url: location.href};
+  }
+  if (!query && el.tagName === 'SELECT') {
+    // focused, not touched (a touch opens Chrome's native popup, which a
+    // page read can't see): its options print as rows on the next read
+    if (!inView(r)) el.scrollIntoView({block: 'center', inline: 'nearest'});
+    el.focus();
+    return {found: true, count: 1, used: used, label: (names(el)[0] || '').slice(0, 60), focused: true, url: location.href};
+  }
   if (query) {
     return {found: true, count: controls.length, used: used, label: (names(el)[0] || '').slice(0, 60),
             l: r.left, t: r.top, w: r.width, h: r.height, inview: inView(r), dpr: window.devicePixelRatio || 1,
@@ -522,6 +557,7 @@ def read(page, cap=600):
 
 CLASSES = {"field": "android.widget.EditText", "check": "android.widget.CheckBox",
            "button": "android.widget.Button", "link": "android.view.View",
+           "select": "android.widget.Spinner", "option": "android.widget.TextView",
            "text": "android.widget.TextView"}
 
 
@@ -695,6 +731,11 @@ def tap(page, label, index=None, idle_ms=1200):
     if hit.get("count", 1) != 1:
         hit["screen"] = read(page)
         return hit
+    if hit.get("chose") or hit.get("focused"):
+        # a dropdown's option picked, or a dropdown focused: no touch
+        time.sleep(0.15)
+        return {"found": True, "count": 1, "label": hit.get("label"),
+                "how": "chose" if hit.get("chose") else "focus", "screen": read(page)}
     if hit.get("moved"):
         time.sleep(0.3)  # the scroll into view
     page.loading = False
@@ -721,14 +762,25 @@ def navigate(page, url, idle_ms=1000):
 
 # The focused field's content selected, so inserted text replaces it.
 SELECT_JS = r"""
-(function(){
+(function(text){
   const el = document.activeElement;
-  if (!el || el === document.body) return false;
+  if (!el || el === document.body) return {ok: false};
+  const type = (el.type || '').toLowerCase();
+  if (/^(date|time|month|week|datetime-local|color|range|number)$/.test(type)) {
+    // these take no typed text: the value is set (2026-10-05, 14:30,
+    // #ff0000, 50), the page told, and the field left so the text that
+    // follows lands nowhere
+    el.value = text;
+    el.dispatchEvent(new Event('input', {bubbles: true}));
+    el.dispatchEvent(new Event('change', {bubbles: true}));
+    el.blur();
+    return {ok: true, direct: true, value: el.value, type: type};
+  }
   try {
     if (typeof el.select === 'function') el.select();
     else { const r = document.createRange(); r.selectNodeContents(el); const s = getSelection(); s.removeAllRanges(); s.addRange(r); }
   } catch (e) {}
-  return true;
+  return {ok: true, direct: false, type: type};
 })"""
 
 
@@ -738,14 +790,18 @@ def type_text(page, text, idle_ms=800):
     text inserted the way an IME commits it, a wait for the page, a
     read. Raises NotSent when no field has the focus."""
     try:
-        res = page.call_many([("Runtime.evaluate", {"expression": _js(SELECT_JS), "returnByValue": True}),
+        res = page.call_many([("Runtime.evaluate", {"expression": _js(SELECT_JS, text), "returnByValue": True}),
                               ("Input.insertText", {"text": text})])
     except Exception as e:
         raise NotSent(str(e)[:120])
-    if not (res[0].get("result") or {}).get("value"):
+    sel = (res[0].get("result") or {}).get("value") or {}
+    if not sel.get("ok"):
         raise NotSent("no field has the focus on the page")
+    if sel.get("direct") and str(sel.get("value", "")) != text:
+        raise RuntimeError("the %s field didn't take %r (it holds %r)"
+                           % (sel.get("type"), text, sel.get("value")))
     time.sleep(0.25)  # the field's own reaction (a list of suggestions)
-    return {"screen": read(page), "ready": "complete"}
+    return {"screen": read(page), "ready": "complete", "direct": bool(sel.get("direct"))}
 
 
 def scroll(page, direction="down", times=1, fraction=0.6, idle_ms=500):

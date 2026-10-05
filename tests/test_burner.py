@@ -3994,6 +3994,29 @@ class WebPathTests(OfflineTestCase):
         fake.front_page = lambda dev, current=None: self.fail("asked again within the cooldown")
         self.assertEqual(dm._dump(fresh=True), SAMPLE_XML)
 
+    def test_form_rows_read_like_native_controls(self):
+        cdp = _cdp()
+        screen = dict(WEB_SCREEN, rows=[
+            {"text": "", "desc": "Password", "kind": "field", "value": "", "placeholder": "", "focused": True,
+             "l": 20, "t": 100, "w": 400, "h": 30},
+            {"text": "", "desc": "Default checkbox", "kind": "check", "click": True, "checked": False,
+             "l": 20, "t": 200, "w": 20, "h": 20},
+            {"text": "Two", "desc": "Dropdown (select example)", "kind": "select", "click": True,
+             "l": 20, "t": 300, "w": 300, "h": 30},
+            {"text": "One", "desc": "", "kind": "option", "click": True, "selected": False,
+             "l": 20, "t": 330, "w": 300, "h": 30},
+            {"text": "Two", "desc": "", "kind": "option", "click": True, "selected": True,
+             "l": 20, "t": 360, "w": 300, "h": 30}])
+        root = ET.fromstring(cdp.page_xml(screen, 283, 2400))
+        lines, _ = pc.screen_lines(pc.walk(root), 1080, 2400)
+        self.assertIn("[Password] (click,focused) [EditText] (440,513)", lines)
+        self.assertIn("[Default checkbox] (click,off) [CheckBox] (60,703)", lines)
+        self.assertIn("Two (click) [Spinner] (340,913)", lines)  # the dropdown, by its selected option
+        self.assertIn("One (click) (340,973)", lines)  # its options, listed under it
+        self.assertIn("Two (click,selected) (340,1033)", lines)
+        nodes = pc.walk(root)
+        self.assertEqual(pc.plan_tap(nodes, 1080, 2400, text="Default checkbox")["action"], "tap")
+
     def test_page_read_becomes_a_screen_read(self):
         cdp = _cdp()
         xml = cdp.page_xml(WEB_SCREEN, 283, 2400)

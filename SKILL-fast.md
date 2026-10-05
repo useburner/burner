@@ -138,6 +138,12 @@ Details that save a step:
   screen reader (which falls behind on busy pages): a label tap lands on the
   page's own element, `burner scroll` scrolls the page, and the address bar
   prints as an `[EditText]` row with the URL. Other apps read as before.
+- Forms in Chrome: `burner tap "Label"` focuses a field, checks a box or
+  picks a radio by its label; `burner type` fills the focused field (dates
+  as 2026-10-05, times as 14:30, colors as #ff0000, sliders and numbers as a
+  number). A dropdown shows its current option: tap it and its options print
+  as rows under it, then `burner tap "Option"` picks one. A file field can't
+  be filled.
 - A recipe file has one step per line in `burner do` format, `#` comments,
   and `$VAR` from the environment: `PLAY_PACKAGE=com.example.app burner recipe play-install`.
 - `burner update` keeps `config.env`, the pairing and your own recipes.
