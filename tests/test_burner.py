@@ -3441,6 +3441,30 @@ class OneRoundTripTests(OfflineTestCase):
             rc = pc.cmd_tap(self.parse(["tap", "1", "--quiet"]))
         self.assertEqual((rc, calls, out.getvalue().strip()), (0, ["act"], "tapped 1 (label)"))
 
+    def test_a_lost_or_failed_act_claims_nothing_on_stdout(self):
+        self.allow("wake_async", return_value=mock.Mock())
+        self.allow("ui_dump", return_value=ET.fromstring(TAP_XML))
+        self.allow("tap_center")
+        self.allow("u2_invalidate")
+        self.allow("nav_record")
+
+        def lost(cmd, arg="", timeout=30):
+            pc._u2_status = "lost"
+            return None
+        self.allow("u2sock", side_effect=lost)
+        with self.cap() as (out, err):
+            rc = pc.cmd_tap(self.parse(["tap", "Not now"]))
+        self.assertEqual((rc, out.getvalue().strip()), (1, ""))
+        self.assertIn("didn't confirm the tap", err.getvalue())
+        with self.cap() as (out, err):
+            rc = pc.cmd_press(self.parse(["press", "BACK"]))
+        self.assertEqual((rc, out.getvalue().strip()), (1, ""))
+        self.assertIn("didn't confirm the key press", err.getvalue())
+        with self.cap() as (out, err):
+            rc = pc.cmd_type(self.parse(["type", "--field", "Search", "hello"]))
+        self.assertEqual((rc, out.getvalue().strip()), (1, ""))
+        self.assertIn("didn't confirm the typing", err.getvalue())
+
     def test_tap_falls_back_to_two_steps_with_an_old_helper(self):
         self.allow("wake_async", return_value=mock.Mock())
         self.allow("ui_dump", side_effect=[ET.fromstring(TAP_XML), ET.fromstring(SAMPLE_XML)])
@@ -3729,21 +3753,39 @@ class LabelTapTests(OfflineTestCase):
         # the phone finds it by its words at tap time, in the one round
         # trip with the wait and the read (no read first)
         dm.cmd_act(json.dumps({"tap_label": "OK"}))
-        self.assertEqual(sent[0][1][0], "click")
-        self.assertEqual(sent[0][1][1][0]["text"], "OK")
-        self.assertEqual([m for m, _ in sent[0]], ["wakeUp", "click", "waitForIdle", "dumpWindowHierarchy"])
+        self.assertEqual(sent[0][2][0], "click")
+        self.assertEqual(sent[0][2][1][0]["text"], "OK")
+        self.assertEqual([m for m, _ in sent[0]], ["wakeUp", "count", "click", "waitForIdle", "dumpWindowHierarchy"])
         self.assertEqual(dm.d.calls, [])
         # the phone no longer finds it (the screen changed): nothing was
         # tapped, the row is read afresh and tapped where it is now
         def batch_miss(calls, timeout=45.0):
             sent.append(calls)
             if isinstance(calls[1][1][0], dict):
-                return [None, RuntimeError("UiObjectNotFoundException")] + [None] * (len(calls) - 3) + [SAMPLE_XML]
+                return [None, 0, RuntimeError("UiObjectNotFoundException")] + [None] * (len(calls) - 4) + [SAMPLE_XML]
             return [None] * (len(calls) - 1) + [SAMPLE_XML]
         dm._batch = batch_miss
         dm.cmd_act(json.dumps({"tap_label": "OK"}))
         self.assertEqual(sent[-1][1], ("click", [250, 450]))
         self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])  # one fresh read, which agreed
+        # any other error from the click may have come after the touch went
+        # in (a NullPointerException on a web node, Oct 4): no second tap
+        def batch_npe(calls, timeout=45.0):
+            sent.append(calls)
+            return [None, 1, RuntimeError("java.lang.NullPointerException")] + [None] * (len(calls) - 4) + [SAMPLE_XML]
+        dm._batch = batch_npe
+        dm.d = _FakeServer([], screen_on=True)
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"tap_label": "OK"}))
+        self.assertTrue(str(cm.exception).startswith("act failed after sending: java.lang.NullPointerException"))
+        # rows with the words came since the read: the first was tapped, and it says so
+        def batch_two(calls, timeout=45.0):
+            sent.append(calls)
+            return [None, 2] + [None] * (len(calls) - 3) + [SAMPLE_XML]
+        dm._batch = batch_two
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"tap_label": "OK"}))
+        self.assertEqual(str(cm.exception), "act failed after sending: 2 rows read 'OK' now; the first was tapped")
         dm._batch = batch
         # an older read: the row is read afresh and tapped where it is now
         dm._last_xml_t = 0
@@ -3792,8 +3834,8 @@ class LabelTapTests(OfflineTestCase):
         # by words, from the young read: the phone waits for the tap's
         # acknowledgement itself, so a quiet step is the wake and the tap
         self.assertEqual(dm.cmd_act(json.dumps({"tap_label": "OK", "quiet": True, "idle": 1200})), b"ok")
-        self.assertEqual([m for m, _ in sent[0]], ["wakeUp", "click"])
-        self.assertEqual(sent[0][1][1][0]["text"], "OK")
+        self.assertEqual([m for m, _ in sent[0]], ["wakeUp", "count", "click"])
+        self.assertEqual(sent[0][2][1][0]["text"], "OK")
         self.assertEqual(dm.d.calls, [])
         self.assertEqual(dm._last_xml, SAMPLE_XML)
         # from an older read: the fresh read, the tap where the row is
@@ -3890,6 +3932,7 @@ class NotificationsTests(OfflineTestCase):
         self.assertEqual([c[0][0] for c in sc.call_args_list], ["wake", "shade", "collapse"])
         adb.assert_not_called()
         self.assertIn("Wispr Flow: dictation ready", out.getvalue())
+        self.assertTrue(all(c.kwargs.get("fresh") for c in pc.ui_dump.call_args_list))  # never the cache
         # the helper is away: adb opens and closes the shade, as before
         sc.side_effect = RuntimeError("no scrcpy")
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
@@ -4136,7 +4179,7 @@ class _ScriptedPage(_FakePage):
         self.cdp, self.answers, self.calls = cdp, answers, []
 
     def _name(self, expression):
-        for name in ("FIND_JS", "TARGET_JS", "FILL_JS", "FILLED_JS", "READ_JS", "PLACE_JS",
+        for name in ("TARGET_FILL_JS", "FIND_JS", "TARGET_JS", "FILL_JS", "FILLED_JS", "READ_JS", "PLACE_JS",
                      "SELECT_JS", "SETTLE_JS", "SCROLL_JS"):
             if ("(" + getattr(self.cdp, name)) in expression:
                 return name
@@ -4694,6 +4737,97 @@ class WebPathTests(OfflineTestCase):
         with self.assertRaises(mod.U2NotFound):
             dm.cmd_wait_for(json.dumps({"text": "Top Stories", "timeout": 0.3}))
 
+    def test_a_native_type_with_a_field_label_is_not_sent_by_the_helper(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        dm._batch = mock.Mock(side_effect=AssertionError("setText must not go to the focused field"))
+        dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()  # com.example, not Chrome
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"set_text": "hunter2", "field": "Password", "idle": 1200}))
+        self.assertEqual(str(cm.exception),
+                         "act not sent: --field on a native screen needs a tap on the field first")
+
+    def test_type_with_a_field_label_taps_the_field_first_on_a_native_screen(self):
+        self.allow("u2_invalidate")
+        self.allow("nav_record")
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            spec = json.loads(arg) if cmd == "act" else {}
+            calls.append((cmd, spec))
+            if cmd == "act" and spec.get("field"):
+                pc._u2_status = "err act not sent: --field on a native screen needs a tap on the field first"
+                return None
+            return SAMPLE_XML
+        self.allow("u2sock", side_effect=u2)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_type(self.parse(["type", "--field", "Password", "hunter2"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual([(c, s.get("set_text"), s.get("field"), s.get("tap_label")) for c, s in calls],
+                         [("act", "hunter2", "Password", None),   # the one-op fill: not on a native screen
+                          ("act", None, None, "Password"),        # the field tapped by its label
+                          ("act", "hunter2", None, None)])        # then the text into the focused field
+        self.assertIn("typed 7 chars", out.getvalue())
+        self.assertNotIn("into Password", out.getvalue())
+
+    def test_an_action_batch_is_never_replayed_on_a_stale_stream(self):
+        mod = _u2mux()
+        import http.client as hc
+        core = mock.Mock(HTTPResponse=lambda content: SimpleNamespace(content=content),
+                         HTTPError=Exception)
+
+        class Resp:
+            status, reason, will_close = 200, "OK", False
+
+            def read(self):
+                return b"[]"
+
+            def getheader(self, name):
+                return ""
+
+        def conn(stale):
+            c = SimpleNamespace(requests=[], sock=SimpleNamespace(settimeout=lambda t: None))
+            c.request = lambda method, path, body=None, headers=None: c.requests.append(path)
+            c.getresponse = (mock.Mock(side_effect=hc.RemoteDisconnected("closed")) if stale
+                             else (lambda: Resp()))
+            c.close = lambda: None
+            return c
+        dev = SimpleNamespace(serial="s")
+        with mock.patch.dict(sys.modules, {"uiautomator2": mock.Mock(core=core), "uiautomator2.core": core}):
+            # a read on a stale reused stream is sent again on a fresh one
+            ka = mod.KeepAliveHTTP()
+            first, second = conn(stale=True), conn(stale=False)
+            ka._conns[(dev.serial, 9008)] = [first, mod._time.monotonic()]
+            ka._open = mock.Mock(return_value=second)
+            ka.request(dev, 9008, "POST", "/jsonrpc/0", data=[{"method": "dumpWindowHierarchy"}])
+            self.assertEqual((first.requests, second.requests), (["/jsonrpc/0"], ["/jsonrpc/0"]))
+            # an action batch is not: the server may have acted before it closed
+            ka = mod.KeepAliveHTTP()
+            first, second = conn(stale=True), conn(stale=False)
+            ka._conns[(dev.serial, 9008)] = [first, mod._time.monotonic()]
+            ka._open = mock.Mock(return_value=second)
+            with self.assertRaises(hc.RemoteDisconnected):
+                ka.request(dev, 9008, "POST", "/jsonrpc/0", data=[{"method": "click"}], replay=False)
+            self.assertEqual(second.requests, [])
+            # a re-open that fails after the request went out once is not "not sent"
+            ka = mod.KeepAliveHTTP()
+            first = conn(stale=True)
+            ka._conns[(dev.serial, 9008)] = [first, mod._time.monotonic()]
+            ka._open = mock.Mock(side_effect=OSError("refused"))
+            with self.assertRaises(hc.RemoteDisconnected):
+                ka.request(dev, 9008, "POST", "/jsonrpc/0", data=[{"method": "dumpWindowHierarchy"}])
+            # the batch sender tells the two apart
+            dm = EmptyScreenTests._daemon(self, mod)
+            dm.d = SimpleNamespace(_dev=dev, _device_server_port=9008)
+            seen = []
+            with mock.patch.object(mod._KEEPALIVE, "request",
+                                   side_effect=lambda *a, **k: seen.append(k.get("replay")) or SimpleNamespace(json=lambda: [])):
+                dm._batch([("wakeUp", []), ("click", [1, 2])])
+                dm._batch([("dumpWindowHierarchy", [False, 50])])
+            self.assertEqual(seen, [False, True])
+
     def test_an_act_whose_stream_would_not_open_is_not_sent(self):
         mod = _u2mux()
         EmptyScreenTests.no_sleep(self, mod)
@@ -4746,6 +4880,33 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(dm._last_xml, SAMPLE_XML)  # and that look is the newest read
         self.assertIsNone(dm._web)
 
+    def test_a_label_not_on_the_page_is_tapped_on_chromes_own_prompt(self):
+        # a permission ask or "Save password?" is Chrome's, not the page's:
+        # the screen reader has it, and the row is tapped where it is
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = self._fake_cdp(mod, calls)
+        fake.tap = lambda page, label, index=None, idle_ms=1200: calls.append(("tap", label)) or {"found": False, "screen": WEB_SCREEN}
+        prompt = CHROME_XML.replace(
+            '<node text="" class="android.webkit.WebView"',
+            '<node text="Allow" class="android.widget.Button" package="com.android.chrome"'
+            ' bounds="[600,1500][900,1600]" clickable="true" enabled="true"/>'
+            '<node text="" class="android.webkit.WebView"')
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([prompt])
+        sent = []
+        dm._batch = lambda cs, timeout=45.0: sent.append(cs) or [None] * (len(cs) - 1) + [prompt]
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        dm.cmd_act(json.dumps({"tap_label": "Allow", "idle": 900}))
+        self.assertEqual(calls[0], ("tap", "Allow"))
+        self.assertEqual(sent[0][1], ("click", [750, 1550]))
+        # no such row on the screen reader's read either: not sent
+        dm.d = _FakeServer([CHROME_XML])
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"tap_label": "Nope"}))
+        self.assertEqual(str(cm.exception), "act not sent: not on the page")
+
     def test_helper_fills_a_field_by_its_label(self):
         mod = _u2mux()
         EmptyScreenTests.no_sleep(self, mod)
@@ -4777,34 +4938,37 @@ class WebPathTests(OfflineTestCase):
         on_button = {"found": True, "count": 1, "label": "search", "notField": True, "tag": "span",
                      "x": 305, "y": 27, "url": "https://en.m.wikipedia.org/"}
         page = _ScriptedPage(cdp, {
-            "FIND_JS": on_button, "TARGET_JS": {"ok": True, "how": "focus", "label": "search wikipedia"},
-            "FILL_JS": {"ok": True, "mode": "insert"}, "FILLED_JS": {"ok": True, "value": "Pixel 7"},
-            "READ_JS": WEB_SCREEN})
+            "FIND_JS": on_button, "FILL_JS": {"ok": False, "why": "not a field"},
+            "TARGET_FILL_JS": {"target": {"ok": True, "how": "focus", "label": "search wikipedia"},
+                               "filled": {"ok": True, "mode": "insert"}},
+            "FILLED_JS": {"ok": True, "value": "Pixel 7"}, "READ_JS": WEB_SCREEN})
         with mock.patch.object(cdp.time, "sleep"):
             r = cdp.fill(page, "Search", "Pixel 7")
         self.assertEqual((r["found"], r["how"], r["value"]), (True, "tap+focus", "Pixel 7"))
         self.assertEqual(page.calls, [
             ("many", ["FIND_JS", "FILL_JS"]),  # the fill rides with the find: a field takes it there
             ("many", ["Input.dispatchTouchEvent", "Input.dispatchTouchEvent"]),  # not a field: touched
-            ("many", ["TARGET_JS", "FILL_JS"]),  # the field that opened, filled in the same trip
+            ("eval", "TARGET_FILL_JS"),  # the field that opened, waited for and filled in one script
             ("many", ["Input.insertText", "FILLED_JS", "READ_JS"])])
-        # the touch led to a page with the box (no focus): the field with the label
+        # the touch led to a page with the box (no focus): the field with the label, on the second look
         page = _ScriptedPage(cdp, {
-            "FIND_JS": on_button, "TARGET_JS": [{"ok": False, "fields": 0}, {"ok": True, "how": "label", "label": "search wikipedia"}],
-            "FILL_JS": {"ok": True, "mode": "insert"}, "FILLED_JS": {"ok": True, "value": "Pixel 7"},
-            "READ_JS": WEB_SCREEN})
+            "FIND_JS": on_button, "FILL_JS": {"ok": False, "why": "not a field"},
+            "TARGET_FILL_JS": [{"target": {"ok": False, "fields": 0}, "filled": None},
+                               {"target": {"ok": True, "how": "label", "label": "search wikipedia"},
+                                "filled": {"ok": True, "mode": "insert"}}],
+            "FILLED_JS": {"ok": True, "value": "Pixel 7"}, "READ_JS": WEB_SCREEN})
         with mock.patch.object(cdp.time, "sleep"):
             r = cdp.fill(page, "Search", "Pixel 7")
         self.assertEqual(r["how"], "tap+label")
-        self.assertEqual([c for c in page.calls if c[1] and c[1][0] == "TARGET_JS"],
-                         [("many", ["TARGET_JS", "FILL_JS"])] * 2)
+        self.assertEqual([c for c in page.calls if c[0] == "eval"], [("eval", "TARGET_FILL_JS")] * 2)
 
     def test_fill_says_when_the_button_opened_no_field(self):
         cdp = _cdp()
         page = _ScriptedPage(cdp, {
             "FIND_JS": {"found": True, "count": 1, "label": "search", "notField": True, "tag": "span",
-                        "x": 305, "y": 27, "url": "u"},
-            "TARGET_JS": {"ok": False, "fields": 2, "named": 0}, "READ_JS": WEB_SCREEN})
+                        "x": 305, "y": 27, "url": "u"}, "FILL_JS": {"ok": False, "why": "not a field"},
+            "TARGET_FILL_JS": {"target": {"ok": False, "fields": 2, "named": 0}, "filled": None},
+            "READ_JS": WEB_SCREEN})
         with mock.patch.object(cdp.time, "sleep"), self.assertRaises(cdp.NotDone) as cm:
             cdp.fill(page, "Search", "Pixel 7")
         self.assertEqual(str(cm.exception),
@@ -4823,6 +4987,30 @@ class WebPathTests(OfflineTestCase):
         # two round trips: find + fill, then the text, the check and the read
         self.assertEqual(page.calls, [("many", ["FIND_JS", "FILL_JS"]),
                                       ("many", ["Input.insertText", "FILLED_JS", "READ_JS"])])
+
+    def test_a_read_that_fails_after_an_untouched_answer_is_not_sent(self):
+        cdp = _cdp()
+        page = _ScriptedPage(cdp, {"FIND_JS": {"found": False}})
+        page.eval = mock.Mock(side_effect=[{"found": False}, {"found": False}, OSError("stream closed")])
+        with mock.patch.object(cdp.time, "sleep"), self.assertRaises(cdp.NotSent):
+            cdp.tap(page, "Nope")
+        page = _ScriptedPage(cdp, {"FIND_JS": {"found": True, "count": 2, "labels": ["a", "b"]}})
+        page.eval = mock.Mock(side_effect=[{"found": True, "count": 2, "labels": ["a", "b"]}, OSError("stream closed")])
+        with self.assertRaises(cdp.NotSent):
+            cdp.tap(page, "Twice")
+
+    def test_page_text_is_cleaned_of_what_xml_cannot_carry(self):
+        cdp = _cdp()
+        screen = dict(WEB_SCREEN, title="t\x00itle", rows=[
+            {"text": "a\x01b\ud800c", "desc": "d\x1fe", "kind": "text", "click": False, "l": 0, "t": 0, "w": 10, "h": 10}])
+        xml = cdp.page_xml(screen, 283, 2400)
+        root = ET.fromstring(xml)
+        xml.encode("utf-8")
+        texts = [n.get("text") for n in root.iter("node")]
+        self.assertIn("abc", texts)
+        self.assertIn("de", [n.get("content-desc") for n in root.iter("node")])
+        self.assertIn("title", xml)
+        self.assertNotIn("\x00", xml)
 
     def test_tap_reads_the_page_in_the_touch_round_trip(self):
         cdp = _cdp()

@@ -21,8 +21,8 @@ import base64
 import hashlib
 import json
 import os
+import re
 import select
-import socket
 import struct
 import time
 from xml.sax.saxutils import quoteattr
@@ -770,10 +770,30 @@ def read(page, cap=600):
     return page.eval(_js(READ_JS, cap)) or {}
 
 
+def _read_untouched(page):
+    """A read for an answer that touched nothing (words not on the page,
+    several controls): when it fails, nothing was sent, and the caller
+    takes the other way, rather than "the action failed"."""
+    try:
+        return read(page)
+    except Exception as e:
+        raise NotSent(str(e)[:120])
+
+
 CLASSES = {"field": "android.widget.EditText", "check": "android.widget.CheckBox",
            "button": "android.widget.Button", "link": "android.view.View",
            "select": "android.widget.Spinner", "option": "android.widget.TextView",
            "text": "android.widget.TextView"}
+
+
+# What XML can't carry and the reader doesn't need: control characters
+# (a page's text can hold them) and lone surrogates (which no encoding
+# can write); either made every read of the page fail.
+_UNPRINTABLE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff]")
+
+
+def _plain(v):
+    return _UNPRINTABLE.sub("", str(v))
 
 
 def _node(index, text, desc, cls, bounds, pkg, clickable=False, checkable=False,
@@ -785,7 +805,7 @@ def _node(index, text, desc, cls, bounds, pkg, clickable=False, checkable=False,
              ("focusable", clickable), ("focused", focused), ("scrollable", scrollable),
              ("long-clickable", False), ("password", False), ("selected", selected),
              ("visible-to-user", True), ("bounds", bounds)]
-    body = " ".join("%s=%s" % (k, quoteattr(str(v).lower() if isinstance(v, bool) else str(v)))
+    body = " ".join("%s=%s" % (k, quoteattr(str(v).lower() if isinstance(v, bool) else _plain(v)))
                     for k, v in attrs)
     if children:
         return "<node %s>\n%s\n</node>" % (body, children)
@@ -846,9 +866,10 @@ LOAD_CAP_S = 1.8   # a wait for a page that is loading, at most (the caller
 VISIBLE_FOR_S = 45.0  # a page's read says whether its document is visible: that proof
                       # holds this long without another (no question of its own), and a
                       # read that says hidden ends it
-QUICK_AFTER_S = 8.0   # a command QUICK_AFTER_S or more after the last proof waits
-STALE_CALL_S = 3.0    # STALE_CALL_S at most: a tab frozen in the background answers
-                      # nothing, and the caller then looks at the screen
+QUICK_AFTER_S = 2.0   # a command QUICK_AFTER_S or more after the last proof waits
+STALE_CALL_S = 3.0    # STALE_CALL_S at most: a tab frozen in the background (a touch
+                      # that opened another app) answers nothing, and the caller then
+                      # looks at the screen; a page on screen answers well within it
 
 
 def settle(page, idle_ms=1200, poll_s=0.15, quiet_s=0.3, url=None, loading=False):
@@ -893,10 +914,10 @@ def touch(page, x, y, then=()):
     refused, and then nothing of `then` was asked."""
     cmds = [("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [{"x": x, "y": y}]}),
             ("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})] + list(then)
-    try:
-        res = page.call_many(cmds, timeout=5.0, raise_errors=False)
-    except RuntimeError:
-        res = [RuntimeError("no answer")]
+    # a stream that fails here raises (the caller reads the screen); a
+    # touch the page refused comes back as its result, and the element's
+    # own click stands in
+    res = page.call_many(cmds, timeout=5.0, raise_errors=False)
     if any(isinstance(r, Exception) for r in res[:2]):
         page.eval("window.__burnerTarget && window.__burnerTarget.click(); 'clicked'")
         return "click", []
@@ -921,17 +942,14 @@ TARGET_WAIT_MS = 700  # the field that a touch opens is waited for this long, on
 
 
 def _target_fill(page, label, text):
-    """After a touch on what opens a field: the field (TARGET_JS) and
-    its fill (FILL_JS), one round trip: (target, filled)."""
-    res = page.call_many([_evaluate(_js(TARGET_JS, label, TARGET_WAIT_MS)), _evaluate(_js(FILL_JS, text))],
-                         raise_errors=False)
-    out = []
-    for r in res:
-        try:
-            out.append(_value(r) or {})
-        except RuntimeError:
-            out.append({})
-    return out[0], out[1]
+    """After a touch on what opens a field: the field (TARGET_JS, waited
+    for on the page) and its fill (FILL_JS) in one script, so the fill
+    runs once the field is there, not on a stale target: (target, filled)."""
+    try:
+        res = page.eval(_js(TARGET_FILL_JS, label, TARGET_WAIT_MS, text)) or {}
+    except RuntimeError:
+        return {}, {}
+    return res.get("target") or {}, res.get("filled") or {}
 
 
 def find_read(page, label, top=0):
@@ -985,9 +1003,9 @@ def tap(page, label, index=None, idle_ms=1200):
     except Exception as e:
         raise NotSent(str(e)[:120])
     if not hit or not hit.get("found"):
-        return {"found": False, "screen": read(page)}
+        return {"found": False, "screen": _read_untouched(page)}
     if hit.get("count", 1) != 1:
-        hit["screen"] = read(page)
+        hit["screen"] = _read_untouched(page)
         return hit
     if hit.get("chose") or hit.get("focused"):
         # a dropdown's option picked, or a dropdown focused: no touch
@@ -1134,6 +1152,13 @@ FILLED_JS = r"""
 })"""
 
 
+# TARGET_JS then FILL_JS on what it found, as one promise: the fill runs
+# after the field is there (two scripts sent together could run the
+# fill first, on the target of the touch).
+TARGET_FILL_JS = ("(function(label, waitMs, text){ return (%s)(label, waitMs)"
+                  ".then(t => ({target: t, filled: t.ok ? (%s)(text) : null})); })") % (TARGET_JS, FILL_JS)
+
+
 def fill(page, label, text, index=None):
     """`text` into the field with this label (see FIND_JS with fill, and
     FILL_JS), then a read. Two round trips: the find with the fill
@@ -1149,9 +1174,9 @@ def fill(page, label, text, index=None):
     except Exception as e:
         raise NotSent(str(e)[:120])
     if not hit or not hit.get("found"):
-        return {"found": False, "screen": read(page)}
+        return {"found": False, "screen": _read_untouched(page)}
     if hit.get("count", 1) != 1:
-        hit["screen"] = read(page)
+        hit["screen"] = _read_untouched(page)
         return hit
     how = "fill"
     if hit.get("notField"):

@@ -10,7 +10,6 @@ label, the row with those words is tapped a few times (a calculator
 key is harmless). Prints one line per call: what, how long, and the
 size of the reply."""
 import os
-import re
 import sys
 import time
 

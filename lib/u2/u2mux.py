@@ -352,7 +352,7 @@ class KeepAliveHTTP:
             self._conns.clear()
 
     def request(self, dev, port, method, path, data=None, timeout=10.0,
-                print_request=False):
+                print_request=False, replay=True):
         import http.client
         from uiautomator2.core import HTTPResponse, HTTPError
         # The on-phone server gzips its JSON when asked: a screen read's
@@ -367,6 +367,11 @@ class KeepAliveHTTP:
         key = (dev.serial, port)
         self._target = (dev, port)
         self._last_real = _time.monotonic()
+        # replay: a request on a reused stream that turns out closed is
+        # sent again on a fresh one (the idle-close signature) when it is
+        # a read; never when it carries an action, since a server that
+        # closed after reading it has acted (a tap twice).
+        sent, stale = False, None
         with self._lock:
             for attempt in range(2):
                 ent = self._conns.get(key)
@@ -377,20 +382,24 @@ class KeepAliveHTTP:
                     try:
                         fresh = self._open(dev, port)
                     except Exception as e:
+                        if sent:
+                            raise stale  # the request went out once: not "not sent"
                         raise StreamUnavailable(err_text(e, 100))
                     ent = self._conns[key] = [fresh, 0]
                 conn = ent[0]
                 conn.sock.settimeout(timeout)
                 try:
                     conn.request(method, path, body, headers=headers)
+                    sent = True
                     resp = conn.getresponse()
                     content = resp.read()
                 except (http.client.RemoteDisconnected, BrokenPipeError,
                         http.client.CannotSendRequest) as e:
                     conn.close()
                     del self._conns[key]
-                    if reused and attempt == 0:
+                    if reused and attempt == 0 and replay:
                         log("keepalive conn went stale (%s), reopening" % type(e).__name__)
+                        stale = e
                         continue
                     raise
                 except Exception:
@@ -870,7 +879,10 @@ def act_calls(spec):
     opposite. Pure."""
     calls = []
     if "tap_selector" in spec:
-        calls.append(("click", [spec["tap_selector"]]))  # found by its words at tap time
+        # how many controls carry the words now (the check after the tap),
+        # then the click, by its words at tap time
+        calls.append(("count", [spec["tap_selector"]]))
+        calls.append(("click", [spec["tap_selector"]]))
     elif "tap" in spec:
         x, y = spec["tap"]
         calls.append(("click", [int(x), int(y)]))
@@ -1462,7 +1474,8 @@ class U2Daemon:
         body = [{"jsonrpc": "2.0", "id": i + 1, "method": m, "params": p}
                 for i, (m, p) in enumerate(calls)]
         resp = _KEEPALIVE.request(self.d._dev, self.d._device_server_port,
-                                  "POST", "/jsonrpc/0", data=body, timeout=timeout)
+                                  "POST", "/jsonrpc/0", data=body, timeout=timeout,
+                                  replay=not any(m in ACTION_METHODS for m, _ in calls))
         return batch_results(resp.json(), len(calls))
 
     def cmd_act(self, arg):
@@ -1530,7 +1543,16 @@ class U2Daemon:
                     self._web = None
                     raise RuntimeError("act failed after sending: %s" % err_text(e, 120))
                 if not r.get("found"):
-                    raise RuntimeError("act not sent: not on the page")
+                    # Chrome's own prompts (a permission ask, "Save
+                    # password?") are not on the page; the screen reader
+                    # has them: one read there, and the row tapped where it is
+                    center = self._native_row(label)
+                    if center is None:
+                        raise RuntimeError("act not sent: not on the page")
+                    native = {"tap": list(center), "idle": spec.get("idle", 1200)}
+                    if spec.get("quiet"):
+                        native["quiet"] = True
+                    return self._act_batch(native)
                 if r.get("count", 1) != 1:
                     raise RuntimeError("act not sent: %d rows read %r%s" % (
                         r["count"], label, " (%s)" % ", ".join(r["tags"]) if r.get("tags") else ""))
@@ -1615,6 +1637,7 @@ class U2Daemon:
                 try:
                     node, alt = label_node(before, label)
                     spec["tap_selector"] = selector_for(node, alt)
+                    spec["words"] = label
                 except RuntimeError:
                     pass
             if "tap_selector" in spec:
@@ -1651,7 +1674,29 @@ class U2Daemon:
                     raise RuntimeError("act not sent: %s" % err_text(e, 100))
                 reads += 1
             spec["tap"] = list(center)
+        if "set_text" in spec and spec.get("field"):
+            # a native screen: the field with this label is tapped first,
+            # by the CLI's own lookup; setText alone goes to whatever field
+            # has the focus, and the CLI would report it typed into this one
+            raise RuntimeError("act not sent: --field on a native screen needs a tap on the field first")
         return self._act_batch(spec)
+
+    def _native_row(self, label):
+        """The centre of the row with these words on a fresh read by the
+        screen reader (not the page: Chrome's own prompts live only
+        there), or None. The read is the newest one known."""
+        try:
+            with _t("dump rpc (native row)"):
+                xml = read_screen(self.d)
+        except Exception as e:
+            log("the screen reader couldn't be asked for %r (%s)" % (label, err_text(e, 80)))
+            return None
+        if has_words(xml):
+            self._remember(xml)
+        try:
+            return label_target(xml, label)
+        except RuntimeError:
+            return None
 
     def _act_batch(self, spec):
         """The act's calls (see act_calls) in one round trip, and what
@@ -1673,9 +1718,19 @@ class U2Daemon:
                 except Exception as e:
                     raise RuntimeError("act failed after sending: %s" % str(e)[:120])
             if acted and isinstance(results[acted[0]], Exception):
-                if "tap_selector" in spec:
-                    raise _NotThere(err_text(results[acted[0]], 80))
-                raise RuntimeError("act failed after sending: %s" % results[acted[0]])
+                err = results[acted[0]]
+                if "tap_selector" in spec and ("UiObjectNotFound" in str(err) or "-32002" in str(err)):
+                    raise _NotThere(err_text(err, 80))  # no such control: nothing was tapped
+                # any other error (a NullPointerException on a web node, Oct
+                # 4) may have come after the touch went in: no second tap
+                raise RuntimeError("act failed after sending: %s" % err)
+            if "tap_selector" in spec and acted:
+                n = results[acted[0] - 1]
+                if isinstance(n, int) and n > 1:
+                    # the read was BY_WORDS_S old: rows with the words came
+                    # since, and the phone tapped the first; said, not hidden
+                    raise RuntimeError("act failed after sending: %d rows read %r now; the first was tapped"
+                                       % (n, spec.get("words", "")))
             if acted and calls[0][0] == "wakeUp" and isinstance(results[0], Exception):
                 # The action went to a screen that may be off: dropped, then.
                 raise RuntimeError("act failed after sending: the wake before it failed "

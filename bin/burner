@@ -839,11 +839,22 @@ def u2_invalidate():
     snap_invalidate()  # @eN handles from burner snap are now stale
 
 
+def _helper_said():
+    """The UI helper's own reason for a read it refused, on stderr: it
+    says what is wrong (its server couldn't be restarted a moment ago,
+    the screen would not wake) where the fallback's advice can't."""
+    if _u2_status.startswith("err "):
+        print("burner: the UI helper says: {}".format(_u2_status[len("err "):][:200]),
+              file=sys.stderr)
+
+
 def fast_dump(fresh=False):
     """UI hierarchy XML via uiautomator2 mux. None on failure. fresh skips
     the helper's 2-second cache (for re-reads that must see a change)."""
     t0 = time.time()
     xml = u2sock("dump", "fresh" if fresh else "", timeout=40)
+    if xml is None:
+        _helper_said()
     if os.environ.get("BURNER_TRACE"):
         print("trace u2 dump {:.2f}s".format(time.time() - t0), file=sys.stderr)
     if xml is None and not os.path.exists(U2_SOCK):
@@ -872,10 +883,13 @@ def fast_dump(fresh=False):
             time.sleep(0.5)
             xml = u2sock("dump", "fresh", timeout=40)
             _trace("empty read, read again")
+            if not xml:
+                _helper_said()
+                return None  # a read that failed, not an empty screen
             try:
-                root = ET.fromstring(xml) if xml else root
+                root = ET.fromstring(xml)
             except ET.ParseError:
-                pass
+                return None
         _update_screen_from_dump(root)
         return root
     return None
@@ -2195,8 +2209,10 @@ def cmd_tap(args):
                 nav_record(None, 'tap "{}"'.format(args.text), None, ok=True)
             except Exception:
                 pass
+            if status != "ok":
+                return print_act(status, root, note, "tap")  # the helper's word; no claim here
             rc = _tap_ok(args, args.text, None, via="label")
-            if args.quiet and status == "ok":
+            if args.quiet:
                 return rc
             return print_act(status, root, note, "tap") or rc
     # No label tap by the helper (its batch wakes the screen itself): the
@@ -2287,6 +2303,8 @@ def cmd_tap(args):
                     nav_record(None, 'tap "{}"'.format(args.text), None, ok=True)
                 except Exception:
                     pass
+                if status != "ok":
+                    return print_act(status, after, note, "tap")
                 rc = _tap_ok(args, args.text, None, via="label")
                 return print_act(status, after, note, "tap") or rc
         again, _ = read_after_root(prev_root=root, idle_ms=IDLE_ACT_MS)
@@ -2632,11 +2650,11 @@ def cmd_type(args):
     # last text field). Elsewhere: focus the field first, then type.
     if args.field and not args.slow and not quiet:
         status, root, note = act_and_read({"set_text": args.text, "field": args.field})
-        if status == "ok" or status == "lost":
+        if status == "ok":
             print("typed {} chars into {}".format(len(args.text), args.field))
             return print_act(status, root, note, "typing")
-        if status.startswith("failed"):
-            # the helper had it and says why it didn't work: no claim of typing
+        if status == "lost" or status.startswith("failed"):
+            # the helper had it: its word on what happened, no claim of typing
             return print_act(status, root, note, "typing")
     if args.field:
         got = focus_field(args.field)
@@ -2655,13 +2673,12 @@ def cmd_type(args):
     if not args.slow and not quiet:
         # One round trip: the text into the focused field, the wait, the read.
         status, root, note = act_and_read({"set_text": args.text})
-        if status == "ok" or status == "lost":
+        if status == "ok":
             print("typed {} chars".format(len(args.text)))
             return print_act(status, root, note, "typing")
-        if status.startswith("failed") and "no editable field" not in status \
-                and "UiObjectNotFound" not in status:
-            print("typed {} chars".format(len(args.text)))
-            return print_act(status, root, note, "typing")
+        if status == "lost" or (status.startswith("failed") and "no editable field" not in status
+                                and "UiObjectNotFound" not in status):
+            return print_act(status, root, note, "typing")  # the helper's word; no claim of typing
         # "unsent" (an older helper) or no focused field: the paths below
     if not args.slow:
         out = u2sock("set_text", json.dumps({"text": args.text}), timeout=40)
@@ -2826,7 +2843,8 @@ def cmd_press(args):
                 nav_record(None, 'press {}'.format(args.key), None, ok=True)
             except Exception:
                 pass
-            print("pressed {}".format(args.key))
+            if status == "ok":
+                print("pressed {}".format(args.key))
             return print_act(status, root, note, "key press")
 
     def send_one(key):
@@ -4162,7 +4180,9 @@ def cmd_notifications(args):
     lines = []
     try:
         for i in range(3):
-            rows = notification_rows(ui_dump())
+            # afresh every time: the shade opens in milliseconds now, and a
+            # read served from the helper's cache showed the screen before it
+            rows = notification_rows(ui_dump(fresh=True))
             _trace("notifications pass {}: {} rows, last ends {}".format(
                 i, len(rows), max([y for _t, y in rows] or [0])))
             if not rows and i == 0:
