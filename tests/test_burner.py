@@ -3912,10 +3912,48 @@ class WebPathTests(OfflineTestCase):
                 return answers.pop()
         page = object.__new__(cdp.Page)
         page.ws, page.n, page.visible_at = FakeWS(), 0, 0.0
+        page.loading, page.main_frame, page.url = False, "F1", ""
         out = page.call_many([("Input.dispatchTouchEvent", {"type": "touchStart"}),
                               ("Input.dispatchTouchEvent", {"type": "touchEnd"})])
         self.assertEqual(sent, ["Input.dispatchTouchEvent"] * 2)
         self.assertEqual([r["n"] for r in out], [1, 2])
+
+    def test_page_hears_its_navigation(self):
+        cdp = _cdp()
+        events = []
+
+        class FakeWS:
+            buf = b""
+
+            class s:
+                @staticmethod
+                def settimeout(t):
+                    pass
+
+            def recv(self):
+                return json.dumps(events.pop(0))
+        page = object.__new__(cdp.Page)
+        page.ws, page.n, page.visible_at = FakeWS(), 0, 0.0
+        page.loading, page.main_frame, page.url = False, "F1", "https://a/"
+        page._readable = lambda timeout: bool(events)
+        # a subframe (an ad) loading is not a navigation
+        events[:] = [{"method": "Page.frameStartedLoading", "params": {"frameId": "AD"}}]
+        page.listen(0.01)
+        self.assertFalse(page.loading)
+        # the main frame loading is, until its document is parsed
+        events[:] = [{"method": "Page.frameStartedLoading", "params": {"frameId": "F1"}},
+                     {"method": "Page.frameNavigated", "params": {"frame": {"id": "F1", "url": "https://b/"}}}]
+        page.listen(0.01)
+        self.assertTrue(page.loading)
+        self.assertEqual(page.url, "https://b/")
+        events[:] = [{"method": "Page.domContentEventFired", "params": {"timestamp": 1}}]
+        self.assertTrue(page.wait_parsed(0.5))
+        self.assertFalse(page.loading)
+        # after a touch: nothing heard, read at once; a navigation, waited out
+        self.assertEqual(cdp.after_touch(page, listen_s=0.01), {"ready": "complete"})
+        events[:] = [{"method": "Page.frameStartedLoading", "params": {"frameId": "F1"}}]
+        page.loading = False
+        self.assertEqual(cdp.after_touch(page, idle_ms=50, listen_s=0.01), {"ready": "loading"})
 
     def test_http_responses_are_read_by_their_headers(self):
         cdp = _cdp()

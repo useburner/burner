@@ -768,6 +768,7 @@ class U2Daemon:
             self._web = None
             log("reading the page failed (%s); reading the screen" % err_text(e, 100))
             return None
+        log("web read: %d rows, %sms in the page" % (len(screen.get("rows") or []), screen.get("ms", "?")))
         return self._page_xml(screen)
 
     def _remember(self, xml):
@@ -1074,6 +1075,11 @@ class U2Daemon:
         to see whether it stopped changing. Returns the ms it waited."""
         timeout = int(arg.strip() or "1500")
         t0 = _time.monotonic()
+        if self._page() is not None:
+            # A page in Chrome: the screen reader's idle means nothing
+            # there (its tree lags the page), and a page read is current.
+            self.invalidate()
+            return b"0"
         with self._lock:
             with _t("idle rpc"):
                 self.d.jsonrpc.waitForIdle(timeout)

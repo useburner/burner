@@ -21,6 +21,8 @@ import base64
 import hashlib
 import json
 import os
+import select
+import socket
 import struct
 import time
 from xml.sax.saxutils import quoteattr
@@ -221,13 +223,62 @@ def http_get(dev, path, timeout=4.0):
 
 
 class Page:
-    """One page's DevTools session: commands by id, page scripts by value."""
+    """One page's DevTools session: commands by id, page scripts by
+    value, and the page's navigation events (the Page domain is enabled
+    at the start): `loading` is True from the main frame's start of a
+    load until its document is parsed."""
 
     def __init__(self, dev, target):
         self.target = target
         self.ws = WebSocket(open_stream(dev), "/devtools/page/" + target)
         self.n = 0
         self.visible_at = 0.0  # when a probe last said the page was visible
+        self.loading = False
+        self.main_frame = None
+        self.url = ""
+        res = self.call_many([("Page.enable", {}), ("Page.getFrameTree", {})])
+        frame = (res[1].get("frameTree") or {}).get("frame") or {}
+        self.main_frame, self.url = frame.get("id"), frame.get("url", "")
+
+    def _event(self, m):
+        method, p = m.get("method", ""), m.get("params") or {}
+        if method == "Page.frameStartedLoading" and p.get("frameId") == self.main_frame:
+            self.loading = True
+        elif method == "Page.frameNavigated":
+            frame = p.get("frame") or {}
+            if frame.get("id") == self.main_frame or not frame.get("parentId"):
+                self.main_frame, self.url = frame.get("id", self.main_frame), frame.get("url", self.url)
+        elif method in ("Page.domContentEventFired", "Page.loadEventFired"):
+            self.loading = False
+        elif method == "Page.frameStoppedLoading" and p.get("frameId") == self.main_frame:
+            self.loading = False
+
+    def _readable(self, timeout):
+        """True when a frame is waiting on the stream within `timeout`."""
+        try:
+            return bool(select.select([self.ws.s], [], [], timeout)[0]) or bool(self.ws.buf)
+        except (OSError, ValueError):
+            return False
+
+    def listen(self, seconds):
+        """Take in the events of the next `seconds` (no round trip)."""
+        end = time.monotonic() + seconds
+        while True:
+            left = end - time.monotonic()
+            if left <= 0 or not self._readable(left):
+                return
+            self.ws.s.settimeout(5.0)
+            m = json.loads(self.ws.recv())
+            if "id" not in m:
+                self._event(m)
+
+    def wait_parsed(self, cap_s):
+        """Wait, listening, until the loading document is parsed, `cap_s`
+        at most. True when it is."""
+        end = time.monotonic() + cap_s
+        while self.loading and time.monotonic() < end:
+            self.listen(min(0.25, max(0.0, end - time.monotonic())))
+        return not self.loading
 
     def call(self, method, timeout=10.0, **params):
         self.n += 1
@@ -236,7 +287,9 @@ class Page:
         while True:
             m = json.loads(self.ws.recv())
             if m.get("id") != self.n:
-                continue  # an event; none are enabled, but be safe
+                if "id" not in m:
+                    self._event(m)
+                continue
             if "error" in m:
                 raise RuntimeError("%s: %s" % (method, m["error"].get("message", m["error"])))
             return m.get("result", {})
@@ -256,6 +309,8 @@ class Page:
             m = json.loads(self.ws.recv())
             if m.get("id") in ids:
                 got[m["id"]] = m
+            elif "id" not in m:
+                self._event(m)
         out = []
         for i, (method, _) in zip(ids, cmds):
             m = got[i]
@@ -324,6 +379,7 @@ def front_page(dev, current=None):
 # children then stay out). Boxes are CSS pixels of the viewport.
 READ_JS = r"""
 (function(cap){
+  const t0 = performance.now();
   const vw = innerWidth, vh = innerHeight;
   const out = [], seen = new Set(), used = [];
   const squash = s => (s || '').replace(/\s+/g, ' ').trim();
@@ -359,7 +415,8 @@ READ_JS = r"""
               l: r.left, t: r.top, w: r.width, h: r.height});
   }
   return {title: document.title, url: location.href, ready: document.readyState,
-          dpr: window.devicePixelRatio || 1, vw: vw, vh: vh, rows: out, more: out.length >= cap};
+          dpr: window.devicePixelRatio || 1, vw: vw, vh: vh, rows: out, more: out.length >= cap,
+          ms: Math.round(performance.now() - t0)};
 })"""
 
 # The element with these words (exact, case-insensitive, whitespace
@@ -587,21 +644,18 @@ def touch(page, x, y):
         return "click"
 
 
-def after_touch(page, url, idle_ms=1200, pause_s=0.2):
-    """What a touch led to, with one probe after a short pause: a page
-    loading (a new url, or a document not yet parsed) is waited out (see
-    settle); anything else is read at once, since what a touch changes
-    on a page is there within the pause. Returns the last probe."""
-    time.sleep(pause_s)
-    try:
-        probe = page.eval(SETTLE_JS, timeout=5.0) or {}
-    except Exception:
-        return {"ready": "?"}
-    if probe.get("vis") == "visible":
-        page.visible_at = time.monotonic()
-    if probe.get("ready") == "loading" or (url and probe.get("url") != url):
-        return settle(page, idle_ms, url=url, loading=True)
-    return probe
+def after_touch(page, url=None, idle_ms=1200, listen_s=0.25):
+    """What a touch led to, heard from the page's events (no round trip,
+    and no question to a page mid-navigation, which Chrome answers only
+    once the new page is up): a navigation is waited out until the new
+    document is parsed, LOAD_CAP_S at most (idle_ms when longer);
+    anything else is read right after the listen, since what a touch
+    changes on a page is there by then. Returns {"ready": ...}."""
+    page.listen(listen_s)
+    if page.loading:
+        parsed = page.wait_parsed(max(LOAD_CAP_S, idle_ms / 1000.0))
+        return {"ready": "complete" if parsed else "loading"}
+    return {"ready": "complete"}
 
 
 def find(page, label, top=0):
@@ -643,6 +697,7 @@ def tap(page, label, index=None, idle_ms=1200):
         return hit
     if hit.get("moved"):
         time.sleep(0.3)  # the scroll into view
+    page.loading = False
     how = touch(page, hit["x"], hit["y"])
     probe = after_touch(page, hit.get("url"), idle_ms)
     return {"found": True, "count": 1, "label": hit.get("label"), "how": how,
@@ -654,12 +709,14 @@ def navigate(page, url, idle_ms=1000):
     parsed and quiet (LOAD_CAP_S at most), read. Raises NotSent when the
     page can't be asked to load it."""
     try:
-        before = page.eval("location.href", timeout=5.0)
+        page.loading = True  # until the new document is parsed
         page.call("Page.navigate", 10.0, url=url)
     except Exception as e:
+        page.loading = False
         raise NotSent(str(e)[:120])
-    probe = settle(page, idle_ms, url=before if before != url else None, loading=True)
-    return {"screen": read(page), "ready": probe.get("ready")}
+    parsed = page.wait_parsed(max(LOAD_CAP_S, idle_ms / 1000.0))
+    time.sleep(0.2)  # the first paint of a parsed page
+    return {"screen": read(page), "ready": "complete" if parsed else "loading"}
 
 
 # The focused field's content selected, so inserted text replaces it.
@@ -681,12 +738,12 @@ def type_text(page, text, idle_ms=800):
     text inserted the way an IME commits it, a wait for the page, a
     read. Raises NotSent when no field has the focus."""
     try:
-        ok = page.eval(_js(SELECT_JS), timeout=5.0)
+        res = page.call_many([("Runtime.evaluate", {"expression": _js(SELECT_JS), "returnByValue": True}),
+                              ("Input.insertText", {"text": text})])
     except Exception as e:
         raise NotSent(str(e)[:120])
-    if not ok:
+    if not (res[0].get("result") or {}).get("value"):
         raise NotSent("no field has the focus on the page")
-    page.call("Input.insertText", 10.0, text=text)
     time.sleep(0.25)  # the field's own reaction (a list of suggestions)
     return {"screen": read(page), "ready": "complete"}
 
