@@ -4234,16 +4234,47 @@ class WebPathTests(OfflineTestCase):
         with mock.patch.object(mod, "phone_config", return_value={}), \
                 mock.patch.dict(sys.modules, {"uiautomator2": mock.Mock(), "uiautomator2.core": mock.Mock(AdbHTTPConnection=adb)}):
             self.assertEqual(ka2._open(SimpleNamespace(serial="s"), 9008).how, "adb")
-        # the proxy of a hosted assistant, as tunnel.sh reads it
-        with mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://user:pw@proxy.example:3128"}):
+        # the proxy of a hosted assistant, as tunnel.sh reads it: the
+        # CONNECT handshake tools/direct.py used, on a socket of its own
+        sent = []
+
+        class Sock:
+            def __init__(self):
+                self.pending = b"HTTP/1.1 200 Connection established\r\n\r\n"
+
+            def sendall(self, data):
+                sent.append(bytes(data))
+
+            def settimeout(self, t):
+                pass
+
+            def recv(self, n):
+                out, self.pending = self.pending[:n], self.pending[n:]
+                return out
+
+            def close(self):
+                pass
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://user:pw@proxy.example:3128"}), \
+                mock.patch.object(mod.socket, "create_connection", return_value=Sock()) as cc:
             self.assertEqual(mod.tailnet_proxy(), ("proxy.example", "user:pw"))
             conn = mod.direct_http("100.64.0.9", 9008, 5.0)
-            self.assertEqual((conn.host, conn.port, conn._tunnel_host, conn._tunnel_port),
-                             ("proxy.example", 3130, "100.64.0.9", 9008))
-        with mock.patch.dict(os.environ, {"HTTPS_PROXY": ""}):
-            self.assertIsNone(mod.tailnet_proxy())
-            conn = mod.direct_http("100.64.0.9", 9008, 5.0)
             self.assertEqual((conn.host, conn.port), ("100.64.0.9", 9008))
+            conn.connect()
+            self.assertEqual(cc.call_args[0][0], ("proxy.example", 3130))
+            self.assertTrue(sent[0].startswith(b"CONNECT 100.64.0.9:9008 HTTP/1.1\r\nHost: 100.64.0.9:9008\r\n"))
+            self.assertIn(b"Proxy-Authorization: Basic dXNlcjpwdw==\r\n", sent[0])
+            # a proxy that refuses
+            refused = Sock()
+            refused.pending = b"HTTP/1.1 403 Forbidden\r\n\r\n"
+            cc.return_value = refused
+            with self.assertRaises(ConnectionRefusedError):
+                mod.connect_direct("100.64.0.9", 9008, 5.0)
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": ""}), \
+                mock.patch.object(mod.socket, "create_connection", return_value=Sock()) as cc:
+            self.assertIsNone(mod.tailnet_proxy())
+            mod.direct_http("100.64.0.9", 9008, 5.0).connect()
+            self.assertEqual(cc.call_args[0][0], ("100.64.0.9", 9008))
+            self.assertEqual(sent[-1:], sent[-1:])  # no handshake on the tailnet itself
 
     def test_an_answered_command_proves_the_page_on_screen(self):
         cdp = _cdp()

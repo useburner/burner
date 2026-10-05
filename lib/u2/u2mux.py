@@ -19,6 +19,7 @@ with one RLock around the device.
 Protocol: one line command, first line of reply is "ok <nbytes>" or "err <msg>",
 followed by <nbytes> of payload for ok.
 """
+import http.client
 import json
 import os
 import re
@@ -151,21 +152,49 @@ def tailnet_proxy():
     return host.split(":")[0], auth
 
 
-def direct_http(ip, port, timeout):
-    """An HTTP connection to ip:port on the tailnet: direct, or a CONNECT
-    tunnel through the proxy (see tailnet_proxy). Not connected yet."""
+def connect_direct(ip, port, timeout):
+    """A socket to ip:port on the tailnet: direct, or through the HTTP
+    CONNECT proxy (see tailnet_proxy), with the handshake tools/direct.py
+    used (http.client's tunnel was closed by the proxy without a reply,
+    Oct 5). Raises OSError when the proxy or the phone refuses."""
     import base64
-    import http.client
-    proxy = tailnet_proxy()
-    if proxy is None:
-        return http.client.HTTPConnection(ip, port, timeout=timeout)
-    host, auth = proxy
-    conn = http.client.HTTPConnection(host, 3130, timeout=timeout)
-    headers = {}
-    if auth:
-        headers["Proxy-Authorization"] = "Basic " + base64.b64encode(auth.encode()).decode()
-    conn.set_tunnel(ip, port, headers=headers)
-    return conn
+    if tailnet_proxy() is None:
+        return socket.create_connection((ip, int(port)), timeout)
+    host, auth = tailnet_proxy()
+    s = socket.create_connection((host, 3130), timeout)
+    try:
+        req = "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n" % (ip, int(port), ip, int(port))
+        if auth:
+            req += "Proxy-Authorization: Basic %s\r\n" % base64.b64encode(auth.encode()).decode()
+        s.sendall((req + "\r\n").encode())
+        s.settimeout(timeout)
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = s.recv(4096)
+            if not chunk:
+                raise ConnectionError("the proxy closed the connection")
+            head += chunk
+        status = head.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+        if " 200" not in status:
+            raise ConnectionRefusedError("proxy: " + status[:80])
+    except BaseException:
+        s.close()
+        raise
+    return s
+
+
+class DirectHTTPConnection(http.client.HTTPConnection):
+    """An HTTP connection to the phone's UI server over the tailnet: its
+    socket comes from connect_direct."""
+
+    def connect(self):
+        self.sock = connect_direct(self.host, self.port, self.timeout)
+
+
+def direct_http(ip, port, timeout):
+    """An HTTP connection to ip:port on the tailnet (see connect_direct).
+    Not connected yet."""
+    return DirectHTTPConnection(ip, int(port), timeout=timeout)
 
 
 DIRECT_RETRY_S = 300.0  # a direct route that failed is tried again after this
