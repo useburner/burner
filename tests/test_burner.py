@@ -3945,6 +3945,24 @@ class EmptyScreenTests(OfflineTestCase):
                 if m == "dumpWindowHierarchy":
                     self.assertEqual(params, [False, 50])
 
+    def test_helper_click_text_falls_back_to_coordinates_when_the_selector_click_throws(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        dm = self._daemon(mod)
+        dm.d = _FakeServer([SAMPLE_XML], screen_on=True)
+        dm.d.jsonrpc.click = lambda sel: (_ for _ in ()).throw(RuntimeError("java.lang.NullPointerException"))
+        import types
+        fake = types.ModuleType("uiautomator2._selector")
+        fake.Selector = lambda **kw: kw
+        exc = types.ModuleType("uiautomator2.exceptions")
+        exc.UiObjectNotFoundError = type("UiObjectNotFoundError", (Exception,), {})
+        pkg = types.ModuleType("uiautomator2")
+        pkg._selector, pkg.exceptions = fake, exc
+        with mock.patch.dict(sys.modules, {"uiautomator2": pkg, "uiautomator2._selector": fake,
+                                           "uiautomator2.exceptions": exc}):
+            out = json.loads(dm.cmd_click_text("OK"))
+        self.assertEqual((out["x"], out["y"]), (250, 450))  # tier 3: the node's centre
+
     def test_helper_read_screen_asks_for_a_depth(self):
         mod = _u2mux()
         seen = []

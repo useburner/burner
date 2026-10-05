@@ -795,6 +795,12 @@ class U2Daemon:
                         ok = self.d.jsonrpc.click(Selector(textMatches=pat))
                 except UiObjectNotFoundError:
                     ok = False
+                except Exception as e:
+                    # The server looks the node up again for a selector
+                    # click and threw NullPointerException on a web node
+                    # (Chrome, Oct 4): tier 3 taps by coordinates instead.
+                    log("click_text selector failed (%s); tapping by coordinates" % err_text(e, 80))
+                    ok = False
                 if ok:
                     self.invalidate()
                     return json.dumps({"clicked": True, "text": arg}).encode()
