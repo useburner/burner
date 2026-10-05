@@ -4828,7 +4828,13 @@ def cmd_open(args):
             # added a tab every time (120 on a phone), and the new tab
             # took up to 17s to answer (Oct 5). The intent below stays
             # for no Chrome, or no page reachable once it is up.
-            if launch_and_check(CHROME_PKG) == CHROME_PKG:
+            # (the scrcpy helper starts it in milliseconds, as `start`
+            # does; adb's launch, which polls for it, when the helper is away)
+            try:
+                started = scrcpy_send("startapp " + CHROME_PKG)
+            except Exception:
+                started = False
+            if started or launch_and_check(CHROME_PKG) == CHROME_PKG:
                 u2_invalidate()
                 status, root, note = act_and_read({"open": args.url, "launched": True},
                                                   idle_ms=IDLE_LAUNCH_MS, rereads=1)

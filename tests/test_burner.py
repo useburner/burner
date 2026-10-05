@@ -3363,6 +3363,7 @@ class AmazonStatusTests(OfflineTestCase):
 
 class LaunchReadBudgetTests(OfflineTestCase):
     def test_open_rereads_a_thin_screen_once_only(self):
+        self.allow("scrcpy_send", return_value=False)  # Chrome started through the scrcpy helper: not here
         self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
         self.allow("u2_invalidate")
         calls = []
@@ -3621,6 +3622,7 @@ class OneRoundTripTests(OfflineTestCase):
         self.assertIn("no text field had the focus", out.getvalue())
 
     def test_launch_read_waits_for_the_window(self):
+        self.allow("scrcpy_send", return_value=False)  # Chrome started through the scrcpy helper: not here
         self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
         self.allow("u2_invalidate")
         calls = []
@@ -6882,6 +6884,7 @@ class CoordinateTapTests(OfflineTestCase):
     def test_a_cold_open_asks_the_page_straight_after_the_launch(self):
         # Chrome not in front: the helper can't open the link in a page,
         # the link is launched by intent, and the page is asked at once
+        self.allow("scrcpy_send", return_value=False)  # Chrome started through the scrcpy helper: not here
         page = _cdp().page_xml(WEB_SCREEN, 283, 2400)
         calls = []
 
@@ -7300,6 +7303,7 @@ class AirbnbRoundTests(OfflineTestCase):
         self.assertIn("web tap: touch on <a> at 164,458 laid over the words, scrolled into view", logged)
 
     def test_a_cold_open_tells_the_helper_the_link(self):
+        self.allow("scrcpy_send", return_value=False)  # Chrome started through the scrcpy helper: not here
         self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
         self.allow("u2_invalidate")
         calls = []
@@ -7411,6 +7415,7 @@ class AirbnbRoundTests(OfflineTestCase):
         self.assertIn("can't be listed", err.getvalue())
 
     def test_a_link_launched_carries_burner_s_own_tab_id(self):
+        self.allow("scrcpy_send", return_value=False)  # Chrome started through the scrcpy helper: not here
         adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
         self.allow("u2_invalidate")
         def u2(cmd, arg="", timeout=30):
@@ -7431,6 +7436,7 @@ class AirbnbRoundTests(OfflineTestCase):
         # a link launched by intent added a tab every time (120 on a phone)
         # and the new tab took up to 17s to answer, Oct 5: Chrome is brought
         # up as a tap on its icon does, and its tab loads the link
+        self.allow("scrcpy_send", return_value=True)  # Chrome started through the scrcpy helper
         self.allow("adb_or_ensure", return_value=SimpleNamespace(
             returncode=0, stdout="  mFocusedApp=ActivityRecord{1 u0 com.android.chrome/.Main t1}\n", stderr=""))
         self.allow("u2_invalidate")
