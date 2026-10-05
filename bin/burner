@@ -1465,6 +1465,40 @@ def system_prompt(nodes, w, h):
     return None
 
 
+def opaque_webview(nodes, w, h):
+    """The web view that fills the screen with nothing readable under it,
+    as {"name": its own words, "bounds"}, or None. An app's own web page
+    (a login page in a WebView: ESPN's, Oct 5) can keep its content from
+    the screen reader; then the rows say nothing of what a person sees,
+    and the way on is a picture and taps by --xy. Only when the rest of
+    the screen has no words either (an app with a readable page and a
+    web banner is not opaque). Pure."""
+    for n in nodes:
+        if "webview" not in (n.get("class") or "").lower():
+            continue
+        r = _bounds_rect(n.get("bounds"))
+        if not r or (r[2] - r[0]) * (r[3] - r[1]) < 0.5 * w * h:
+            continue
+        elem = n.get("elem")
+        inside = [k for k in nodes if elem is not None and elem in k.get("parents", ())]
+        if any(_row_words(k) for k in inside):
+            continue
+        others = [k for k in nodes if k is not n and k not in inside
+                  and k.get("package") == n.get("package") and _row_words(k)]
+        if others:
+            continue
+        return {"name": _row_words(n), "bounds": n.get("bounds")}
+    return None
+
+
+def opaque_line(opaque):
+    """The `opaque:` line of a printed screen."""
+    name = ' "%s"' % opaque["name"] if opaque.get("name") else ""
+    return ("opaque: a web view%s fills the screen with nothing readable (the app's own web "
+            "page): look at a picture (burner shot --out .), tap by --xy, and typed text goes "
+            "to the focused box" % name)
+
+
 def asked_line(asked):
     """The `asked:` line of a printed screen: the question, its options,
     and that the user decides."""
@@ -1503,6 +1537,9 @@ def print_screen(root, cap=SCREEN_CAP, note=""):
     asked = system_prompt(nodes, *screen_dims())
     if asked:
         print("  " + asked_line(asked))
+    opaque = opaque_webview(nodes, *screen_dims())
+    if opaque:
+        print("  " + opaque_line(opaque))
     shown, hidden = lines[:cap], lines[cap:]
     # Past the cap, keep what a next step needs most: text fields and the
     # focused row (a form's input and Send sit at the bottom).
@@ -2595,6 +2632,8 @@ def _wait_hint():
         asked = system_prompt(nodes, *screen_dims())
         if asked:
             return "the phone asks: {} (options: {})".format(asked["text"], " / ".join(asked["options"]))
+        if opaque_webview(nodes, *screen_dims()):
+            return "the screen is a web view with nothing readable (look at a picture: burner shot --out .)"
         return progress_hint(nodes)
     except Exception as e:
         return "the screen couldn't be read ({})".format(str(e)[:60])
@@ -3167,6 +3206,9 @@ def cmd_state(args):
         asked = system_prompt(nodes, *screen_dims())
         if asked:
             out["asked"] = asked
+        opaque = opaque_webview(nodes, *screen_dims())
+        if opaque:
+            out["opaque"] = opaque
         print(json.dumps(out))
         return 0
     print_screen(root)

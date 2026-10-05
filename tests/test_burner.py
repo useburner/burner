@@ -6583,6 +6583,41 @@ class PhoneAsksTests(OfflineTestCase):
         self.assertIn("asked: Allow Vinted to send you notifications? | options: Allow / Don't allow", out.getvalue())
         self.assertNotIn("didn't come to the front", err.getvalue())
 
+    def test_an_opaque_web_view_is_said(self):
+        # ESPN's login screen, Oct 5: a WebView with no rows under it, and
+        # nothing else of the app readable (the status bar aside)
+        opaque = """<hierarchy rotation="0">
+  <node text="" class="android.widget.FrameLayout" package="com.espn.score_center" bounds="[0,0][1080,2400]" clickable="false" enabled="true">
+    <node text="" class="android.widget.FrameLayout" package="com.espn.score_center" bounds="[0,0][1080,2337]" clickable="false" enabled="true">
+      <node text="" content-desc="ONEID UI MOBILE" class="android.webkit.WebView" package="com.espn.score_center" bounds="[0,0][1080,2337]" clickable="false" enabled="true"/>
+      <node text="" class="android.widget.ImageView" package="com.espn.score_center" bounds="[0,0][1080,2337]" clickable="false" enabled="true"/>
+    </node>
+  </node>
+  <node text="" class="android.widget.FrameLayout" package="com.android.systemui" bounds="[0,0][1080,136]" clickable="false" enabled="true">
+    <node text="1:44" class="android.widget.TextView" package="com.android.systemui" bounds="[47,39][143,97]" clickable="false" enabled="true"/>
+  </node>
+</hierarchy>"""
+        root = ET.fromstring(opaque)
+        pc._update_screen_from_dump(root)
+        nodes = pc.walk(root)
+        self.assertEqual(pc.opaque_webview(nodes, 1080, 2400)["name"], "ONEID UI MOBILE")
+        with self.cap() as (out, err):
+            pc.print_screen(root)
+        self.assertIn('  opaque: a web view "ONEID UI MOBILE" fills the screen with nothing readable', out.getvalue())
+        self.assertIn("burner shot --out .", out.getvalue())
+        # a web view with rows under it, or beside readable rows of the app, is not opaque
+        self.assertIsNone(pc.opaque_webview(pc.walk(ET.fromstring(CHROME_XML)), 1080, 2400))
+        readable = opaque.replace('<node text="" class="android.widget.ImageView"',
+                                  '<node text="Log in with Disney" class="android.widget.TextView"')
+        self.assertIsNone(pc.opaque_webview(pc.walk(ET.fromstring(readable)), 1080, 2400))
+        self.assertIsNone(pc.opaque_webview(pc.walk(ET.fromstring(SAMPLE_XML)), 1080, 2400))
+        # --json state carries it, and a wait's progress line names it
+        self.allow("ui_dump", return_value=ET.fromstring(opaque))
+        with self.cap() as (out, err):
+            pc.cmd_state(self.parse(["state", "--json"]))
+        self.assertEqual(json.loads(out.getvalue())["opaque"]["name"], "ONEID UI MOBILE")
+        self.assertIn("web view with nothing readable", pc._wait_hint())
+
     def test_the_helper_hands_out_its_newest_read_without_a_round_trip(self):
         mod = _u2mux()
         EmptyScreenTests.no_sleep(self, mod)

@@ -69,6 +69,11 @@ Every step you take costs a round trip, so the fewer steps, the faster.
    choose: tell the user what the app asks for and the options as printed,
    wait for their answer, tap it (`burner tap "Only this time"`), then go on
    with the task (a paused chain prints the command).
+11. **An `opaque:` line means the screen can't be read as rows:** an app's
+   own web page (a login page inside the app) hides its words from the
+   screen reader. Don't wait for words that will never come: take a picture
+   (`burner shot --out .`, in your own folder, and look at it), tap by
+   `--xy`, and `burner type` goes to the focused box.
 
 ## Common requests
 
