@@ -23,7 +23,9 @@ import json
 import os
 import re
 import select
+import socket
 import struct
+import threading
 import time
 from xml.sax.saxutils import quoteattr
 
@@ -39,6 +41,13 @@ class NotDone(RuntimeError):
 
 class NotSent(RuntimeError):
     """A tap that failed before anything touched the page."""
+
+
+class NothingSent(ConnectionError):
+    """The page took none of the commands: the stream failed before the
+    first went out, or Chrome refused the session. The caller may act
+    another way. A failure after that is not this: the page may have
+    acted on what it got."""
 
 
 def is_chrome(pkg):
@@ -96,16 +105,16 @@ class WebSocket:
         while b"\r\n\r\n" not in resp:
             chunk = self.s.recv(4096)
             if not chunk:
-                raise ConnectionError("websocket handshake: the stream closed")
+                raise NothingSent("websocket handshake: the stream closed")
             resp += chunk
         head, self.buf = resp.split(b"\r\n\r\n", 1)
         status = head.split(b"\r\n", 1)[0].decode("utf-8", "replace")
         if " 101 " not in status:
-            raise ConnectionError("websocket handshake refused: %s" % status[:80])
+            raise NothingSent("websocket handshake refused: %s" % status[:80])
         accept = base64.b64encode(hashlib.sha1(
             (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
         if accept not in head:
-            raise ConnectionError("websocket handshake: wrong accept key")
+            raise NothingSent("websocket handshake: wrong accept key")
 
     def _read(self, n):
         if self._handshake_key:
@@ -242,10 +251,13 @@ class Page:
     at the start): `loading` is True from the main frame's start of a
     load until its document is parsed."""
 
+    lock = threading.RLock()  # a page built without __init__ (the tests) has this one
+
     def __init__(self, dev, target):
         self.target = target
         self.ws = WebSocket(open_stream(dev), "/devtools/page/" + target)
         self.n = 0
+        self.lock = threading.RLock()  # one thread on the stream (a wait polls while a tap acts)
         self.visible_at = 0.0  # when a probe last said the page was visible
         self.loading = False
         self.main_frame = None
@@ -289,14 +301,15 @@ class Page:
     def listen(self, seconds):
         """Take in the events of the next `seconds` (no round trip)."""
         end = time.monotonic() + seconds
-        while True:
-            left = end - time.monotonic()
-            if left <= 0 or not self._readable(left):
-                return
-            self.ws.s.settimeout(5.0)
-            m = json.loads(self.ws.recv())
-            if "id" not in m:
-                self._event(m)
+        with self.lock:
+            while True:
+                left = end - time.monotonic()
+                if left <= 0 or not self._readable(left):
+                    return
+                self.ws.s.settimeout(5.0)
+                m = json.loads(self.ws.recv())
+                if "id" not in m:
+                    self._event(m)
 
     def wait_parsed(self, cap_s):
         """Wait, listening, until the loading document is parsed, `cap_s`
@@ -314,37 +327,38 @@ class Page:
         return timeout
 
     def call(self, method, timeout=10.0, **params):
-        self.n += 1
-        self.ws.s.settimeout(self._bound(timeout))
-        self.ws.send(json.dumps({"id": self.n, "method": method, "params": params}))
-        while True:
-            m = json.loads(self.ws.recv())
-            if m.get("id") != self.n:
-                if "id" not in m:
-                    self._event(m)
-                continue
-            if "error" in m:
-                raise RuntimeError("%s: %s" % (method, m["error"].get("message", m["error"])))
-            return m.get("result", {})
+        return self.call_many([(method, params)], timeout)[0]
 
     def call_many(self, cmds, timeout=10.0, raise_errors=True):
         """Several commands sent at once, one round trip: their results
         in order. cmds: [(method, params), ...]. Raises on the first
         command that failed, after all have been answered; with
-        raise_errors False, a failed command's result is its RuntimeError."""
+        raise_errors False, a failed command's result is its RuntimeError.
+        Raises NothingSent when the page took none of them (the stream
+        failed before the first went out, or Chrome refused the session);
+        any other failure came after a command went out, and the page may
+        have acted on it."""
         ids = []
-        self.ws.s.settimeout(self._bound(timeout))
-        for method, params in cmds:
-            self.n += 1
-            ids.append(self.n)
-            self.ws.send(json.dumps({"id": self.n, "method": method, "params": params}))
-        got = {}
-        while len(got) < len(ids):
-            m = json.loads(self.ws.recv())
-            if m.get("id") in ids:
-                got[m["id"]] = m
-            elif "id" not in m:
-                self._event(m)
+        with self.lock:
+            self.ws.s.settimeout(self._bound(timeout))
+            for method, params in cmds:
+                self.n += 1
+                ids.append(self.n)
+                try:
+                    self.ws.send(json.dumps({"id": self.n, "method": method, "params": params}))
+                except NothingSent:
+                    raise
+                except Exception as e:
+                    if len(ids) == 1:
+                        raise NothingSent(str(e)[:120]) from e
+                    raise
+            got = {}
+            while len(got) < len(ids):
+                m = json.loads(self.ws.recv())
+                if m.get("id") in ids:
+                    got[m["id"]] = m
+                elif "id" not in m:
+                    self._event(m)
         out = []
         for i, (method, _) in zip(ids, cmds):
             m = got[i]
@@ -427,7 +441,7 @@ def front_page(dev, current=None):
 READ_JS = r"""
 (function(cap){
   const t0 = performance.now();
-  const vw = innerWidth, vh = innerHeight;
+  const vw = innerWidth, vh = innerHeight, vv = window.visualViewport;
   const out = [], seen = new Set(), used = [];
   const squash = s => (s || '').replace(/\s+/g, ' ').trim();
   const own = el => { let t = ''; for (const c of el.childNodes) if (c.nodeType === 3) t += c.nodeValue; return squash(t); };
@@ -482,13 +496,19 @@ READ_JS = r"""
                 l: r.left, t: r.top + r.height * (i + 1), w: r.width, h: r.height});
     }
   }
+  // the visual viewport: its scale (a page laid out wider than the screen
+  // is drawn scaled down; a pinch zooms in), its corner in the layout and
+  // its size, which say where a row is on the screen
   return {title: document.title, url: location.href, ready: document.readyState, vis: document.visibilityState,
           dpr: window.devicePixelRatio || 1, vw: vw, vh: vh, rows: out, more: out.length >= cap,
+          vs: vv ? vv.scale : 1, vx: vv ? vv.offsetLeft : 0, vy: vv ? vv.offsetTop : 0,
+          vvw: vv ? vv.width : vw, vvh: vv ? vv.height : vh,
           ms: Math.round(performance.now() - t0)};
 })"""
 
 # The element with these words (exact, case-insensitive, whitespace
-# squashed; "A || B" tries each; then as a part of longer words), scrolled
+# squashed; "A || B" tries each; then as a part of longer words, unless
+# `exact`), scrolled
 # into view when it is partly out, and its centre in CSS pixels of the
 # viewport. Candidates are the elements with words of their own, with a
 # label attribute, or links and buttons with short text (by textContent:
@@ -499,7 +519,7 @@ READ_JS = r"""
 # it is scrolled into view). Several controls: their count and words,
 # no choice, unless `index` picks one.
 FIND_JS = r"""
-(function(label, index, query, fill){
+(function(label, index, query, fill, exact){
   const squash = s => (s || '').replace(/\s+/g, ' ').trim();
   const own = el => { let t = ''; for (const c of el.childNodes) if (c.nodeType === 3) t += c.nodeValue; return squash(t); };
   const attr = el => squash(el.getAttribute('aria-label') || el.getAttribute('alt') || el.getAttribute('title') || el.getAttribute('placeholder') || (el.tagName === 'INPUT' ? el.value : ''));
@@ -521,10 +541,14 @@ FIND_JS = r"""
   // (a search's highlight of the typed words) is not a "Pixel 7"
   const INLINE = new Set(['B', 'STRONG', 'I', 'EM', 'SPAN', 'BDI', 'BDO', 'U', 'S', 'SMALL', 'SUB', 'SUP', 'MARK', 'ABBR', 'CODE', 'TIME', 'CITE', 'Q', 'VAR', 'KBD', 'SAMP', 'FONT', 'BR', 'WBR']);
   const inlinePart = el => INLINE.has(el.tagName) && !el.matches(ACTIVE) && !el.hasAttribute('aria-label') && !el.hasAttribute('title');
-  const runOf = el => { while (el.parentElement && el.parentElement !== document.body && inlinePart(el)) el = el.parentElement; return el; };
-  const runText = el => { const kids = el.getElementsByTagName('*'); if (!kids.length || kids.length > 40) return own(el);
-    for (const k of kids) if (!inlinePart(k)) return own(el);
-    return squash(el.textContent); };
+  // a run: an element whose descendants (40 at most) are all inline parts
+  const isRun = el => { const kids = el.getElementsByTagName('*'); if (!kids.length || kids.length > 40) return false;
+    for (const k of kids) if (!inlinePart(k)) return false; return true; };
+  // the run an inline part belongs to: climbed only into a parent that is
+  // a run itself (a span beside a block stands on its own: "Wi-Fi" beside
+  // "Connected" was found nowhere, and its words in a link instead)
+  const runOf = el => { while (el.parentElement && el.parentElement !== document.body && inlinePart(el) && isRun(el.parentElement)) el = el.parentElement; return el; };
+  const runText = el => isRun(el) ? squash(el.textContent) : own(el);
   const cands = new Set();
   const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   for (let t = tw.nextNode(); t; t = tw.nextNode()) { const p = t.parentElement; if (p && squash(t.nodeValue) && !skip(p) && p.tagName !== 'OPTION') cands.add(runOf(p)); }
@@ -544,7 +568,7 @@ FIND_JS = r"""
     for (const el of cands) if (visible(el) && names(el).some(n => test(n, want))) h.push(el);
     if (h.length) { used = alt; return h; } } return []; };
   let hits = find((n, w) => n === w);
-  if (!hits.length) hits = find((n, w) => n.includes(w));
+  if (!hits.length && !exact) hits = find((n, w) => n.includes(w));
   if (!hits.length) return {found: false};
   // the words typed into a field are not its label when something else
   // carries them (a search box holding "Pixel 7" beside that suggestion)
@@ -608,8 +632,10 @@ FIND_JS = r"""
     return {found: true, count: 1, used: used, label: (names(el)[0] || '').slice(0, 60), focused: true, url: location.href};
   }
   if (query) {
+    const vq = window.visualViewport;
     return {found: true, count: controls.length, used: used, label: (names(el)[0] || '').slice(0, 60),
             l: r.left, t: r.top, w: r.width, h: r.height, inview: inView(r), dpr: window.devicePixelRatio || 1,
+            vs: vq ? vq.scale : 1, vx: vq ? vq.offsetLeft : 0, vy: vq ? vq.offsetTop : 0,
             enabled: !(el.disabled || el.getAttribute('aria-disabled') === 'true')};
   }
   if (!inView(r) || r.top < 0 || r.bottom > vh) { el.scrollIntoView({block: 'center', inline: 'nearest'}); r = box(el); moved = true; }
@@ -822,17 +848,22 @@ def page_xml(screen, top, screen_h=0, pkg="com.android.chrome"):
     WebView placed `top` pixels down the screen (where the last real
     read had it), the address bar above it and the navigation bar below
     (to `screen_h`), so that rows print, plans and taps work unchanged.
-    Boxes are device pixels: CSS pixels times the pixel ratio. Pure."""
-    dpr = float(screen.get("dpr") or 1)
-    vw, vh = float(screen.get("vw") or 0), float(screen.get("vh") or 0)
-    W, H = int(round(vw * dpr)), int(round(vh * dpr))
+    Boxes are device pixels: CSS pixels from the visual viewport's
+    corner, times the page's zoom and the pixel ratio (a page laid out
+    wider than the screen, no viewport meta, is drawn scaled down: its
+    rows printed off the screen's edge, found in review Oct 5). Pure."""
+    k = float(screen.get("vs") or 1) * float(screen.get("dpr") or 1)
+    vx, vy = float(screen.get("vx") or 0), float(screen.get("vy") or 0)
+    vw = float(screen.get("vvw") or screen.get("vw") or 0)
+    vh = float(screen.get("vvh") or screen.get("vh") or 0)
+    W, H = int(round(vw * k)), int(round(vh * k))
     top = int(top or 0)
     rows = []
     for i, r in enumerate(screen.get("rows") or []):
-        x1 = max(0, int(round(r.get("l", 0) * dpr)))
-        y1 = max(top, int(round(top + r.get("t", 0) * dpr)))
-        x2 = min(W, int(round((r.get("l", 0) + r.get("w", 0)) * dpr)))
-        y2 = min(top + H, int(round(top + (r.get("t", 0) + r.get("h", 0)) * dpr)))
+        x1 = max(0, int(round((r.get("l", 0) - vx) * k)))
+        y1 = max(top, int(round(top + (r.get("t", 0) - vy) * k)))
+        x2 = min(W, int(round((r.get("l", 0) + r.get("w", 0) - vx) * k)))
+        y2 = min(top + H, int(round(top + (r.get("t", 0) + r.get("h", 0) - vy) * k)))
         if x2 <= x1 or y2 <= y1:
             continue
         kind = r.get("kind") or "text"
@@ -955,11 +986,11 @@ def _target_fill(page, label, text):
     return res.get("target") or {}, res.get("filled") or {}
 
 
-def find_read(page, label, top=0):
+def find_read(page, label, top=0, exact=False):
     """find() with the read in the same round trip: (the find's answer,
     the screen). A wait's poll that lands has its read at once."""
-    res = page.call_many([_evaluate(_js(FIND_JS, label, None, True)), _evaluate(_js(READ_JS, 600))],
-                         raise_errors=False)
+    res = page.call_many([_evaluate(_js(FIND_JS, label, None, True, False, exact)),
+                          _evaluate(_js(READ_JS, 600))], raise_errors=False)
     try:
         screen = _value(res[1]) or None
     except RuntimeError:
@@ -967,23 +998,25 @@ def find_read(page, label, top=0):
     return _found(_value(res[0]) or {}, label, top), screen
 
 
-def find(page, label, top=0):
-    """Whether the page has an element with these words (see FIND_JS),
-    anywhere in the document: {"found": False}, or {"found": True,
-    "text", "bounds" (device pixels, `top` down the screen), "enabled",
-    "inview", "count"}. A wait's probe: cheaper than a read, and it sees
-    below the fold, as the screen reader's tree did."""
-    return _found(page.eval(_js(FIND_JS, label, None, True)) or {}, label, top)
+def find(page, label, top=0, exact=False):
+    """Whether the page has an element with these words (see FIND_JS;
+    the whole words only with `exact`), anywhere in the document:
+    {"found": False}, or {"found": True, "text", "bounds" (device
+    pixels, `top` down the screen), "enabled", "inview", "count"}. A
+    wait's probe: cheaper than a read, and it sees below the fold, as
+    the screen reader's tree did."""
+    return _found(page.eval(_js(FIND_JS, label, None, True, False, exact)) or {}, label, top)
 
 
 def _found(hit, label, top):
     if not hit.get("found"):
         return {"found": False}
-    dpr = float(hit.get("dpr") or 1)
-    x1 = int(round(hit.get("l", 0) * dpr))
-    y1 = int(round(top + hit.get("t", 0) * dpr))
-    x2 = int(round((hit.get("l", 0) + hit.get("w", 0)) * dpr))
-    y2 = int(round(top + (hit.get("t", 0) + hit.get("h", 0)) * dpr))
+    k = float(hit.get("vs") or 1) * float(hit.get("dpr") or 1)  # the page's zoom, the pixel ratio
+    vx, vy = float(hit.get("vx") or 0), float(hit.get("vy") or 0)
+    x1 = int(round((hit.get("l", 0) - vx) * k))
+    y1 = int(round(top + (hit.get("t", 0) - vy) * k))
+    x2 = int(round((hit.get("l", 0) + hit.get("w", 0) - vx) * k))
+    y2 = int(round(top + (hit.get("t", 0) + hit.get("h", 0) - vy) * k))
     return {"found": True, "text": hit.get("label") or label, "desc": "",
             "bounds": "[%d,%d][%d,%d]" % (x1, y1, x2, y2), "enabled": bool(hit.get("enabled", True)),
             "inview": bool(hit.get("inview")), "count": hit.get("count", 1)}
@@ -1059,13 +1092,17 @@ def touch_hit(page, hit, then=()):
 def navigate(page, url, idle_ms=1000):
     """Load `url` in this page (Chrome's current tab), wait for it to be
     parsed and quiet (LOAD_CAP_S at most), read. Raises NotSent when the
-    page can't be asked to load it."""
+    page can't be asked to load it (nothing was sent: the caller opens
+    the link its own way; sent twice, a one-time link is used up)."""
     try:
         page.loading = True  # until the new document is parsed
         page.call("Page.navigate", 10.0, url=url)
-    except Exception as e:
+    except NothingSent as e:
         page.loading = False
         raise NotSent(str(e)[:120])
+    except (socket.timeout, TimeoutError):
+        pass  # asked; Chrome answers once the load is committed, which a slow
+              # server delays past the wait: the load is under way
     parsed = page.wait_parsed(max(LOAD_CAP_S, idle_ms / 1000.0))
     time.sleep(0.2)  # the first paint of a parsed page
     return {"screen": read(page), "ready": "complete" if parsed else "loading"}
@@ -1074,11 +1111,16 @@ def navigate(page, url, idle_ms=1000):
 # The focused field's content selected, so inserted text replaces it.
 SELECT_JS = r"""
 (function(text){
+  // the element with the focus, through shadow roots (a custom element's
+  // box inside its shadow tree: document.activeElement names the host);
+  // any editable one keeps it, so the text goes where a person's would
   let el = document.activeElement, only = false;
-  if (!el || el === document.body || !el.matches('input,textarea,select,[contenteditable=true],[role=textbox],[role=searchbox],[role=combobox]')) {
+  while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+  const editable = e => !!e && e !== document.body && (e.isContentEditable || e.matches('input,textarea,select,[role=textbox],[role=searchbox],[role=combobox]'));
+  if (!editable(el)) {
     // nothing has the focus: the one text field in view takes the text,
     // as a person would tap the only box; none or several: no guess
-    const FIELDS = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=image]):not([type=file]):not([type=checkbox]):not([type=radio]),textarea,[contenteditable=true],[role=textbox],[role=searchbox],[role=combobox]';
+    const FIELDS = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=image]):not([type=file]):not([type=checkbox]):not([type=radio]),textarea,[contenteditable]:not([contenteditable=false]),[role=textbox],[role=searchbox],[role=combobox]';
     const vh = innerHeight, vw = innerWidth;
     const fields = Array.from(document.querySelectorAll(FIELDS)).filter(f => { const r = f.getBoundingClientRect();
       return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < vh && r.right > 0 && r.left < vw
@@ -1173,9 +1215,11 @@ def fill(page, label, text, index=None):
     try:
         res = page.call_many([_evaluate(_js(FIND_JS, label, index, False, True)),
                               _evaluate(_js(FILL_JS, text))], raise_errors=False)
-        hit = _value(res[0])
-    except Exception as e:
+    except NothingSent as e:
         raise NotSent(str(e)[:120])
+    # from here on a failure came after the fill went out (it clicks a
+    # checkbox, picks an option): "failed after sending", not "not sent"
+    hit = _value(res[0])
     if not hit or not hit.get("found"):
         return {"found": False, "screen": _read_untouched(page)}
     if hit.get("count", 1) != 1:
@@ -1222,14 +1266,15 @@ def type_text(page, text, idle_ms=800):
     """Type `text` into the page's focused field, replacing its content
     (as the screen reader's set_text does): the content selected, the
     text inserted the way an IME commits it, and the read a moment
-    later, in one round trip. Raises NotSent when no field has the focus
-    (the insert then had nowhere to go)."""
+    later, in one round trip. Raises NotSent when the page couldn't be
+    asked, or no field has the focus (the insert then had nowhere to
+    go); a failure after the insert went out is not that."""
     try:
         res = page.call_many([_evaluate(_js(SELECT_JS, text)), ("Input.insertText", {"text": text}),
                               _evaluate(_later(_js(READ_JS, 600), 250))], raise_errors=False)
-        sel = _value(res[0]) or {}
-    except Exception as e:
+    except NothingSent as e:
         raise NotSent(str(e)[:120])
+    sel = _value(res[0]) or {}
     if not sel.get("ok"):
         n = sel.get("fields", 0)
         raise NotSent("no field has the focus on the page" + (

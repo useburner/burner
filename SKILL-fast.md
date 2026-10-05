@@ -58,7 +58,7 @@ Every step you take costs a round trip, so the fewer steps, the faster.
 | The user says | Do this |
 |---|---|
 | "What's on my burner?" / "Take a screenshot of my burner" | The screen right now: `burner shot --out .` and send the image. |
-| "Use Tinder to…" (any app or service by name) | `burner apps tinder` finds its package, then `burner start <package>`: the launch prints the first screen. If the app isn't installed or stops you at a sign-in wall, read the site in the phone's browser instead: `burner open "https://…" com.android.chrome` (read-only, and tell the user). |
+| "Use Tinder to…" (any app or service by name) | `burner apps tinder` finds its package, then `burner start <package>`: the launch prints the screen it opens on (`--fresh` for its first screen). If the app isn't installed or stops you at a sign-in wall, read the site in the phone's browser instead: `burner open "https://…" com.android.chrome` (read-only, and tell the user). |
 | "Install Snapchat" (any free app) | `PLAY_PACKAGE=com.snapchat.android burner recipe play-install` with the package (a Play Store link ends in `?id=<package>`). Name only: `APP_QUERY=Vinted burner recipe play-search`, pick the right result (`burner tap "Vinted" --index 0`), then `burner recipe play-install-current`. The recipes open the store themselves; a listing that says Open or Installed means it's already there. Never buy an app. |
 | "Turn on Bluetooth" / a phone setting | `burner settings bluetooth` opens that page in one call (`burner settings` lists the pages: wifi, display, sound, battery, apps, location, `app <package>`...). Switch rows show `(on)` or `(off)`; tap the row to flip it. |
 | "Check my burner" / battery / "is it on?" | `burner status`. |
@@ -112,8 +112,8 @@ Act (each prints the screen it ends on)
   burner type "text"                type into the focused field (--field "Hint", --clear)
   burner press BACK|HOME|ENTER      press a key (--repeat N)
   burner scroll [down|up|left|right|top|bottom]   scroll the open app (--times N, --to "Text")
-  burner wait "Text"                wait for text (--timeout 30, "A || B" for either, --absent to wait for it to go)
-  burner start <package>            open an app on its first screen
+  burner wait "Text"                wait for text (--timeout 30, "A || B" for either, --absent to wait for it to go, --exact for the whole label only)
+  burner start <package>            open an app (--fresh: on its first screen)
   burner settings [page]            a Settings page by name: bluetooth, wifi, display, battery, apps, app <package>...
   burner open <url> [package]       open a link, in one app if a package is given
   burner dismiss                    close pop-ups: Not now, Skip, Don't allow, Got it, Close

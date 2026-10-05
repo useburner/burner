@@ -770,30 +770,86 @@ def contains(outer, inner):
             and outer[2] >= inner[2] and outer[3] >= inner[3])
 
 
-def row_over(nodes, control, center):
-    """The row drawn over `center`, the tap point of `control` (its rows),
-    or None: a row with words of its own, not one of the control's rows,
-    whose rectangle holds the point but neither holds the whole control
-    (a card described with its game's names holds its own Box Score link
-    and is no cover) nor sits inside it (a button's own words). For a
-    control on a web page only: there, document order says nothing about
-    what is on top, and a sticky bar sits over the content it precedes
-    (espn.com, Oct 4: the tap meant for Box Score opened Standings). On a
-    native screen later is on top, and the CLI's own check applies. Pure."""
-    if not control[0].get("web"):
-        return None
+OVERLAY_CLASS_HINTS = ("dialog", "bottomsheet", "popup", "dropdown", "spinner", "menu")
+
+
+def takes_tap(n, target, size):
+    """True when `n`, drawn over the tap point of `target` and after it,
+    would take the tap (the CLI's own rule, so a tap by words refuses
+    what a planned tap refuses): a dialog, sheet, popup or menu by its
+    class; a row with words of its own, unless they are the target's
+    (the same control drawn twice); or a big clickable unlabelled scrim,
+    two fifths of the screen (`size`, (w, h)) or more. Most covers are
+    harmless (an unlabelled button drawn over its words, a Compose
+    app's views) and pass. Pure."""
+    if any(k in n.get("cls", "") for k in OVERLAY_CLASS_HINTS):
+        return True
+    words = (n["text"] or n["desc"]).strip().lower()
+    if words:
+        return words != (target["text"] or target["desc"]).strip().lower()
+    if not n["clickable"] or not size:
+        return False
+    x1, y1, x2, y2 = n["rect"]
+    return (x2 - x1) * (y2 - y1) >= 0.4 * size[0] * size[1]
+
+
+def descends(nodes, i, ids):
+    """True when nodes[i] is inside one of the nodes whose id() is in
+    `ids` (see iter_nodes: parent). Pure."""
+    p = nodes[i].get("parent")
+    while p is not None:
+        if id(nodes[p]) in ids:
+            return True
+        p = nodes[p].get("parent")
+    return False
+
+
+def screen_size(nodes):
+    """(w, h) from a read's nodes: the far corner of those touching the
+    left or top edge (see screen_of), or None when none does. Pure."""
+    w = h = 0
+    for n in nodes:
+        x1, y1, x2, y2 = n["rect"]
+        if x1 == 0 or y1 == 0:
+            w, h = max(w, x2), max(h, y2)
+    return (w, h) if w >= 300 and h >= 300 else None
+
+
+def row_over(nodes, control, center, size=None):
+    """What is drawn over `center`, the tap point of `control` (its rows),
+    or None. On a web page document order says nothing about what is on
+    top, and a sticky bar sits over the content it precedes (espn.com,
+    Oct 4: the tap meant for Box Score opened Standings): there a row of
+    the page with words of its own counts, not one of the control's
+    rows, whose rectangle holds the point but neither holds the whole
+    control (a card described with its game's names holds its own Box
+    Score link and is no cover) nor sits inside it (a button's own
+    words). Anything native drawn after the control (later is on top; a
+    dialog is a later window) counts when it would take the tap (see
+    takes_tap): a dialog's button over a row of the app behind it, or
+    over a link in a WebView (a tap by words pressed the dialog's button
+    where the CLI's planned tap refused, found in review Oct 5). The
+    control's own parts don't count. Pure."""
     cx, cy = center
     whole = union_rect(control)
-    for n in nodes:
-        if any(n is c for c in control) or not (n["text"] or n["desc"]):
+    web = bool(control[0].get("web"))
+    ids = {id(c) for c in control}
+    after, cover = False, None
+    for i, n in enumerate(nodes):
+        if id(n) in ids:
+            after = True
             continue
         x1, y1, x2, y2 = n["rect"]
         if not (x1 <= cx <= x2 and y1 <= cy <= y2):
             continue
-        if contains(n["rect"], whole) or contains(whole, n["rect"]):
+        if n.get("web"):
+            if (web and (n["text"] or n["desc"])
+                    and not (contains(n["rect"], whole) or contains(whole, n["rect"]))):
+                return n
             continue
-        return n
-    return None
+        if after and not descends(nodes, i, ids) and takes_tap(n, control[0], size):
+            cover = n  # the last one drawn is the one on top
+    return cover
 
 
 def label_target(xml, label):
@@ -852,7 +908,7 @@ def label_node(xml, label):
         if any(cut_off(n) for n in controls[0]):
             raise RuntimeError("%r is cut off at the screen's edge" % alt)
         center = tuple(controls[0][0]["center"])
-        over = row_over(nodes, controls[0], center)
+        over = row_over(nodes, controls[0], center, screen_size(nodes))
         if over is not None:
             raise RuntimeError("%r is under %r" % (alt, (over["text"] or over["desc"])[:40]))
         return controls[0][0], alt
@@ -893,19 +949,18 @@ def act_calls(spec):
     if calls:
         if not sleeps_the_screen(spec):
             calls.insert(0, ("wakeUp", []))
-        if "tap_selector" in spec:
+        if "tap_selector" not in spec:
             # a tap by words is acknowledged by the UI before the phone
             # answers it (the click waits for the first event it causes),
-            # so no read stands in for the pause; a chained one ends here:
-            # the next step finds its control by words when its turn comes
-            if spec.get("quiet"):
-                return calls
-        else:
+            # so no read stands in for the pause there
             calls.append(("dumpWindowHierarchy", [False, DUMP_DEPTH]))
     calls.append(("waitForIdle", [int(spec.get("idle", 2000))]))
-    if not spec.get("quiet"):
-        # a chained step wants no screen back: the next step reads afresh
-        calls.append(("dumpWindowHierarchy", [False, DUMP_DEPTH]))
+    # the read that is returned; a chained (quiet) step takes it too, on
+    # the phone's time alone, as the newest read known: its next step
+    # finds its control by words on the screen as it is after this one
+    # (a calculator's display reads "1" once the 1 key is tapped; on the
+    # read from before, the one "1" was the key, found in review Oct 5)
+    calls.append(("dumpWindowHierarchy", [False, DUMP_DEPTH]))
     return calls
 
 
@@ -1013,6 +1068,8 @@ class U2Daemon:
                 self._remember(xml)
                 self._front_cache = (xml, screen_of(xml))
                 chrome_in_front = _cdp().is_chrome((self._front_cache[1] or (0, 0, ""))[2])
+                if not chrome_in_front:
+                    self._front_look = xml  # a read of what is in front, for _dump
             if not chrome_in_front or not _cdp().visible(current, _cdp().PROBE_S):
                 current.close()
                 self._web = current = None
@@ -1033,18 +1090,33 @@ class U2Daemon:
 
     def _page_xml(self, screen):
         """A page read as a screen read (cdp.page_xml), placed under the
-        newest read's WebView and above its navigation bar. A read that
-        says the document is hidden (a tap opened another tab) ends the
-        page's proof of being on screen: the next command asks."""
+        newest read's WebView and above its navigation bar; None for a
+        read that says the document is hidden (a tap opened another tab
+        or another app, a key went Home): that ends the page's proof of
+        being on screen, and the screen reader says what is in front
+        (the page's rows printed as the screen while the phone showed
+        the home screen, found in review Oct 5)."""
         page = getattr(self, "_web", None)
         if page is not None and screen.get("vis") == "visible":
             page.visible_at = _time.monotonic()  # the proof it is on screen
-        elif page is not None and screen.get("vis") == "hidden":
-            page.visible_at = 0.0
-            log("the page says it is hidden now; the next command checks what is in front")
+        elif screen.get("vis") == "hidden":
+            if page is not None:
+                page.visible_at = 0.0
+            log("the page says it is hidden now; the screen reader says what is in front")
+            return None
         last = getattr(self, "_last_xml", "")
         info = screen_of(last) if last else None
         return _cdp().page_xml(screen, webview_top(last), info[1] if info else 0)
+
+    def _after_page(self, screen):
+        """The screen after an action on the page: its read as a screen
+        read, or the screen reader's read when the page says it is
+        hidden now (the action opened another app or tab)."""
+        xml = self._page_xml(screen)
+        if xml is None:
+            with _t("dump rpc (page hidden)"):
+                xml = read_screen(self.d)
+        return xml
 
     def _page_read(self):
         """The page in Chrome as a screen read, or None (see _page). The
@@ -1088,7 +1160,12 @@ class U2Daemon:
             return xml
         with self._lock:
             gen, t0 = self._gen, _time.monotonic()
+            self._front_look = None
             xml = self._page_read()
+            if xml is None:
+                # the page check's own look at the screen (Chrome left the
+                # front), when it took one, is this read
+                xml, self._front_look = getattr(self, "_front_look", None), None
             if xml is None:
                 with _t("dump rpc"):
                     xml = read_screen(self.d)
@@ -1280,15 +1357,16 @@ class U2Daemon:
                            "bounds": n["bounds"]}).encode()
 
     def cmd_wait_for(self, arg):
-        """arg: JSON {"text", "timeout" (s), "absent" (bool)}. Polls in the
-        daemon every POLL_S, taking self._lock only for each dump RPC so
-        other clients interleave. Match = exact label (text/content-desc,
-        case-insensitive), else substring. Returns JSON with the matched
+        """arg: JSON {"text", "timeout" (s), "absent" (bool), "exact"
+        (bool)}. Polls in the daemon every POLL_S, taking self._lock only
+        for each dump RPC so other clients interleave. Match = exact label
+        (text/content-desc, case-insensitive), else substring unless
+        exact ("Open" is not "OpenAI"). Returns JSON with the matched
         node (or {"gone": true}); U2NotFound on timeout. The last dump stays
         cached, so an immediate `burner tap` needs no further lookup RPC."""
         POLL_S = 0.25
         p = json.loads(arg)
-        text, absent = p["text"], bool(p.get("absent"))
+        text, absent, exact = p["text"], bool(p.get("absent")), bool(p.get("exact"))
         t0 = _time.monotonic()
         deadline = t0 + float(p.get("timeout", 30))
         polls, healed, fresh = 0, False, False
@@ -1308,7 +1386,7 @@ class U2Daemon:
                     page.wait_parsed(min(2.0, max(0.1, deadline - _time.monotonic())))
                 try:
                     with _t("web find"):
-                        n, screen = _cdp().find_read(page, text, webview_top(self._last_xml))
+                        n, screen = _cdp().find_read(page, text, webview_top(self._last_xml), exact)
                 except Exception as e:
                     fails += 1
                     if fails > 1:
@@ -1318,6 +1396,12 @@ class U2Daemon:
                     page.loading = True  # likely mid-navigation: once more after it
                     page.wait_parsed(min(2.0, max(0.1, deadline - _time.monotonic())))
                     continue
+                if screen and screen.get("vis") == "hidden":
+                    # the page left the front (the tap before opened an
+                    # app): what is in front is the screen reader's to say
+                    self._page_xml(screen)  # ends the page's proof
+                    fresh = True
+                    break
                 waited = int((_time.monotonic() - t0) * 1000)
                 if absent and not n.get("found"):
                     return json.dumps({"gone": True, "waited_ms": waited, "polls": polls}).encode()
@@ -1349,7 +1433,7 @@ class U2Daemon:
                     self.connect()
                 continue
             fresh = True
-            n = find_node(xml, text)
+            n = find_node(xml, text, fuzzy=not exact)
             waited = int((_time.monotonic() - t0) * 1000)
             # a blank read shows nothing, so it can't show `text` gone; nor
             # can a wordless one, until a fresh server read it wordless too
@@ -1501,7 +1585,7 @@ class U2Daemon:
                 except Exception as e:
                     self._web = None
                     raise RuntimeError("act failed after sending: %s" % err_text(e, 120))
-                xml = self._page_xml(r["screen"])
+                xml = self._after_page(r["screen"])
                 self._remember(xml)
             return xml.encode()
         if "scroll" in spec:
@@ -1521,7 +1605,7 @@ class U2Daemon:
                 except Exception as e:
                     self._web = None
                     raise RuntimeError("act failed after sending: %s" % err_text(e, 120))
-                xml = self._page_xml(r["screen"])
+                xml = self._after_page(r["screen"])
                 self._remember(xml)
             return xml.encode()
         if "tap_label" in spec and self._page() is not None:
@@ -1554,7 +1638,7 @@ class U2Daemon:
                 if r.get("count", 1) != 1:
                     raise RuntimeError("act not sent: %d rows read %r%s" % (
                         r["count"], label, " (%s)" % ", ".join(r["tags"]) if r.get("tags") else ""))
-                xml = self._page_xml(r["screen"])
+                xml = self._after_page(r["screen"])
                 self._remember(xml)
             return xml.encode()
         if "set_text" in spec and spec.get("field") and self._page() is not None:
@@ -1583,7 +1667,7 @@ class U2Daemon:
                 if r.get("count", 1) != 1:
                     raise RuntimeError("act not sent: %d fields read %r%s" % (
                         r["count"], spec["field"], " (%s)" % ", ".join(r["tags"]) if r.get("tags") else ""))
-                xml = self._page_xml(r["screen"])
+                xml = self._after_page(r["screen"])
                 self._remember(xml)
             return xml.encode()
         if "set_text" in spec and self._page() is not None:
@@ -1603,7 +1687,7 @@ class U2Daemon:
                     raise RuntimeError("act failed after sending: %s" % err_text(e, 120))
                 if r.get("only"):
                     log("web type: nothing had the focus; the one text field in view took the text")
-                xml = self._page_xml(r["screen"])
+                xml = self._after_page(r["screen"])
                 self._remember(xml)
             return xml.encode()
         if "tap_label" in spec:
@@ -1733,12 +1817,17 @@ class U2Daemon:
                 # The action went to a screen that may be off: dropped, then.
                 raise RuntimeError("act failed after sending: the wake before it failed "
                                    "(%s), so it may have been dropped" % results[0])
+            xml = results[-1]
             if spec.get("quiet"):
                 # a chained step: the action landed and the UI went quiet;
-                # no screen was read, the next step reads afresh (the read
-                # before this tap stays the newest one known)
+                # no screen goes back, and the read taken is the newest one
+                # known (the next step finds its control by words on it);
+                # a blank one isn't, so that step reads afresh
+                if isinstance(xml, str) and has_words(xml):
+                    self._remember(xml)
+                else:
+                    self._last_xml_t = 0.0
                 return b"ok"
-            xml = results[-1]
             if isinstance(xml, Exception) or not xml:
                 raise RuntimeError("act failed after sending: no read (%s)" % xml)
             if not has_words(xml) and not sleeps_the_screen(spec):
@@ -1754,11 +1843,15 @@ class U2Daemon:
                     raise RuntimeError("act failed after sending: the screen was off, so "
                                        "it was probably dropped; the screen is on now")
             # The action landed in Chrome: the page itself says what it
-            # shows now (the screen reader's tree may lag it).
+            # shows now (the screen reader's tree may lag it). The read is
+            # the newest first, so that the page is asked only with Chrome
+            # in front on it (HOME from a page: no question to a page in
+            # the background, whose rows printed as the screen, Oct 5).
+            self._remember(xml)
             page_xml = self._page_read()
             if page_xml is not None:
                 xml = page_xml
-            self._remember(xml)
+                self._remember(xml)
         return xml.encode()
 
     def cmd_health(self, _):
@@ -1804,12 +1897,15 @@ _BOUNDS_RE = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
 
 def iter_nodes(xml):
     """Yield {text, desc, bounds, center, rect, enabled, clickable, web,
-    field} for every node with non-empty on-screen bounds, in document
-    order; web: the node is inside a WebView (a browser's page, an app's
-    web content); field: a text field (its text is what was typed)."""
+    field, cls, parent} for every node with non-empty on-screen bounds,
+    in document order; web: the node is inside a WebView (a browser's
+    page, an app's web content); field: a text field (its text is what
+    was typed); cls: its class, lowercased; parent: the index, in this
+    order, of the nearest node above it that was yielded, or None."""
     import xml.etree.ElementTree as ET
+    count = [0]
 
-    def rec(n, web):
+    def rec(n, web, parent):
         cls = (n.get("class") or "").lower()
         web = web or "webview" in cls
         m = _BOUNDS_RE.match(n.get("bounds", ""))
@@ -1821,10 +1917,12 @@ def iter_nodes(xml):
                        "rect": (x1, y1, x2, y2),
                        "enabled": n.get("enabled") != "false",
                        "clickable": n.get("clickable") == "true", "web": web,
-                       "field": "edittext" in cls}
+                       "field": "edittext" in cls, "cls": cls, "parent": parent}
+                parent = count[0]
+                count[0] += 1
         for c in n:
-            yield from rec(c, web)
-    yield from rec(ET.fromstring(xml), False)
+            yield from rec(c, web, parent)
+    yield from rec(ET.fromstring(xml), False, None)
 
 
 def screen_of(xml):

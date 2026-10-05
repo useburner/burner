@@ -11,4 +11,4 @@ tap "Install"
 # Downloads are slow. "Uninstall" only appears once the install finishes.
 # After the install the button row reads "Uninstall" + "Open" (the Pixel 7
 # showed only "Open" once and the old wait sat here for 10 minutes).
-wait "Uninstall || Open" --timeout 600
+wait "Uninstall || Open" --exact --timeout 600

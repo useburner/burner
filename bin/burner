@@ -1020,14 +1020,15 @@ def _is_blocker(cover, target):
     return bool(cover.get("clickable")) and area >= 0.4 * w * h
 
 
-def is_point_covered(nodes, x, y, exclude_node):
+def is_point_covered(nodes, x, y, exclude_node, ignore=None):
     """Return the topmost node covering point (x, y), or None if uncovered.
 
     "Topmost" = latest in document order (walk() order: parents before
     children, siblings in order — later nodes paint on top). exclude_node is
     skipped (the tap target itself); pass None to check every node. With a
     target, only covers that would really steal the tap count (_is_blocker).
-    Pure function: no adb, unit-testable."""
+    `ignore`: a test for nodes that never count (a page's own rows, for a
+    row of its WebView). Pure function: no adb, unit-testable."""
     idx = -1
     if exclude_node is not None:
         for i, n in enumerate(nodes):
@@ -1036,6 +1037,8 @@ def is_point_covered(nodes, x, y, exclude_node):
                 break
     cover = None
     for n in nodes[idx + 1:]:
+        if ignore is not None and ignore(n):
+            continue
         r = _bounds_rect(n.get("bounds"))
         if r and r[0] <= x <= r[2] and r[1] <= y <= r[3]:
             if exclude_node is not None and not _is_blocker(n, exclude_node):
@@ -1044,13 +1047,14 @@ def is_point_covered(nodes, x, y, exclude_node):
     return cover
 
 
-def find_uncovered_point(node, nodes):
+def find_uncovered_point(node, nodes, ignore=None):
     """Find a tappable point inside node's bounds that no other node covers.
 
     Samples a 3x3 grid — center first, then the 1/4 and 3/4 points along each
     axis — and returns the first (x, y) not covered by any node drawn after
-    `node` in document order. Returns None when every sample is occluded or
-    the node's bounds are unparseable. Pure function: unit-testable."""
+    `node` in document order (`ignore` as for is_point_covered). Returns None
+    when every sample is occluded or the node's bounds are unparseable. Pure
+    function: unit-testable."""
     r = _bounds_rect(node.get("bounds"))
     if not r:
         return None
@@ -1059,7 +1063,7 @@ def find_uncovered_point(node, nodes):
         for fx in (0.5, 0.25, 0.75):
             x = int(x1 + fx * (x2 - x1))
             y = int(y1 + fy * (y2 - y1))
-            if is_point_covered(nodes, x, y, node) is None:
+            if is_point_covered(nodes, x, y, node, ignore) is None:
                 return (x, y)
     return None
 
@@ -2149,15 +2153,18 @@ def plan_tap(nodes, w, h, text=None, xy=None, fuzzy=False, index=None,
     if pt[0] is None:
         return {"action": "nobounds"}
     moved = False
-    if check and not in_webview(node):
+    if check:
         # what is over a row on a page is the page's own business: a tap
         # by label there asks the page what is under the point (the guess
         # from the rows sent a tap nudging for 12s over a banner, and the
-        # document-order one refused the next try, Oct 5); on a native
-        # screen later is on top
-        cover = is_point_covered(nodes, pt[0], pt[1], node)
+        # document-order one refused the next try, Oct 5), so the page's
+        # own rows never count as covers; a native dialog over the page
+        # does, as on a native screen, where later is on top (the planned
+        # tap pressed the dialog's button, found in review Oct 5)
+        ignore = in_webview if in_webview(node) else None
+        cover = is_point_covered(nodes, pt[0], pt[1], node, ignore)
         if cover is not None:
-            alt = find_uncovered_point(node, nodes)
+            alt = find_uncovered_point(node, nodes, ignore)
             if alt is None:
                 return {"action": "refused", "xy": pt, "cover": cover}
             pt, moved = alt, True
@@ -2194,9 +2201,9 @@ def cmd_tap(args):
         # page in Chrome picks among its matches with --index). Any
         # other case (two matches, an older read) reads first, below.
         # A quiet tap (a step of `burner do`) gets no screen back: the
-        # helper taps and waits for the UI to go quiet, the next step
-        # reads afresh (a keypad's keys cost a read and a tap each, not a
-        # read, a tap, a sleep and an idle wait).
+        # helper taps, waits for the UI to go quiet and keeps its read for
+        # the next step (a keypad's keys cost a tap each, not a read, a
+        # tap, a sleep and an idle wait).
         spec = {"tap_label": args.text}
         if args.index is not None:
             spec["index"] = args.index
@@ -2477,9 +2484,12 @@ def _print_waited_screen(args):
 def cmd_wait(args):
     # Fast path: the daemon polls (0.25s interval, fresh dump each poll) and
     # returns the matched node — one socket call, no per-poll RPC from here.
-    # Matches exact label first, then case-insensitive substring (text/desc).
+    # Matches exact label first, then case-insensitive substring (text/desc)
+    # unless --exact ("Open" is not "OpenAI": a recipe's wait for an
+    # install to finish ended on the developer's name, found in review Oct 5).
+    exact = getattr(args, "exact", False)
     r = u2sock("wait_for", json.dumps({"text": args.text, "timeout": args.timeout,
-                                       "absent": args.absent}),
+                                       "absent": args.absent, "exact": exact}),
                timeout=args.timeout + 30)
     if r == U2_NOT_FOUND:
         return _wait_fail(args, 'timeout waiting for "{}"'.format(args.text))
@@ -2504,7 +2514,7 @@ def cmd_wait(args):
         nodes = walk(ui_dump())
         hits = []
         for label in labels:
-            hits = find_nodes(nodes, label, exact=not args.fuzzy)
+            hits = find_nodes(nodes, label, exact=exact or not args.fuzzy)
             if hits:
                 break
         if args.absent and not hits:
@@ -2993,7 +3003,7 @@ def foreground_package():
 FRONT_LINES = "dumpsys activity activities | grep -m1 mFocusedApp"
 
 
-def launch_and_check(pkg, home_first=False):
+def launch_and_check(pkg, home_first=False, fresh=False):
     """Launch an app and report which package is in front, in ONE adb call
     (each call costs ~0.3s over the link). The phone polls until the app is
     resumed (up to ~3s) instead of us sleeping a fixed 1.5s and then pulling
@@ -3002,24 +3012,26 @@ def launch_and_check(pkg, home_first=False):
     transparent screen) isn't taken for success. Returns the front package,
     or None."""
     q = _sh_quote(pkg)
-    # `am start` on the app's launcher activity with NEW_TASK|CLEAR_TASK:
-    # the app opens on its first screen, not on whatever page it was left
-    # on (an assistant that lands on a sub-page spends steps finding its
-    # way back; Muse tapped "Navigate up" twice and BACK once on Oct 4).
-    # monkey does a plain launch but boots a Java VM first (~1.3s).
-    # Falls back to monkey if the launcher activity can't be resolved.
+    # `am start` on the app's launcher activity as a tap on its icon does
+    # (NEW_TASK|RESET_TASK_IF_NEEDED: the app resumes where it was); with
+    # `fresh`, NEW_TASK|CLEAR_TASK: the app opens on its first screen, not
+    # on whatever page it was left on (an assistant that lands on a
+    # sub-page spends steps finding its way back; Muse tapped "Navigate up"
+    # twice and BACK once on Oct 4). monkey does a plain launch but boots
+    # a Java VM first (~1.3s). Falls back to monkey if the launcher
+    # activity can't be resolved.
     script = (
         "{home}a=$(cmd package resolve-activity --brief "
         "-c android.intent.category.LAUNCHER {p} 2>/dev/null | tail -n 1); "
         "case \"$a\" in {p}/*) am start -a android.intent.action.MAIN "
-        "-c android.intent.category.LAUNCHER -f 0x10008000 -n \"$a\" >/dev/null 2>&1;; "
+        "-c android.intent.category.LAUNCHER -f {flags} -n \"$a\" >/dev/null 2>&1;; "
         "*) monkey -p {p} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1;; esac; "
         "n=0; for i in 1 2 3 4 5 6 7 8 9 10 11 12; do sleep 0.3; "
         "f=$({front}); case \"$f\" in *\" \"{p}/*) n=$((n+1));; *) n=0;; esac; "
         "[ $n -ge 2 ] && break; done; "
         "echo \"$f\"").format(
             home="input keyevent KEYCODE_HOME; sleep 0.5; " if home_first else "",
-            p=q, front=FRONT_LINES)
+            p=q, flags="0x10008000" if fresh else "0x10200000", front=FRONT_LINES)
     r = adb_or_ensure("shell", script, timeout=30)
     return parse_front(r.stdout or "")
 
@@ -3031,13 +3043,20 @@ def parse_front(text):
 
 def cmd_start(args):
     quiet = getattr(args, "quiet", False)
+    fresh = getattr(args, "fresh", False)
     # Fastest: the scrcpy helper's open connection starts the app in a few
-    # milliseconds ("+": a fresh start on its first screen). The read
-    # after says which app is in front; adb only when the helper is away.
-    try:
-        started = scrcpy_send("startapp +" + args.package)
-    except Exception:
-        started = False
+    # milliseconds, as a tap on its icon does: the app resumes where it
+    # was (a "+" in front of the package would force-stop it first, which
+    # kills a download or a playback in progress, found in review Oct 5).
+    # Its first screen (--fresh) is adb's launch, which clears the app's
+    # task. The read after says which app is in front; adb also when the
+    # helper is away.
+    started = False
+    if not fresh:
+        try:
+            started = scrcpy_send("startapp " + args.package)
+        except Exception:
+            started = False
     if started:
         u2_invalidate()
         try:
@@ -3056,7 +3075,7 @@ def cmd_start(args):
     # keep the front after a launch. Check, and if so go Home first and
     # launch again before reporting success.
     for attempt in range(2):
-        front = launch_and_check(args.package, home_first=attempt > 0)
+        front = launch_and_check(args.package, home_first=attempt > 0, fresh=fresh)
         if front is None or front == args.package:
             break
         if attempt == 1:
@@ -4429,6 +4448,8 @@ def build_parser():
     p.add_argument("text", help='text to wait for; "A || B" waits for either')
     p.add_argument("--timeout", type=int, default=30)
     p.add_argument("--fuzzy", action="store_true")
+    p.add_argument("--exact", action="store_true",
+                   help='the whole label only ("Open" is not "OpenAI")')
     p.add_argument("--absent", action="store_true",
                    help="wait until the text disappears")
     p.add_argument("--no-evidence", action="store_true",
@@ -4516,6 +4537,8 @@ def build_parser():
 
     p = sub.add_parser("start", help="launch app by package")
     p.add_argument("package")
+    p.add_argument("--fresh", action="store_true",
+                   help="open the app on its first screen, not where it was left")
     p.add_argument("--quiet", "-q", action="store_true",
                    help="don't print the screen afterwards")
     p.set_defaults(fn=cmd_start)
@@ -6062,33 +6085,58 @@ COMMANDS_LOG_MAX = 400 * 1024  # bytes: trimmed to the newest half past this
 
 
 _LOG_KEEP_VALUE = {"--field", "--clear-keys", "--timeout"}
-_LOG_TYPE_IN_FLOW = re.compile(r"""(\btype\s+)(?:"[^"]*"|'[^']*'|\S+)""")
+_LOG_GLOBAL_OPTS = {"--json"}  # burner's own options, before the command
+
+
+def _mask_type(words):
+    """`type`'s arguments with the typed text masked: a flag stays, and so
+    does the value of a flag that takes one; whatever else is there is
+    the typed text (past a bare --, everything is)."""
+    masked, after_dashes = [], False
+    for prev, w in zip([""] + words, words):
+        if after_dashes:
+            masked.append("…")
+            continue
+        if w == "--":
+            after_dashes = True
+            masked.append(w)
+            continue
+        keep = (w.startswith("-") and len(w) > 1) or prev in _LOG_KEEP_VALUE
+        masked.append(w if keep else "…")
+    return masked
+
+
+def _mask_flow(flow):
+    """A do/save/record/replay argument with the text of every `type` step
+    in it masked, the step's flags and their values kept (a pattern that
+    masked the first word after `type` kept the text after a --field,
+    found in review Oct 5)."""
+    steps = []
+    for step in flow.split(";"):
+        try:
+            ws = shlex.split(step)
+        except ValueError:
+            ws = step.split()
+        if ws and ws[0] == "type":
+            step = " ".join(["type"] + [w if w == "…" else shlex.quote(w) for w in _mask_type(ws[1:])])
+        steps.append(step.strip())
+    return "; ".join(steps)
 
 
 def log_line(argv, ms, rc):
     """One line for run/commands.log: when, how long, the exit code and the
     command. Typed text never goes in: every `type` argument but its flags
-    is masked, `type` steps inside a `do`/`save` flow lose their text, and
-    a pairing code stays out."""
+    is masked (behind burner's own options too), `type` steps inside a
+    `do`/`save` flow lose their text, and a pairing code stays out."""
     words = list(argv)
-    cmd = words[0] if words else ""
+    lead = 0
+    while lead < len(words) and words[lead] in _LOG_GLOBAL_OPTS:
+        lead += 1
+    cmd = words[lead] if lead < len(words) else ""
     if cmd == "type":
-        # A flag stays, and so does the value of a flag that takes one;
-        # whatever else is there is the typed text.
-        masked, after_dashes = [], False
-        for prev, w in zip(words, words[1:]):
-            if after_dashes:  # past a bare --, everything is typed text
-                masked.append("…")
-                continue
-            if w == "--":
-                after_dashes = True
-                masked.append(w)
-                continue
-            keep = w.startswith("--") or prev in _LOG_KEEP_VALUE
-            masked.append(w if keep else "…")
-        words = [cmd] + masked
+        words = words[:lead + 1] + _mask_type(words[lead + 1:])
     elif cmd in ("do", "save", "record", "replay"):
-        words = [cmd] + [_LOG_TYPE_IN_FLOW.sub(r"\1…", w) for w in words[1:]]
+        words = words[:lead + 1] + [_mask_flow(w) for w in words[lead + 1:]]
     elif cmd == "setup":
         for i, w in enumerate(words):
             if i and words[i - 1] == "--code":

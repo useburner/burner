@@ -613,17 +613,25 @@ class JsonOutputTests(OfflineTestCase):
         native = COVERED_XML.replace("android.webkit.WebView", "android.widget.FrameLayout")
         plan = pc.plan_tap(pc.walk(ET.fromstring(native)), 1080, 2400, text="Box Score")
         self.assertEqual(plan["action"], "tap")  # later is on top on a native screen
-        # a later row holding the point: a cover on a native screen, the
-        # page's own business on a page (its rows' order says nothing)
+        # a later row holding the point: a cover on a native screen, and
+        # over a page too when it is Chrome's own (drawn after the WebView:
+        # a banner, a prompt); a later row of the page itself is the
+        # page's own business (its rows' order says nothing)
         later = WHOLE_XML.replace("</hierarchy>", "").rstrip()
         later = later[:later.rfind("</node>")] + (
             '<node text="Download today" class="android.view.View" package="com.android.chrome"'
             ' bounds="[0,400][1080,600]" clickable="true" enabled="true"/></node></hierarchy>')
         plan = pc.plan_tap(pc.walk(ET.fromstring(later)), 1080, 2400, text="Box Score")
-        self.assertEqual((plan["action"], plan["xy"]), ("tap", (796, 491)))
+        self.assertNotEqual((plan["action"], plan.get("moved")), ("tap", False))
         plan = pc.plan_tap(pc.walk(ET.fromstring(later.replace("android.webkit.WebView", "android.widget.FrameLayout"))),
                            1080, 2400, text="Box Score")
         self.assertNotEqual((plan["action"], plan.get("moved")), ("tap", False))
+        inside = WHOLE_XML.replace(
+            '<node text="" content-desc="Where to watch"',
+            '<node text="Download today" class="android.view.View" package="com.android.chrome"'
+            ' bounds="[0,400][1080,600]" clickable="true" enabled="true"/>\n      <node text="" content-desc="Where to watch"')
+        plan = pc.plan_tap(pc.walk(ET.fromstring(inside)), 1080, 2400, text="Box Score")
+        self.assertEqual((plan["action"], plan["xy"]), ("tap", (796, 491)))
         whole = pc.plan_tap(pc.walk(ET.fromstring(WHOLE_XML)), 1080, 2400, text="Box Score")
         self.assertEqual((whole["action"], whole["xy"]), ("tap", (796, 491)))
         # one control drawn twice is one row, not an ambiguity
@@ -2771,8 +2779,11 @@ class BranchInstallTests(OfflineTestCase):
         self.assertIn("helpers restarted", out.getvalue())
         self.assertIn("Re-read", out.getvalue())
 
-    def test_start_opens_the_first_screen(self):
-        self.allow("scrcpy_send", side_effect=RuntimeError("no scrcpy"))
+    def test_start_fresh_opens_the_first_screen_through_adb(self):
+        # --fresh: adb's launch clears the app's task (the scrcpy helper's
+        # launch can only resume, or force-stop first, which kills a
+        # download or a playback in progress)
+        sc = self.allow("scrcpy_send", return_value=True)
         adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(
             stdout="  mFocusedApp=ActivityRecord{1 u0 com.example/.Main t3}\n",
             stderr="", returncode=0))
@@ -2780,8 +2791,10 @@ class BranchInstallTests(OfflineTestCase):
         self.allow("nav_record")
         self.allow("u2sock", return_value="100")
         with mock.patch.object(pc.time, "sleep"), self.cap():
-            pc.cmd_start(SimpleNamespace(package="com.example", quiet=True))
+            pc.cmd_start(SimpleNamespace(package="com.example", quiet=True, fresh=True))
         self.assertIn("-f 0x10008000", adb.call_args[0][1])  # NEW_TASK|CLEAR_TASK
+        sc.assert_not_called()
+        self.assertTrue(self.parse(["start", "com.example", "--fresh"]).fresh)
 
     def test_update_fails_loudly_on_a_bad_download(self):
         run = self.allow("subprocess")
@@ -3824,30 +3837,40 @@ class LabelTapTests(OfflineTestCase):
             dm.cmd_act(json.dumps({"tap_label": "OK"}))
         self.assertTrue(str(cm.exception).startswith("act not sent: the read before it failed"),
                         str(cm.exception))
-        # a quiet tap (a step of `burner do`): one fresh read before the
-        # tap, the tap, the wait for the UI to go quiet, and no screen
-        # sent back; the read before the tap stays the newest one known
+        # a quiet tap (a step of `burner do`): the tap, the wait for the
+        # UI to go quiet and a read in the one trip; no screen sent back,
+        # and the read is the newest one known (the next step finds its
+        # control by words on the screen after this tap: a calculator's
+        # display reads "1" once the 1 key is tapped)
+        after = SAMPLE_XML.replace('text="Hello"', 'text="Hello after"')
         dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()
         dm.d = _FakeServer([SAMPLE_XML], screen_on=True)
         sent.clear()
-        dm._batch = lambda calls, timeout=45.0: sent.append(calls) or [None] * len(calls)
+        dm._batch = lambda calls, timeout=45.0: sent.append(calls) or [None] * (len(calls) - 1) + [after]
         # by words, from the young read: the phone waits for the tap's
-        # acknowledgement itself, so a quiet step is the wake and the tap
+        # acknowledgement itself, so no read stands in for the pause
         self.assertEqual(dm.cmd_act(json.dumps({"tap_label": "OK", "quiet": True, "idle": 1200})), b"ok")
-        self.assertEqual([m for m, _ in sent[0]], ["wakeUp", "count", "click"])
+        self.assertEqual([m for m, _ in sent[0]], ["wakeUp", "count", "click", "waitForIdle", "dumpWindowHierarchy"])
         self.assertEqual(sent[0][2][1][0]["text"], "OK")
         self.assertEqual(dm.d.calls, [])
-        self.assertEqual(dm._last_xml, SAMPLE_XML)
+        self.assertEqual(dm._last_xml, after)
+        self.assertLess(mod._time.monotonic() - dm._last_xml_t, 5.0)
         # from an older read: the fresh read, the tap where the row is
-        # now, the pause and the wait; no screen sent back
+        # now, the pause, the wait and the read; no screen sent back
         dm._last_xml_t = 0
         self.assertEqual(dm.cmd_act(json.dumps({"tap_label": "OK", "quiet": True, "idle": 1200})), b"ok")
-        self.assertEqual([m for m, _ in sent[1]], ["wakeUp", "click", "dumpWindowHierarchy", "waitForIdle"])
+        self.assertEqual([m for m, _ in sent[1]],
+                         ["wakeUp", "click", "dumpWindowHierarchy", "waitForIdle", "dumpWindowHierarchy"])
         self.assertEqual(sent[1][1], ("click", [250, 450]))
         self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])
-        self.assertEqual(dm._last_xml, SAMPLE_XML)
+        self.assertEqual(dm._last_xml, after)
         self.assertEqual([m for m, _ in mod.act_calls({"key": 66, "quiet": True, "idle": 500})],
-                         ["wakeUp", "pressKeyCode", "dumpWindowHierarchy", "waitForIdle"])
+                         ["wakeUp", "pressKeyCode", "dumpWindowHierarchy", "waitForIdle", "dumpWindowHierarchy"])
+        # a blank read after a quiet step is not kept: the next step reads afresh
+        dm._batch = lambda calls, timeout=45.0: sent.append(calls) or [None] * len(calls)
+        dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()
+        self.assertEqual(dm.cmd_act(json.dumps({"tap_label": "OK", "quiet": True, "idle": 1200})), b"ok")
+        self.assertEqual((dm._last_xml, dm._last_xml_t), (SAMPLE_XML, 0.0))
 
 
 class HelperStalenessTests(OfflineTestCase):
@@ -3955,7 +3978,7 @@ class StartAndSettingsTests(OfflineTestCase):
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_start(self.parse(["start", "com.example"]))
         self.assertEqual(rc, 0)
-        sc.assert_called_once_with("startapp +com.example")
+        sc.assert_called_once_with("startapp com.example")  # no "+": a force-stop would kill a download
         adb.assert_not_called()
         self.assertEqual(calls, ["act"])
         self.assertIn("launched com.example", out.getvalue())
@@ -4002,7 +4025,7 @@ class StartAndSettingsTests(OfflineTestCase):
         with mock.patch.object(pc.time, "sleep"), self.cap():
             rc = pc.cmd_start(SimpleNamespace(package="com.example", quiet=True))
         self.assertEqual(rc, 0)
-        self.assertIn("-f 0x10008000", adb.call_args[0][1])
+        self.assertIn("-f 0x10200000", adb.call_args[0][1])  # resumed, as a tap on its icon does
 
     def test_settings_page_by_name(self):
         adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
@@ -4720,7 +4743,7 @@ class WebPathTests(OfflineTestCase):
             calls.append(("find", label, top))
             return next(answers)
         fake.find = find
-        fake.find_read = lambda page, label, top=0: (fake.find(page, label, top), WEB_SCREEN)
+        fake.find_read = lambda page, label, top=0, exact=False: (fake.find(page, label, top), WEB_SCREEN)
         dm = EmptyScreenTests._daemon(self, mod)
         dm.d = _FakeServer([])  # the screen reader is never asked
         dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
@@ -5891,3 +5914,233 @@ class EmptyScreenTests(OfflineTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------- 23. pre-merge review fixes (the helper)
+
+DIALOG_XML = SAMPLE_XML.replace("</hierarchy>", """  <node index="0" text="" class="android.widget.FrameLayout" package="com.example" content-desc="" clickable="false" enabled="true" bounds="[50,350][1030,900]">
+    <node index="0" text="Delete this?" class="android.widget.TextView" package="com.example" content-desc="" clickable="false" enabled="true" bounds="[100,370][900,420]"/>
+    <node index="1" text="Delete" class="android.widget.Button" package="com.example" content-desc="" clickable="true" enabled="true" bounds="[100,430][980,520]"/>
+  </node>
+</hierarchy>""")  # a dialog, a later window, its Delete button over the OK button's centre (250,450)
+
+
+class HelperReviewFixTests(OfflineTestCase):
+    def test_iter_nodes_knows_parents_and_classes(self):
+        mod = _u2mux()
+        nodes = list(mod.iter_nodes(SAMPLE_XML))
+        self.assertEqual([n["parent"] for n in nodes], [None, 0, 0, 0])
+        self.assertEqual(nodes[1]["cls"], "android.widget.textview")
+        self.assertTrue(mod.descends(nodes, 2, {id(nodes[0])}))
+        self.assertFalse(mod.descends(nodes, 2, {id(nodes[1])}))
+        self.assertEqual(mod.screen_size(nodes), (1080, 2400))
+        self.assertIsNone(mod.screen_size(nodes[1:]))  # nothing at an edge
+
+    def test_a_tap_by_words_refuses_a_row_under_a_dialog(self):
+        mod = _u2mux()
+        # a dialog's button over the row (a later window: on top): refused,
+        # as the CLI's planned tap refuses it
+        with self.assertRaises(RuntimeError) as cm:
+            mod.label_target(DIALOG_XML, "OK")
+        self.assertEqual(str(cm.exception), "'OK' is under 'Delete'")
+        # a dialog by its class, with no words of its own at the point
+        sheet = SAMPLE_XML.replace("</hierarchy>", '  <node text="" class="com.google.android.material.bottomsheet.BottomSheetDialog" package="com.example" content-desc="" clickable="false" enabled="true" bounds="[0,300][1080,2400]"/>\n</hierarchy>')
+        with self.assertRaises(RuntimeError) as cm:
+            mod.label_target(sheet, "OK")
+        self.assertIn("'OK' is under", str(cm.exception))
+        # an unlabelled clickable scrim over most of the screen (behind a
+        # modal): refused; a small unlabelled view drawn after: no cover
+        scrim = SAMPLE_XML.replace("</hierarchy>", '  <node text="" class="android.view.View" package="com.example" content-desc="" clickable="true" enabled="true" bounds="[0,0][1080,2400]"/>\n</hierarchy>')
+        with self.assertRaises(RuntimeError):
+            mod.label_target(scrim, "OK")
+        small = SAMPLE_XML.replace("</hierarchy>", '  <node text="" class="android.view.View" package="com.example" content-desc="" clickable="true" enabled="true" bounds="[200,400][300,500]"/>\n</hierarchy>')
+        self.assertEqual(mod.label_target(small, "OK"), (250, 450))
+        # the same words drawn again over the row (one control drawn twice,
+        # centres apart): no cover
+        twice = SAMPLE_XML.replace("</hierarchy>", '  <node text="OK" class="android.widget.TextView" package="com.example" content-desc="" clickable="false" enabled="true" bounds="[100,400][900,500]"/>\n</hierarchy>')
+        self.assertEqual(mod.label_target(twice, "OK"), (250, 450))
+        # the helper's tap by words sends nothing for a row under a dialog
+        EmptyScreenTests.no_sleep(self, mod)
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([DIALOG_XML])
+        dm._batch = mock.Mock(side_effect=AssertionError("nothing may be tapped under a dialog"))
+        dm._last_xml, dm._last_xml_t = DIALOG_XML, mod._time.monotonic()
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"tap_label": "OK", "idle": 1200}))
+        self.assertEqual(str(cm.exception), "act not sent: 'OK' is under 'Delete'")
+
+    def test_a_dialog_over_a_link_in_a_webview_is_a_cover(self):
+        mod = _u2mux()
+        # Chrome's own prompt (a later window) over the Box Score link at (796,491)
+        allow = WHOLE_XML.replace("</hierarchy>", '  <node text="" class="android.widget.FrameLayout" package="com.android.chrome" bounds="[60,380][1020,700]" clickable="false" enabled="true">\n    <node text="Allow" class="android.widget.Button" package="com.android.chrome" bounds="[100,440][900,540]" clickable="true" enabled="true"/>\n  </node>\n</hierarchy>')
+        with self.assertRaises(RuntimeError) as cm:
+            mod.label_target(allow, "Box Score")
+        self.assertEqual(str(cm.exception), "'Box Score' is under 'Allow'")
+        # a native row before the WebView that overlaps it is not on top
+        # (the card case in test_helper_label_target), nor is the WebView's
+        # own unlabelled parent drawn after a row
+        self.assertEqual(mod.label_target(WHOLE_XML, "Box Score"), (796, 491))
+
+    def test_a_control_s_own_parts_are_no_cover(self):
+        mod = _u2mux()
+        # a row described "Wi-Fi" whose centre falls on its own "Connected"
+        # line: its parts, not covers
+        row = """<hierarchy rotation="0">
+  <node text="" class="android.widget.FrameLayout" package="com.example" content-desc="" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node text="" class="android.widget.LinearLayout" package="com.example" content-desc="Wi-Fi" clickable="true" enabled="true" bounds="[0,400][1080,600]">
+      <node text="Wi-Fi" class="android.widget.TextView" package="com.example" content-desc="" clickable="false" enabled="true" bounds="[100,410][500,480]"/>
+      <node text="Connected" class="android.widget.TextView" package="com.example" content-desc="" clickable="false" enabled="true" bounds="[100,480][500,590]"/>
+    </node>
+  </node>
+</hierarchy>"""
+        self.assertEqual(mod.label_target(row, "Wi-Fi"), (540, 500))
+
+    def test_a_hidden_page_read_is_no_screen(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = WebPathTests._fake_cdp(self, mod, calls)
+        fake.read = lambda page, cap=160: calls.append(("read",)) or dict(WEB_SCREEN, vis="hidden")
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm._web = _FakePage()
+        dm._web.visible_at = 1e9
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        self.assertIsNone(dm._page_xml(dict(WEB_SCREEN, vis="hidden")))
+        self.assertEqual(dm._web.visible_at, 0.0)
+        # a read with Chrome on the newest read: the page says hidden, so
+        # the screen reader's read is the screen (HOME was pressed)
+        dm._web.visible_at = 1e9
+        dm.d = _FakeServer([SAMPLE_XML])
+        self.assertEqual(dm._dump(fresh=True), SAMPLE_XML)
+        self.assertEqual(calls, [("read",)])
+        self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])
+        # the screen after an action on the page, when it says hidden
+        dm.d = _FakeServer([SAMPLE_XML])
+        self.assertEqual(dm._after_page(dict(WEB_SCREEN, vis="hidden")), SAMPLE_XML)
+        self.assertIn('text="Box Score"', dm._after_page(WEB_SCREEN))
+
+    def test_the_act_that_leaves_chrome_does_not_ask_the_page(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = WebPathTests._fake_cdp(self, mod, calls)
+        fake.read = lambda page, cap=160: self.fail("a page in the background must not be asked")
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm._web = _FakePage()
+        dm._web.visible_at = 1e9
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        dm.d = _FakeServer([])
+        dm._batch = lambda calls_, timeout=45.0: [None] * (len(calls_) - 1) + [SAMPLE_XML]  # HOME: com.example in front
+        self.assertEqual(dm.cmd_act(json.dumps({"key": 3, "idle": 1200})), SAMPLE_XML.encode())
+        self.assertEqual(dm._last_xml, SAMPLE_XML)
+        # with Chrome still in front on the read after the action, the page is asked
+        fake.read = lambda page, cap=160: calls.append(("read",)) or WEB_SCREEN
+        dm._batch = lambda calls_, timeout=45.0: [None] * (len(calls_) - 1) + [CHROME_XML]
+        xml = dm.cmd_act(json.dumps({"key": 4, "idle": 1200})).decode()
+        self.assertEqual(calls, [("read",)])
+        self.assertIn('text="Box Score"', xml)
+
+    def test_a_wait_moves_to_the_screen_reader_when_the_page_hides(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = WebPathTests._fake_cdp(self, mod, calls)
+        fake.find_read = lambda page, label, top=0, exact=False: (
+            calls.append(("find", label, exact)) or {"found": False}, dict(WEB_SCREEN, vis="hidden"))
+        fake.visible = lambda page, timeout=1.5: page.visible_at > 0  # a probe: hidden once the proof ended
+        fake.front_page = lambda dev, current=None: current  # the page in hand while it is visible
+        dm = EmptyScreenTests._daemon(self, mod)
+        page = dm._web = _FakePage()
+        page.visible_at = 1e9
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        dm.d = _FakeServer([SAMPLE_XML])  # the app the tap opened, with its OK button
+        out = json.loads(dm.cmd_wait_for(json.dumps({"text": "OK", "timeout": 5})))
+        self.assertTrue(out["found"])
+        self.assertEqual(out["text"], "OK")
+        self.assertEqual(calls, [("find", "OK", False)])  # the page once; then the screen reader
+        # one look at the screen (the page check's), which is the read
+        self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])
+        self.assertEqual(page.visible_at, 0.0)
+        self.assertIsNone(dm._web)
+
+    def test_wait_exact_matches_the_whole_label_only(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        dm = EmptyScreenTests._daemon(self, mod)
+        openai = SAMPLE_XML.replace('text="Hello"', 'text="OpenAI"')
+        dm._last_xml, dm._last_xml_t = openai, mod._time.monotonic()
+        dm.d = SimpleNamespace(jsonrpc_call=lambda m, p, timeout=10: openai, info={"screenOn": True})
+        with self.assertRaises(mod.U2NotFound):
+            dm.cmd_wait_for(json.dumps({"text": "Uninstall || Open", "timeout": 0.3, "exact": True}))
+        dm.d = _FakeServer([openai])
+        out = json.loads(dm.cmd_wait_for(json.dumps({"text": "Uninstall || Open", "timeout": 5})))
+        self.assertEqual(out["text"], "OpenAI")  # as a part of longer words, without exact
+        self.assertEqual(mod.find_node(openai, "open", fuzzy=False), None)
+        # the page is asked the same way
+        calls = []
+        fake = WebPathTests._fake_cdp(self, mod, calls)
+        fake.find_read = lambda page, label, top=0, exact=False: (
+            calls.append(("find", label, exact)) or {"found": True, "text": label, "desc": "", "bounds": "[0,0][1,1]",
+                                                     "enabled": True, "inview": True, "count": 1}, WEB_SCREEN)
+        dm._web = _FakePage()
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        dm.cmd_wait_for(json.dumps({"text": "Open", "timeout": 5, "exact": True}))
+        self.assertEqual(calls, [("find", "Open", True)])
+
+
+# --------------------------------- 24. pre-merge review fixes (the CLI)
+
+class CliReviewFixTests(OfflineTestCase):
+    def test_a_page_row_under_a_native_dialog_is_refused_by_the_plan(self):
+        # Chrome's own prompt (a later window), its button over the whole
+        # Box Score link (no free point of the link to move the tap to)
+        allow = WHOLE_XML.replace("</hierarchy>", '  <node text="" class="android.widget.FrameLayout" package="com.android.chrome" bounds="[60,380][1020,700]" clickable="false" enabled="true">\n    <node text="Allow" class="android.widget.Button" package="com.android.chrome" bounds="[100,440][1060,560]" clickable="true" enabled="true"/>\n  </node>\n</hierarchy>')
+        root = ET.fromstring(allow)
+        pc._update_screen_from_dump(root)
+        plan = pc.plan_tap(pc.walk(root), 1080, 2400, text="Box Score")
+        self.assertEqual(plan["action"], "refused")
+        self.assertEqual(plan["cover"]["text"], "Allow")
+        # the page's own rows never count (the page says what is under a point)
+        root = ET.fromstring(COVERED_XML)
+        pc._update_screen_from_dump(root)
+        plan = pc.plan_tap(pc.walk(root), 1080, 2400, text="Box Score")
+        self.assertEqual((plan["action"], plan["xy"]), ("tap", (796, 491)))
+
+    def test_wait_exact_reaches_the_helper(self):
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append((cmd, arg))
+            if cmd == "wait_for":
+                return json.dumps({"found": True, "text": "Open", "desc": "", "bounds": "[0,0][10,10]",
+                                   "enabled": True, "waited_ms": 5, "polls": 1})
+            return SAMPLE_XML
+        self.allow("u2sock", side_effect=u2)
+        self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_wait(self.parse(["wait", "Open", "--exact", "--quiet"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        spec = json.loads([a for c, a in calls if c == "wait_for"][0])
+        self.assertTrue(spec["exact"])
+        spec = json.loads(pc.json.dumps({"x": 1}))  # json in scope
+        with mock.patch.object(pc.time, "sleep"), self.cap():
+            pc.cmd_wait(self.parse(["wait", "Open", "--quiet"]))
+        self.assertFalse(json.loads([a for c, a in calls if c == "wait_for"][1])["exact"])
+
+    def test_log_line_masks_typed_text_behind_options_and_inside_flows(self):
+        line = pc.log_line(["--json", "type", "hunter2"], 10, 0)
+        self.assertNotIn("hunter2", line)
+        self.assertIn("burner --json type '…'", line)
+        line = pc.log_line(["do", 'tap Password; type --field Password "hunter2"; press ENTER'], 10, 0)
+        self.assertNotIn("hunter2", line)
+        self.assertIn("type --field Password …", line)
+        self.assertIn("press ENTER", line)
+        line = pc.log_line(["do", "type --clear s3cret; type -q also"], 10, 0)
+        self.assertNotIn("s3cret", line)
+        self.assertNotIn("also", line)
+        self.assertIn("type --clear …; type -q …", line)
+        line = pc.log_line(["save", "login", 'type "my secret"'], 10, 0)
+        self.assertNotIn("my secret", line)
+        self.assertIn("login", line)
+        # a flow with no typing is logged as it was
+        self.assertIn("tap OK; press BACK", pc.log_line(["do", "tap OK; press BACK"], 10, 0))

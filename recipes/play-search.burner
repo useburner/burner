@@ -9,4 +9,4 @@
 open market://search?q=$APP_QUERY&c=apps com.android.vending
 # The results list shows Install for a new app, Open for one already on
 # the phone, so wait for either.
-wait "Install || Open" --timeout 30
+wait "Install || Open" --exact --timeout 30

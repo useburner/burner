@@ -17,8 +17,9 @@ wait "Uninstall" --absent --timeout 2
 # nothing is tapped. Never add a purchase step to this recipe.
 tap "Install"
 # Downloads are slow. "Uninstall" only appears once the install finishes
-# (the button row becomes "Uninstall" + "Open"). Waiting on "Open" instead
-# would substring-match listing text like the description.
+# (the button row becomes "Uninstall" + "Open"). The whole label only
+# (--exact): as a part of longer words, "Open" matches listing text like a
+# developer's name (OpenAI) while the download is still going.
 # After the install the button row reads "Uninstall" + "Open" (the Pixel 7
 # showed only "Open" once and the old wait sat here for 10 minutes).
-wait "Uninstall || Open" --timeout 600
+wait "Uninstall || Open" --exact --timeout 600
