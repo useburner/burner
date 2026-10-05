@@ -127,7 +127,11 @@ def _trace_sleeps():
 
     def traced_sleep(secs):
         real_sleep(secs)
-        _trace("sleep {:.2f}s".format(secs))
+        # Only burner's own pauses: subprocess.run polls a child with
+        # sleeps under a millisecond, hundreds for one slow command (a
+        # trace of 300 "0ms sleep" lines broke the assistant's reply).
+        if secs >= 0.005:
+            _trace("sleep {:.2f}s".format(secs))
     time.sleep = traced_sleep
 
 
