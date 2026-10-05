@@ -26,6 +26,7 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 # Paths derive from this file's real location (lib/u2/u2mux.py), so a copy
@@ -718,6 +719,88 @@ def webview_top(xml):
     return int(m.group(2)) if m else 0
 
 
+def webview_rect(xml):
+    """The rectangle (x1, y1, x2, y2) of the first WebView on a read, or
+    None. Pure."""
+    m = re.search(r'class="[^"]*WebView"[^>]*bounds="\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]', xml or "")
+    return tuple(int(v) for v in m.groups()) if m else None
+
+
+WINDOWS_DEPTH = 2       # a look at the phone's windows: each window's root and its first rows
+LOOK_WAIT_S = 2.0       # the look is waited for this long once the page has answered
+WINDOW_OVER_PART = 0.2  # a window holding this much of the page's box is over it
+
+
+def window_over(windows_xml, rect, front_pkg):
+    """The window drawn over `rect` (the page's WebView, else the screen)
+    on a read of the phone's windows: (its package, its first words) or
+    None. A window of another app than the one in front (the
+    notification shade, a permission dialog, an app chooser), not a
+    keyboard, holding WINDOW_OVER_PART of the rectangle or more; the bars
+    at the edges hold too little. The page can't see such a window: the
+    shade read as empty from the page while it held nine notifications
+    (Oct 5). Pure."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(windows_xml or "")
+    except ET.ParseError:
+        return None
+    x1, y1, x2, y2 = rect
+    area = max(1, (x2 - x1) * (y2 - y1))
+    for w in root:  # the windows, each a root under the hierarchy
+        pkg = w.get("package") or ""
+        if not pkg or pkg == front_pkg or any(k in pkg.lower() for k in U2Daemon.IME_HINTS):
+            continue
+        m = _BOUNDS_RE.match(w.get("bounds", ""))
+        if not m:
+            continue
+        wx1, wy1, wx2, wy2 = map(int, m.groups())
+        held = max(0, min(x2, wx2) - max(x1, wx1)) * max(0, min(y2, wy2) - max(y1, wy1))
+        if held >= WINDOW_OVER_PART * area:
+            words = next((t for n in w.iter("node") for t in (n.get("text"), n.get("content-desc")) if t), "")
+            return pkg, words[:40]
+    return None
+
+
+class _Look(threading.Thread):
+    """A read of the phone's windows alone (WINDOWS_DEPTH deep: small and
+    quick on the phone), taken while the page is asked, so that a window
+    over the page is seen without a round trip of its own. Started at
+    once; `over` has the answer."""
+
+    def __init__(self, dm):
+        super().__init__(daemon=True)
+        self.dm, self.xml, self.error = dm, None, None
+        self.start()
+
+    def run(self):
+        try:
+            self.xml = self.dm.d.jsonrpc_call("dumpWindowHierarchy", [False, WINDOWS_DEPTH],
+                                              timeout=DUMP_RPC_TIMEOUT)
+        except Exception as e:
+            self.error = e
+
+    def over(self):
+        """The window over the page (see window_over), or None, once the
+        look is in (LOOK_WAIT_S at most past the page's answer; a look
+        that is late or failed leaves the page's read standing)."""
+        self.join(LOOK_WAIT_S)
+        if not self.xml:
+            log("the look at the windows %s; the page's read stands"
+                % ("failed (%s)" % err_text(self.error, 80) if self.error else "is late"))
+            return None
+        try:
+            last = getattr(self.dm, "_last_xml", "")
+            info = screen_of(last) if last else None
+            rect = webview_rect(last) or ((0, 0, info[0], info[1]) if info else None)
+            if rect is None:
+                return None
+            return window_over(self.xml, rect, info[2] if info else "")
+        except Exception as e:
+            log("the look at the windows couldn't be read (%s); the page's read stands" % err_text(e, 80))
+            return None
+
+
 def batch_results(replies, n):
     """One entry per call from a JSON-RPC batch reply: the result, or an
     Exception for a call that failed. Pure."""
@@ -1111,7 +1194,9 @@ class U2Daemon:
     def _after_page(self, screen):
         """The screen after an action on the page: its read as a screen
         read, or the screen reader's read when the page says it is
-        hidden now (the action opened another app or tab)."""
+        hidden now (the action opened another app or tab). A window the
+        action opened over the page (a permission dialog) is not seen
+        here; the next read of the screen sees it (see _page_read)."""
         xml = self._page_xml(screen)
         if xml is None:
             with _t("dump rpc (page hidden)"):
@@ -1122,16 +1207,24 @@ class U2Daemon:
         """The page in Chrome as a screen read, or None (see _page). The
         screen reader's tree lags a finger scroll on a heavy page by
         seconds and comes back empty for a while (espn.com, Oct 4); the
-        page itself has the current layout."""
+        page itself has the current layout. Not with a window of another
+        app over the page (see _Look and window_over: the notification
+        shade, a permission dialog): the page can't see it, and the
+        screen reader's read is the screen then."""
         page = self._page()
         if page is None:
             return None
+        look = _Look(self)  # the phone's windows, read meanwhile
         try:
             with _t("web read"):
                 screen = _cdp().read(page)
         except Exception as e:
             self._web = None
             log("reading the page failed (%s); reading the screen" % err_text(e, 100))
+            return None
+        over = look.over()
+        if over is not None:
+            log("a window over the page (%s %r): the screen reader's read" % over)
             return None
         log("web read: %d rows, %sms in the page" % (len(screen.get("rows") or []), screen.get("ms", "?")))
         return self._page_xml(screen)
@@ -1384,6 +1477,7 @@ class U2Daemon:
                 page.listen(0.05)
                 if page.loading:
                     page.wait_parsed(min(2.0, max(0.1, deadline - _time.monotonic())))
+                look = _Look(self)  # the phone's windows, read meanwhile
                 try:
                     with _t("web find"):
                         n, screen = _cdp().find_read(page, text, webview_top(self._last_xml), exact)
@@ -1396,6 +1490,13 @@ class U2Daemon:
                     page.loading = True  # likely mid-navigation: once more after it
                     page.wait_parsed(min(2.0, max(0.1, deadline - _time.monotonic())))
                     continue
+                over = look.over()
+                if over is not None:
+                    # a window of another app over the page (a dialog, the
+                    # shade): the words are the screen reader's to find
+                    log("a window over the page (%s %r): the wait moves to the screen reader" % over)
+                    fresh = True
+                    break
                 if screen and screen.get("vis") == "hidden":
                     # the page left the front (the tap before opened an
                     # app): what is in front is the screen reader's to say

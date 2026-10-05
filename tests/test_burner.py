@@ -4100,17 +4100,25 @@ class _FakeDev:
         return self.listings.pop(0) if len(self.listings) > 1 else self.listings[0]
 
 
+NO_WINDOWS = '<hierarchy rotation="0" />'  # a look at the windows that shows nothing over the page
+
+
 class _FakeServer:
     """A uiautomator2 device: deviceInfo and a queue of reads. One read
-    more than queued is a failed test."""
-    def __init__(self, reads, screen_on=True):
+    more than queued is a failed test. A look at the windows (a shallow
+    read, see u2mux._Look) is answered with `windows`, counted in
+    `looks`, and spends no queued read."""
+    def __init__(self, reads, screen_on=True, windows=NO_WINDOWS):
         self.reads = list(reads)
         self.info = {"screenOn": screen_on, "sdkInt": 35}
-        self.calls = []
+        self.calls, self.looks, self.windows = [], 0, windows
         self.jsonrpc = SimpleNamespace(wakeUp=lambda: None, getConfigurator=lambda: {},
                                        setConfigurator=lambda cfg: None)
 
     def jsonrpc_call(self, method, params, timeout=10):
+        if method == "dumpWindowHierarchy" and params[1] < 50:
+            self.looks += 1
+            return self.windows
         self.calls.append(method)
         return self.reads.pop(0)
 
@@ -6144,3 +6152,98 @@ class CliReviewFixTests(OfflineTestCase):
         self.assertIn("login", line)
         # a flow with no typing is logged as it was
         self.assertIn("tap OK; press BACK", pc.log_line(["do", "tap OK; press BACK"], 10, 0))
+
+
+# --------------------------------- 25. a window over the page is the screen
+
+_BARS = """  <node index="1" text="" class="android.widget.FrameLayout" package="com.android.systemui" bounds="[0,0][1080,131]" clickable="false" enabled="true"/>
+  <node index="2" text="" class="android.widget.FrameLayout" package="com.android.systemui" bounds="[0,2274][1080,2400]" clickable="false" enabled="true"/>
+</hierarchy>"""
+BARS_WINDOWS = """<hierarchy rotation="0">
+  <node index="0" text="" class="android.widget.FrameLayout" package="com.android.chrome" bounds="[0,0][1080,2400]" clickable="false" enabled="true"/>
+""" + _BARS
+SHADE_WINDOWS = BARS_WINDOWS.replace(_BARS, """  <node index="1" text="" class="android.widget.FrameLayout" package="com.android.systemui" bounds="[0,0][1080,2400]" clickable="false" enabled="true">
+    <node index="0" text="" content-desc="Notification shade." class="android.widget.FrameLayout" package="com.android.systemui" bounds="[0,0][1080,2400]" clickable="false" enabled="true"/>
+  </node>
+""" + _BARS)
+IME_WINDOWS = BARS_WINDOWS.replace(_BARS, """  <node index="1" text="" class="android.widget.FrameLayout" package="com.google.android.inputmethod.latin" bounds="[0,1350][1080,2274]" clickable="false" enabled="true"/>
+""" + _BARS)
+DIALOG_WINDOWS = BARS_WINDOWS.replace(_BARS, """  <node index="1" text="" class="android.widget.FrameLayout" package="com.google.android.permissioncontroller" bounds="[60,900][1020,1500]" clickable="false" enabled="true">
+    <node index="0" text="Allow Chrome to access this device's location?" class="android.widget.TextView" package="com.google.android.permissioncontroller" bounds="[100,950][980,1050]" clickable="false" enabled="true"/>
+  </node>
+""" + _BARS)
+VOLUME_WINDOWS = BARS_WINDOWS.replace(_BARS, """  <node index="1" text="" class="android.widget.FrameLayout" package="com.android.systemui" bounds="[900,600][1080,1400]" clickable="false" enabled="true"/>
+""" + _BARS)
+# the full read with the shade pulled down over the page: its rows are the screen reader's
+SHADE_OVER_PAGE_XML = CHROME_XML.replace("</hierarchy>", """  <node index="1" text="" class="android.widget.FrameLayout" package="com.android.systemui" bounds="[0,0][1080,2400]" clickable="false" enabled="true">
+    <node index="0" text="" class="android.widget.FrameLayout" package="com.android.systemui" bounds="[0,400][1080,600]" clickable="true" enabled="true">
+      <node index="0" text="Muse" class="android.widget.TextView" package="com.android.systemui" bounds="[100,420][400,470]" clickable="false" enabled="true"/>
+      <node index="1" text="Weekly money check" class="android.widget.TextView" package="com.android.systemui" bounds="[100,480][900,560]" clickable="false" enabled="true"/>
+    </node>
+  </node>
+</hierarchy>""")
+
+
+class WindowOverPageTests(OfflineTestCase):
+    def test_window_over_the_page(self):
+        mod = _u2mux()
+        rect = mod.webview_rect(CHROME_XML)
+        self.assertEqual(rect, (0, 283, 1080, 2400))
+        self.assertIsNone(mod.webview_rect(SAMPLE_XML))
+        chrome = "com.android.chrome"
+        self.assertEqual(mod.window_over(SHADE_WINDOWS, rect, chrome), ("com.android.systemui", "Notification shade."))
+        self.assertEqual(mod.window_over(DIALOG_WINDOWS, rect, chrome)[0], "com.google.android.permissioncontroller")
+        self.assertIsNone(mod.window_over(BARS_WINDOWS, rect, chrome))  # the bars at the edges
+        self.assertIsNone(mod.window_over(IME_WINDOWS, rect, chrome))  # the keyboard: the page knows
+        self.assertIsNone(mod.window_over(VOLUME_WINDOWS, rect, chrome))  # too small
+        self.assertIsNone(mod.window_over(NO_WINDOWS, rect, chrome))
+        self.assertIsNone(mod.window_over("", rect, chrome))
+        self.assertIsNone(mod.window_over("<hierarchy", rect, chrome))
+        # the app in front is never over itself
+        self.assertIsNone(mod.window_over(BARS_WINDOWS, (0, 0, 1080, 2400), chrome))
+
+    def test_a_read_with_the_shade_over_the_page_is_the_screen_readers(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        WebPathTests._fake_cdp(self, mod, calls)
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm._web = _FakePage()
+        dm._web.visible_at = 1e9
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        dm.d = _FakeServer([SHADE_OVER_PAGE_XML], windows=SHADE_WINDOWS)
+        xml = dm._dump(fresh=True)
+        self.assertIn("Weekly money check", xml)  # the shade's rows, from the screen reader
+        self.assertEqual(calls, [("read",)])  # the page was asked, with the look in its wait
+        self.assertEqual((dm.d.looks, dm.d.calls), (1, ["dumpWindowHierarchy"]))
+        self.assertIsNotNone(dm._web)  # the page is still there, under the shade
+        self.assertEqual(dm._last_xml, xml)
+        # the shade closed: the page is the screen again, and no full read
+        dm.d = _FakeServer([], windows=BARS_WINDOWS)
+        self.assertIn('text="Box Score"', dm._dump(fresh=True))
+        self.assertEqual((dm.d.looks, dm.d.calls), (1, []))
+        # a look that fails, or shows nothing readable, leaves the page's read standing
+        dm.d = _FakeServer([], windows=None)
+        self.assertIn('text="Box Score"', dm._dump(fresh=True))
+        dm.d = _FakeServer([], windows="<hierarchy")
+        self.assertIn('text="Box Score"', dm._dump(fresh=True))
+        dm.d = SimpleNamespace(jsonrpc_call=mock.Mock(side_effect=OSError("stream closed")), info={"screenOn": True})
+        self.assertIn('text="Box Score"', dm._dump(fresh=True))
+
+    def test_a_wait_on_a_page_moves_to_the_screen_reader_under_a_window(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = WebPathTests._fake_cdp(self, mod, calls)
+        fake.find_read = lambda page, label, top=0, exact=False: (
+            calls.append(("find", label)) or {"found": False}, WEB_SCREEN)
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm._web = _FakePage()
+        dm._web.visible_at = 1e9
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        dm.d = _FakeServer([SHADE_OVER_PAGE_XML, SHADE_OVER_PAGE_XML], windows=SHADE_WINDOWS)
+        out = json.loads(dm.cmd_wait_for(json.dumps({"text": "Weekly money check", "timeout": 5})))
+        self.assertTrue(out["found"])
+        self.assertEqual([c for c in calls if c[0] == "find"], [("find", "Weekly money check")])  # the page once
+        self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])  # then the screen reader, which had the words
+        self.assertGreaterEqual(dm.d.looks, 2)  # a look with the find, one with the read
