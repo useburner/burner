@@ -4686,8 +4686,34 @@ def cmd_open(args):
     adb_or_ensure("shell", script)
     u2_invalidate()
     print("opened {}".format(args.url))
+    if for_chrome and not quiet:
+        # Chrome was just launched with the link: the page is asked at
+        # once, and its read is the screen (the launch read paid 2s and
+        # showed the screen reader's lagging tree first, Oct 5)
+        root = _page_after_launch()
+        if root is not None:
+            print_screen(root)
+            return 0
     launch_read(quiet)
     return 0
+
+
+def _page_after_launch():
+    """The page, asked straight after Chrome was launched with a link
+    (the helper contacts it without a native read first; see the
+    helper's `dump page`), parsed, or None when it can't be reached or
+    an older helper read something else: the launch read stands in."""
+    try:
+        xml = u2sock("dump", "page", timeout=40)
+        if not xml or "<node" not in xml:
+            return None
+        root = ET.fromstring(xml)
+    except Exception:
+        return None
+    if (dump_package(root) or "") not in WEB_APPS:
+        return None
+    _update_screen_from_dump(root)
+    return root
 
 
 def cmd_amazon_status(args):

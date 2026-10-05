@@ -415,7 +415,7 @@ def visible(page, timeout=PROBE_S):
     return False
 
 
-def front_page(dev, current=None):
+def front_page(dev, current=None, first_probe_s=None):
     """The page the user sees: `current` while it is still the visible
     one, else the visible page among Chrome's first SCAN_TABS tabs (a
     fresh session for it; Chrome lists the current tab first, and a
@@ -423,8 +423,11 @@ def front_page(dev, current=None):
     so the wait is one probe's, not one per tab (three in a row cost 6s
     while a heavy page loaded, Oct 5); when none answers "visible", the
     current tab, listed first, is given LOAD_PROBE_S once more: too busy
-    loading to answer is not hidden. Raises RuntimeError when none is
-    visible (Chrome isn't in front, or shows a native screen)."""
+    loading to answer is not hidden. With `first_probe_s` (Chrome was
+    just launched with a link: its current tab is loading it), the
+    current tab is given that long from the start. Raises RuntimeError
+    when none is visible (Chrome isn't in front, or shows a native
+    screen)."""
     if current is not None:
         if visible(current):
             return current
@@ -436,14 +439,14 @@ def front_page(dev, current=None):
 
     def probe(i):
         try:
-            found[i] = Page(dev, ids[i])
+            found[i] = Page(dev, ids[i], probe_s=first_probe_s if i == 0 else None)
         except Exception as e:
             found[i] = e
     threads = [threading.Thread(target=probe, args=(i,), daemon=True) for i in range(len(ids))]
     for t in threads:
         t.start()
     for t in threads:
-        t.join(PROBE_S + 3.0)
+        t.join(max(PROBE_S, first_probe_s or 0) + 3.0)
     page = None
     for p in found:
         if isinstance(p, Page):
@@ -453,7 +456,8 @@ def front_page(dev, current=None):
                 p.close()
     if page is not None:
         return page
-    if not isinstance(found[0], Page) and not isinstance(found[0], ConnectionError):
+    if (first_probe_s is None and not isinstance(found[0], Page)
+            and not isinstance(found[0], ConnectionError)):
         # the current tab didn't answer in time: busy with a load, not hidden
         p = Page(dev, ids[0], probe_s=LOAD_PROBE_S)
         if p.visible_at > 0:

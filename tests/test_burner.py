@@ -3355,7 +3355,8 @@ class LaunchReadBudgetTests(OfflineTestCase):
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_open(self.parse(["open", "https://example.com"]))
         self.assertEqual(rc, 0)
-        self.assertEqual(calls[1], ("act", '{"idle": 1000}'))
+        self.assertEqual(calls[1], ("dump", "page"))  # the page asked first (an older helper's reply: not a page)
+        self.assertEqual(calls[2], ("act", '{"idle": 1000}'))
         self.assertEqual(dump.call_count, 1)  # one re-read of a thin screen
         self.assertIn("(may still be loading)", out.getvalue())
 
@@ -6689,6 +6690,99 @@ class CoordinateTapTests(OfflineTestCase):
                 mock.patch.object(cdp, "pages", lambda dev: [{"id": "A"}]):
             with self.assertRaises(RuntimeError):
                 cdp.front_page(None)
+
+    def test_a_cold_open_asks_the_page_straight_after_the_launch(self):
+        # Chrome not in front: the helper can't open the link in a page,
+        # the link is launched by intent, and the page is asked at once
+        page = _cdp().page_xml(WEB_SCREEN, 283, 2400)
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append((cmd, arg if cmd != "act" else json.loads(arg)))
+            if cmd == "act":
+                pc._u2_status = "err act not sent: not a page"
+                return None
+            return page if arg == "page" else "100"
+        self.allow("u2sock", side_effect=u2)
+        adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
+        self.allow("u2_invalidate")
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_open(self.parse(["open", "https://www.espn.com/nfl/"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual(adb.call_count, 1)
+        self.assertEqual([c[0] for c in calls], ["act", "dump"])
+        self.assertEqual(calls[1], ("dump", "page"))
+        self.assertIn("Box Score (click) (796,491)", out.getvalue())
+        # the page can't be reached (a Chrome still starting, a native screen): the launch read, as before
+        calls.clear()
+
+        def u2_none(cmd, arg="", timeout=30):
+            calls.append((cmd, arg if cmd != "act" else json.loads(arg)))
+            if cmd == "act":
+                if "open" in json.loads(arg):
+                    pc._u2_status = "err act not sent: not a page"
+                    return None
+                return SAMPLE_XML.replace("com.example", "com.android.chrome")  # the launch read
+            return "" if arg == "page" else "100"
+        self.allow("u2sock", side_effect=u2_none)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_open(self.parse(["open", "https://www.espn.com/nfl/"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual([c[0] for c in calls][:3], ["act", "dump", "act"])
+        self.assertIn("screen: com.android.chrome", out.getvalue())
+
+    def test_the_helper_contacts_the_page_after_a_launch_without_a_native_read(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = WebPathTests._fake_cdp(self, mod, calls)
+        fake.LOAD_PROBE_S = 6.0
+        fake.front_page = lambda dev, current=None, first_probe_s=None: (
+            calls.append(("front_page", first_probe_s)) or _FakePage())
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])  # the screen reader is never asked
+        dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()  # the newest read: not Chrome
+        dm._web_retry_at = mod._time.monotonic() + 100  # a cooldown that a launch overrides
+        xml = dm.cmd_dump("page").decode()
+        self.assertIn('text="Box Score"', xml)
+        self.assertEqual(calls, [("front_page", 6.0), ("read",)])
+        self.assertEqual(dm.d.calls, [])
+        # a Chrome still starting: asked again, then the page
+        calls.clear()
+        answers = iter([OSError("refused"), OSError("refused"), _FakePage()])
+
+        def starting(dev, current=None, first_probe_s=None):
+            a = next(answers)
+            calls.append(("front_page", first_probe_s))
+            if isinstance(a, Exception):
+                raise a
+            return a
+        fake.front_page = starting
+        self.assertIn('text="Box Score"', dm.cmd_dump("page").decode())
+        self.assertEqual([c for c in calls if c[0] == "front_page"], [("front_page", 6.0)] * 3)
+        # a native screen of Chrome's: nothing, and no native read here
+        fake.front_page = mock.Mock(side_effect=RuntimeError("no visible page in Chrome's first 3 tabs"))
+        self.assertEqual(dm.cmd_dump("page"), b"")
+        self.assertEqual(dm.d.calls, [])
+
+    def test_the_current_tab_gets_the_long_probe_from_the_start_after_a_launch(self):
+        cdp = _cdp()
+        probes = []
+
+        class Tab:
+            def __init__(self, dev, target, probe_s=None):
+                probes.append((target, probe_s))
+                self.target, self.visible_at = target, (1.0 if (target == "A" and probe_s) else 0.0)
+                if target != "A":
+                    raise TimeoutError("timed out")
+
+            def close(self):
+                pass
+        with mock.patch.object(cdp, "Page", Tab), \
+                mock.patch.object(cdp, "pages", lambda dev: [{"id": "A"}, {"id": "B"}, {"id": "C"}]):
+            page = cdp.front_page(None, first_probe_s=6.0)
+        self.assertEqual(page.target, "A")
+        self.assertEqual(probes, [("A", 6.0), ("B", None), ("C", None)])  # no second round
 
     def test_touch_at_maps_the_screen_point_into_the_page(self):
         cdp = _cdp()

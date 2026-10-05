@@ -1116,11 +1116,17 @@ class U2Daemon:
             return c[1]
         return None
 
-    def _page(self):
+    LAUNCH_CONTACT_TRIES = 10  # a Chrome just launched: its DevTools side is asked this often, 0.3s apart
+
+    def _page(self, assume_chrome=False):
         """The visible page in Chrome, when Chrome is the app in front on
         the newest read and the page can be reached (cdp.front_page);
         else None: a native screen, or Chrome out of reach, and the
-        screen reader's path applies."""
+        screen reader's path applies. assume_chrome: Chrome was just
+        launched with a link (no read shows it yet): the page is
+        contacted at once, its current tab given the longer probe from
+        the start, and a Chrome still starting is asked again for a
+        few seconds."""
         last = getattr(self, "_last_xml", "")
         cached = getattr(self, "_front_cache", None)
         if cached is not None and cached[0] is last:
@@ -1128,12 +1134,29 @@ class U2Daemon:
         else:
             info = screen_of(last) if last else None
             self._front_cache = (last, info)
-        if not info or not _cdp().is_chrome(info[2]):
-            return None
-        if _time.monotonic() < getattr(self, "_web_retry_at", 0.0):
-            return None  # out of reach a moment ago: the screen reader, for now
+        if not assume_chrome:
+            if not info or not _cdp().is_chrome(info[2]):
+                return None
+            if _time.monotonic() < getattr(self, "_web_retry_at", 0.0):
+                return None  # out of reach a moment ago: the screen reader, for now
         current = getattr(self, "_web", None)
         chrome_in_front = True
+        if assume_chrome:
+            for i in range(self.LAUNCH_CONTACT_TRIES):
+                try:
+                    with _t("web page (after a launch)"):
+                        self._web = _cdp().front_page(getattr(self.d, "_dev", None), current,
+                                                      first_probe_s=_cdp().LOAD_PROBE_S)
+                    return self._web
+                except Exception as e:
+                    current = None
+                    if i == self.LAUNCH_CONTACT_TRIES - 1 or not isinstance(e, (OSError, ValueError)):
+                        self._web = None
+                        self._web_retry_at = _time.monotonic() + WEB_BUSY_RETRY_S
+                        log("the page in Chrome is out of reach after the launch (%s); the screen reader"
+                            % err_text(e, 100))
+                        return None
+                    _time.sleep(0.3)  # Chrome still starting: its DevTools side isn't up yet
         if current is not None and not _cdp().visible(current, _cdp().QUICK_PROBE_S):
             # The page in hand didn't answer at once: it left the front,
             # or it is busy (right after a navigation). One look at the
@@ -1205,7 +1228,7 @@ class U2Daemon:
                 xml = read_screen(self.d)
         return xml
 
-    def _page_read(self):
+    def _page_read(self, assume_chrome=False):
         """The page in Chrome as a screen read, or None (see _page). The
         screen reader's tree lags a finger scroll on a heavy page by
         seconds and comes back empty for a while (espn.com, Oct 4); the
@@ -1213,7 +1236,7 @@ class U2Daemon:
         app over the page (see _Look and window_over: the notification
         shade, a permission dialog): the page can't see it, and the
         screen reader's read is the screen then."""
-        page = self._page()
+        page = self._page(assume_chrome)
         if page is None:
             return None
         look = _Look(self)  # the phone's windows, read meanwhile
@@ -1244,19 +1267,25 @@ class U2Daemon:
             self._mute_since, self._wordless_seen = None, False
         self._last_xml, self._last_xml_t = xml, _time.monotonic()
 
-    def _dump(self, fresh=False, replace=True):
+    def _dump(self, fresh=False, replace=True, page_first=False):
         """Hierarchy XML; served from cache if < DUMP_TTL old unless fresh.
         replace=False: a wordless read is kept without replacing the
         server (a `wait` close to its deadline). A page in Chrome is read
-        from the page itself (see _page_read)."""
-        xml = None if fresh else self._fresh_cache()
+        from the page itself (see _page_read). page_first: Chrome was just
+        launched with a link, and the page is asked without a native read
+        first (that read paid 2s and showed the screen reader's lagging
+        tree, Oct 5); "" when the page can't be reached, for the caller
+        to read its own way."""
+        xml = None if (fresh or page_first) else self._fresh_cache()
         if xml is not None:
             log("dump cache hit")
             return xml
         with self._lock:
             gen, t0 = self._gen, _time.monotonic()
             self._front_look = None
-            xml = self._page_read()
+            xml = self._page_read(assume_chrome=page_first)
+            if xml is None and page_first:
+                return ""
             if xml is None:
                 # the page check's own look at the screen (Chrome left the
                 # front), when it took one, is this read
@@ -1386,6 +1415,9 @@ class U2Daemon:
         if arg.strip() == "cached":
             young = _time.monotonic() - self._last_xml_t < self.CACHED_READ_S
             return self._last_xml.encode() if young and has_words(self._last_xml) else b""
+        if arg.strip() == "page":
+            # Chrome was just launched with a link: the page, asked at once
+            return self._dump(fresh=True, page_first=True).encode()
         return self._dump(fresh=(arg.strip() == "fresh")).encode()
 
     def cmd_invalidate(self, _):
