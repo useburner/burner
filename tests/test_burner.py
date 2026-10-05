@@ -3810,6 +3810,36 @@ class LabelTapTests(OfflineTestCase):
 
 
 class HelperStalenessTests(OfflineTestCase):
+    def test_a_command_waits_for_a_helper_that_is_starting(self):
+        attempts = []
+
+        class Sock:
+            def settimeout(self, t):
+                pass
+
+            def connect(self, path):
+                attempts.append(path)
+                if len(attempts) < 4:
+                    raise OSError("no socket yet")
+        with mock.patch.object(pc, "helper_starting", return_value=True), \
+                mock.patch.object(pc, "_helper_waited", False), \
+                mock.patch.object(pc.time, "sleep") as sl:
+            pc.connect_helper(Sock(), 5)
+            self.assertEqual(len(attempts), 4)  # three misses, then the socket
+            self.assertEqual(sl.call_count, 3)
+            # the wait was had once: a start that never comes isn't waited for again
+            attempts.clear()
+            with self.assertRaises(OSError):
+                pc.connect_helper(Sock(), 5)
+            self.assertEqual(len(attempts), 1)
+        # no start under way: no wait at all
+        attempts.clear()
+        with mock.patch.object(pc, "helper_starting", return_value=False), \
+                mock.patch.object(pc, "_helper_waited", False), \
+                mock.patch.object(pc.time, "sleep") as sl, self.assertRaises(OSError):
+            pc.connect_helper(Sock(), 5)
+        self.assertEqual((len(attempts), sl.call_count), (1, 0))
+
     def test_helper_restarts_when_any_file_under_lib_u2_is_newer(self):
         # the helper loads cdp.py once: an update that changed only the
         # page scripts must restart it too

@@ -731,6 +731,47 @@ def u2_restart_if_stale():
     u2_start_background()
 
 
+HELPER_START_WAIT_S = 12.0  # a command waits this long for a helper that is starting
+_helper_waited = False      # once per process: a start that never comes isn't waited for twice
+
+
+def helper_starting():
+    """True while a helper start began in the last 30s (u2_start_background
+    stamps it): its socket appears once it has connected to the phone."""
+    try:
+        return time.time() - os.path.getmtime(U2_STARTING) < 30
+    except OSError:
+        return False
+
+
+def connect_helper(s, timeout):
+    """Connect `s` to the helper's socket. A helper that is starting (after
+    `burner update` changed its code, or a first command) is waited for,
+    HELPER_START_WAIT_S at most, once per process: the slow adb way for
+    one command costs more than the wait (an `open` took 14.6s there and
+    opened a new Chrome tab besides, Oct 5), and the commands after it
+    would go that way too."""
+    global _helper_waited
+    s.settimeout(timeout)
+    try:
+        s.connect(U2_SOCK)
+        return
+    except OSError:
+        if _helper_waited or not helper_starting():
+            raise
+    _helper_waited = True
+    _trace("the UI helper is starting; waiting for it")
+    deadline = time.time() + HELPER_START_WAIT_S
+    while True:
+        time.sleep(0.25)
+        try:
+            s.connect(U2_SOCK)
+            return
+        except OSError:
+            if time.time() >= deadline:
+                raise
+
+
 def u2sock(cmd, arg="", timeout=30):
     """Talk to the u2 mux daemon directly over its Unix socket.
 
@@ -745,8 +786,7 @@ def u2sock(cmd, arg="", timeout=30):
     s = None
     try:
         s = socket.socket(socket.AF_UNIX)
-        s.settimeout(timeout)
-        s.connect(U2_SOCK)
+        connect_helper(s, timeout)
         s.sendall(("{} {}\n".format(cmd, arg)).encode())
         _u2_status = "lost"
         buf = b""
