@@ -1306,7 +1306,13 @@ class AmbiguousTapTests(OfflineTestCase):
         self.allow("wake_async")
         self.allow("ui_dump", return_value=ET.fromstring(xml))
         tc = self.allow("tap_center")
-        self.allow("u2sock", return_value="100")  # the quiet wait after a tap
+
+        def u2(cmd, arg="", timeout=30):
+            if cmd == "act":  # an old helper: the tap is decided here, not by label
+                pc._u2_status = "err unknown command: act"
+                return None
+            return "100"  # the quiet wait after a tap
+        self.allow("u2sock", side_effect=u2)
         # These test the tap decision only: no read after, no evidence.
         args = self.parse([argv[0], "--quiet", "--no-evidence"] + argv[1:])
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
@@ -2537,10 +2543,18 @@ class ScreenRowsTests(OfflineTestCase):
         self.assertIn("OK (click) [Button]", out.getvalue())
 
     def test_tap_quiet_skips_the_read(self):
+        # with an old helper (no label tap): one read to find the row, the
+        # tap, the quiet wait, and no screen printed
         self.allow("wake_async", return_value=mock.Mock())
         dump = self.allow("ui_dump", return_value=ET.fromstring(TAP_XML))
         self.allow("tap_center")
-        self.allow("u2sock", return_value="100")  # quiet: the wait, no read
+
+        def u2(cmd, arg="", timeout=30):
+            if cmd == "act":
+                pc._u2_status = "err unknown command: act"
+                return None
+            return "100"  # quiet: the wait, no read
+        self.allow("u2sock", side_effect=u2)
         args = self.parse(["tap", "--quiet", "Not now"])
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_tap(args)
@@ -3379,6 +3393,36 @@ class OneRoundTripTests(OfflineTestCase):
         self.assertIn("tapped Not now (label)", out.getvalue())
         self.assertIn("screen: com.example", out.getvalue())
 
+    def test_quiet_tap_is_one_helper_op_without_a_read(self):
+        # a step of `burner do`: the helper taps by label and waits; no
+        # screen comes back and none is read through the CLI
+        self.allow("wake_async", return_value=mock.Mock())
+        self.allow("ui_dump", side_effect=AssertionError("a quiet label tap must not read through the CLI"))
+        tc = self.allow("tap_center")
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append((cmd, json.loads(arg) if cmd == "act" else arg))
+            return "ok" if cmd == "act" else "100"
+        self.allow("u2sock", side_effect=u2)
+        with mock.patch.object(pc.time, "sleep") as sl, self.cap() as (out, err):
+            rc = pc.cmd_tap(self.parse(["tap", "1", "--quiet"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual(calls, [("act", {"tap_label": "1", "quiet": True, "idle": 1200})])
+        tc.assert_not_called()
+        sl.assert_not_called()
+        self.assertEqual(out.getvalue().strip(), "tapped 1 (label)")
+        # an older helper sends the screen anyway: unread, the tap still counts
+        calls.clear()
+
+        def u2_old(cmd, arg="", timeout=30):
+            calls.append(cmd)
+            return SAMPLE_XML if cmd == "act" else "100"
+        self.allow("u2sock", side_effect=u2_old)
+        with self.cap() as (out, err):
+            rc = pc.cmd_tap(self.parse(["tap", "1", "--quiet"]))
+        self.assertEqual((rc, calls, out.getvalue().strip()), (0, ["act"], "tapped 1 (label)"))
+
     def test_tap_falls_back_to_two_steps_with_an_old_helper(self):
         self.allow("wake_async", return_value=mock.Mock())
         self.allow("ui_dump", side_effect=[ET.fromstring(TAP_XML), ET.fromstring(SAMPLE_XML)])
@@ -3694,6 +3738,20 @@ class LabelTapTests(OfflineTestCase):
             dm.cmd_act(json.dumps({"tap_label": "OK"}))
         self.assertTrue(str(cm.exception).startswith("act not sent: the read before it failed"),
                         str(cm.exception))
+        # a quiet tap (a step of `burner do`): one fresh read before the
+        # tap, the tap, the wait for the UI to go quiet, and no screen
+        # sent back; the read before the tap stays the newest one known
+        dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()
+        dm.d = _FakeServer([SAMPLE_XML], screen_on=True)
+        sent.clear()
+        dm._batch = lambda calls, timeout=45.0: sent.append(calls) or [None] * len(calls)
+        self.assertEqual(dm.cmd_act(json.dumps({"tap_label": "OK", "quiet": True, "idle": 1200})), b"ok")
+        self.assertEqual([m for m, _ in sent[0]], ["wakeUp", "click", "dumpWindowHierarchy", "waitForIdle"])
+        self.assertEqual(sent[0][1], ("click", [250, 450]))
+        self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])
+        self.assertEqual(dm._last_xml, SAMPLE_XML)
+        self.assertEqual([m for m, _ in mod.act_calls({"key": 66, "quiet": True, "idle": 500})],
+                         ["wakeUp", "pressKeyCode", "dumpWindowHierarchy", "waitForIdle"])
 
 
 class StartAndSettingsTests(OfflineTestCase):

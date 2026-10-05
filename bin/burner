@@ -1477,6 +1477,11 @@ def act_and_read(action, prev_root=None, idle_ms=IDLE_ACT_MS, rereads=2):
         # the action may have happened: the caller must not act again.
         why = _u2_status[len("err "):] if _u2_status.startswith("err ") else _u2_status
         return "failed " + why[:100], None, ""
+    if spec.get("quiet"):
+        # a chained step: the helper acted and waited for the UI to go
+        # quiet, and sent no screen (an older helper sends one: unread)
+        _trace("act (quiet) {:.2f}s".format(time.time() - t0))
+        return "ok", None, ""
     try:
         root = ET.fromstring(xml)
     except ET.ParseError:
@@ -2100,17 +2105,22 @@ def cmd_tap(args):
             return _tap_fail(args, str(e))
     waker = wake_async()
     plain = (args.xy is None and snap_xy is None and not args.fuzzy
-             and not args.settle and not args.quiet
-             and not as_json(args) and not args.no_occlusion_check)
+             and not args.settle and not as_json(args) and not args.no_occlusion_check)
     if plain:
         # The screen the assistant was just shown is the helper's newest
         # read: when the label is on it exactly once, the helper taps it
         # by label and returns the settled screen in one round trip (a
         # page in Chrome picks among its matches with --index). Any
         # other case (two matches, an older read) reads first, below.
+        # A quiet tap (a step of `burner do`) gets no screen back: the
+        # helper taps and waits for the UI to go quiet, the next step
+        # reads afresh (a keypad's keys cost a read and a tap each, not a
+        # read, a tap, a sleep and an idle wait).
         spec = {"tap_label": args.text}
         if args.index is not None:
             spec["index"] = args.index
+        if args.quiet:
+            spec["quiet"] = True
         status, root, note = act_and_read(spec)
         if status != "unsent":
             waker.join()
@@ -2120,6 +2130,8 @@ def cmd_tap(args):
             except Exception:
                 pass
             rc = _tap_ok(args, args.text, None, via="label")
+            if args.quiet and status == "ok":
+                return rc
             return print_act(status, root, note, "tap") or rc
     if args.no_occlusion_check and args.xy is None and snap_xy is None \
             and not args.fuzzy and args.index is None and not args.settle:

@@ -651,7 +651,9 @@ def act_calls(spec):
             calls.insert(0, ("wakeUp", []))
         calls.append(("dumpWindowHierarchy", [False, DUMP_DEPTH]))
     calls.append(("waitForIdle", [int(spec.get("idle", 2000))]))
-    calls.append(("dumpWindowHierarchy", [False, DUMP_DEPTH]))
+    if not spec.get("quiet"):
+        # a chained step wants no screen back: the next step reads afresh
+        calls.append(("dumpWindowHierarchy", [False, DUMP_DEPTH]))
     return calls
 
 
@@ -1394,6 +1396,11 @@ class U2Daemon:
                 # The action went to a screen that may be off: dropped, then.
                 raise RuntimeError("act failed after sending: the wake before it failed "
                                    "(%s), so it may have been dropped" % results[0])
+            if spec.get("quiet"):
+                # a chained step: the action landed and the UI went quiet;
+                # no screen was read, the next step reads afresh (the read
+                # before this tap stays the newest one known)
+                return b"ok"
             xml = results[-1]
             if isinstance(xml, Exception) or not xml:
                 raise RuntimeError("act failed after sending: no read (%s)" % xml)
