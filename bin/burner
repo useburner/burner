@@ -1990,11 +1990,12 @@ def _format_evidence(ev):
     return "\n".join(lines)
 
 
-def _tap_fail(args, msg):
+def _tap_fail(args, msg, evidence=True):
     """Report a tap failure: human text on stderr, pure JSON on stdout with --json.
-    Attaches failure evidence (screenshot + screen contents) unless --no-evidence."""
+    Attaches failure evidence (screenshot + screen contents) unless --no-evidence
+    or the message is its own evidence (evidence=False)."""
     ev = None
-    if not getattr(args, "no_evidence", False):
+    if evidence and not getattr(args, "no_evidence", False):
         ev = _capture_evidence("tap-fail")
         ev_txt = _format_evidence(ev)
         if ev_txt:
@@ -2134,7 +2135,8 @@ def _tap_ambiguous(args, used, hits, fuzzy_used):
            "use --index N or a longer label").format(
                used, len(hits), " (fuzzy)" if fuzzy_used else "",
                "\n".join(lines))
-    return _tap_fail(args, msg)
+    # the candidates are the evidence: no screenshot (3.3s on a busy phone)
+    return _tap_fail(args, msg, evidence=False)
 
 
 def _one_control(a, b):
@@ -2384,10 +2386,11 @@ def cmd_tap(args):
                 return rc
     waker.join()
     root = None
-    if args.xy is not None or snap_xy is not None:
-        # the point was taken from the screen the assistant was shown: the
-        # helper's newest read is that screen, and the check for what is
-        # over the point needs no read of its own (0.6-1s on a page)
+    if plain or args.xy is not None or snap_xy is not None:
+        # the helper's newest read is the screen: the one it just refused
+        # the tap on (two rows, a row under a dialog), or the one the
+        # assistant took a point from; a read of its own would repeat it
+        # (4.8s on a Play listing while the phone was installing, Oct 5)
         root = _cached_root()
     if root is None:
         root = ui_dump()

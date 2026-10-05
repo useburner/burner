@@ -6751,6 +6751,30 @@ class CoordinateTapTests(OfflineTestCase):
         self.assertIn("act failed after sending: a window over the page", str(cm.exception))
         self.assertEqual(dm._last_xml, SHADE_OVER_PAGE_XML)
 
+    def test_a_refused_label_tap_plans_from_the_helper_s_read_and_lists_without_a_picture(self):
+        # the helper read the screen, found "OK" twice and refused: the CLI
+        # plans on that read (no second read) and lists the candidates
+        self.allow("wake_async", return_value=mock.Mock())
+        self.allow("u2_invalidate")
+        self.allow("ui_dump", side_effect=AssertionError("the helper's read is the screen: no read of its own"))
+        shot = self.allow("_capture_evidence", side_effect=AssertionError("the candidates are the evidence"))
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append((cmd, arg))
+            if cmd == "act":
+                pc._u2_status = "err act not sent: 2 rows read 'OK'"
+                return None
+            return AMBI_XML if arg == "cached" else "100"
+        self.allow("u2sock", side_effect=u2)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_tap(self.parse(["tap", "OK"]))
+        self.assertEqual(rc, 1)
+        self.assertIn("ambiguous tap", err.getvalue())
+        self.assertIn("--index", err.getvalue())
+        self.assertEqual([c[0] for c in calls], ["act", "dump"])
+        shot.assert_not_called()
+
     def test_a_tap_by_xy_plans_from_the_helper_s_newest_read(self):
         self.allow("wake_async", return_value=mock.Mock())
         self.allow("u2_invalidate")
