@@ -6897,7 +6897,7 @@ class CoordinateTapTests(OfflineTestCase):
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_open(self.parse(["open", "https://www.espn.com/nfl/"]))
         self.assertEqual(rc, 0, err.getvalue())
-        self.assertEqual(adb.call_count, 1)
+        self.assertEqual(adb.call_count, 2)  # Chrome brought up first (not here: no Chrome), then the intent
         self.assertEqual([c[0] for c in calls], ["act", "dump"])
         self.assertEqual((calls[1][0], calls[1][1].split()[0]), ("dump", "page"))
         self.assertIn("Box Score (click) (796,491)", out.getvalue())
@@ -7421,6 +7421,55 @@ class AirbnbRoundTests(OfflineTestCase):
         self.allow("u2sock", side_effect=u2)
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             pc.cmd_open(self.parse(["open", "https://www.airbnb.com/s/homes"]))
-        script = adb.call_args_list[0][0][1]
+        scripts = [c[0][1] for c in adb.call_args_list]
+        self.assertIn("resolve-activity", scripts[0])  # Chrome brought up first (no Chrome here: the intent)
+        script = [s for s in scripts if "android.intent.action.VIEW" in s][0]
         self.assertIn("--es com.android.browser.application_id burner", script)
         self.assertNotIn("application_id com.android.chrome", script)
+
+    def test_a_link_while_chrome_is_in_the_background_loads_in_the_tab_chrome_comes_back_to(self):
+        # a link launched by intent added a tab every time (120 on a phone)
+        # and the new tab took up to 17s to answer, Oct 5: Chrome is brought
+        # up as a tap on its icon does, and its tab loads the link
+        self.allow("adb_or_ensure", return_value=SimpleNamespace(
+            returncode=0, stdout="  mFocusedApp=ActivityRecord{1 u0 com.android.chrome/.Main t1}\n", stderr=""))
+        self.allow("u2_invalidate")
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            spec = json.loads(arg) if cmd == "act" else arg
+            calls.append((cmd, spec))
+            if cmd == "act" and not spec.get("launched"):
+                pc._u2_status = "err act not sent: not a page"  # Chrome not in front
+                return None
+            return CHROME_XML if cmd == "act" else "100"
+        self.allow("u2sock", side_effect=u2)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_open(self.parse(["open", "https://www.airbnb.com/s/homes"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual([c for c in calls if c[0] == "act"],
+                         [("act", {"open": "https://www.airbnb.com/s/homes", "idle": pc.IDLE_LAUNCH_MS}),
+                          ("act", {"open": "https://www.airbnb.com/s/homes", "launched": True, "idle": pc.IDLE_LAUNCH_MS})])
+        self.assertNotIn(("dump", "page https://www.airbnb.com/s/homes"), calls)  # no intent, no launch read
+        self.assertIn("opened https://www.airbnb.com/s/homes", out.getvalue())
+        self.assertIn("screen: com.android.chrome", out.getvalue())
+
+    def test_the_helper_opens_a_link_after_a_launch_the_launch_way(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = WebPathTests._fake_cdp(self, mod, calls)
+        fake.front_page = lambda dev, current=None, **kw: calls.append(("front_page", kw.get("quick"), kw.get("hint"))) or _FakePage()
+        fake.navigate = lambda page, url, idle_ms=1000: calls.append(("navigate", url)) or {"screen": WEB_SCREEN, "ready": "complete"}
+        dm = EmptyScreenTests._daemon(self, mod)
+        mod.log = lambda *a: None
+        dm.d = _FakeServer([CHROME_XML])  # the launch check: Chrome in front
+        dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()  # the newest read: the launcher
+        xml = dm.cmd_act(json.dumps({"open": "https://www.espn.com/nfl/", "launched": True, "idle": 1000})).decode()
+        self.assertIn('text="Box Score"', xml)
+        self.assertEqual(calls[:2], [("front_page", True, "https://www.espn.com/nfl/"), ("navigate", "https://www.espn.com/nfl/")])
+        # without "launched", the newest read decides, as before: not a page
+        dm._last_xml, dm._web = SAMPLE_XML, None
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"open": "https://www.espn.com/nfl/"}))
+        self.assertEqual(str(cm.exception), "act not sent: not a page")

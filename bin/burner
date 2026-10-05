@@ -4799,6 +4799,9 @@ def cmd_settings(args):
     return 0
 
 
+CHROME_PKG = "com.android.chrome"
+
+
 def cmd_open(args):
     quiet = getattr(args, "quiet", False)
     for_chrome = (args.url.startswith(("http://", "https://"))
@@ -4818,6 +4821,26 @@ def cmd_open(args):
                   .format(status[len("failed "):][:100] if status.startswith("failed ")
                           else status), file=sys.stderr)
             return 1
+        if not args.package:
+            # Chrome isn't in front: brought up on the tab it was left on
+            # (as a tap on its icon does), and that tab loads the link,
+            # through the page. No tab added: a link launched by intent
+            # added a tab every time (120 on a phone), and the new tab
+            # took up to 17s to answer (Oct 5). The intent below stays
+            # for no Chrome, or no page reachable once it is up.
+            if launch_and_check(CHROME_PKG) == CHROME_PKG:
+                u2_invalidate()
+                status, root, note = act_and_read({"open": args.url, "launched": True},
+                                                  idle_ms=IDLE_LAUNCH_MS, rereads=1)
+                if status == "ok":
+                    print("opened {}".format(args.url))
+                    print_screen(root, note=note)
+                    return 0
+                if status != "unsent":
+                    print("burner: opening the link in the page failed ({}); run burner state"
+                          .format(status[len("failed "):][:100] if status.startswith("failed ")
+                                  else status), file=sys.stderr)
+                    return 1
     # The phone's shell re-splits what adb sends: an unquoted link with
     # `&` was cut there (`market://search?q=x&c=apps com.android.vending`
     # became `market://search?q=x`, and the package was lost).

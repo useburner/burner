@@ -1799,11 +1799,16 @@ class U2Daemon:
         if "open" in spec:
             # A link opened in the page in Chrome (cdp.navigate): its
             # current tab loads it. No tab for every link, no first
-            # contact with a new one. Elsewhere the CLI launches the link
-            # (remembered: the tab it lands in is the one to look for).
-            page = self._page()
+            # contact with a new one. "launched": the CLI just brought
+            # Chrome up (no read shows it yet): the page is contacted the
+            # way it is after a launch, the link the hint. Elsewhere the
+            # CLI launches the link (remembered: the tab it lands in is
+            # the one to look for).
+            link = str(spec["open"])
+            page = (self._page(assume_chrome=True, hint=link) if spec.get("launched")
+                    else self._page())
             if page is None:
-                self._opened, self._opened_at = str(spec["open"]), _time.monotonic()
+                self._opened, self._opened_at = link, _time.monotonic()
                 raise RuntimeError("act not sent: not a page")
             with self._lock:
                 self.invalidate()
