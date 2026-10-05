@@ -2137,13 +2137,32 @@ def cmd_tap(args):
             nodes = walk(root)
             plan = plan_tap(nodes, w, h, text=args.text, fuzzy=args.fuzzy,
                             index=args.index, check=not args.no_occlusion_check)
+    if plan["action"] == "clipped" and _nudge(plan["edge"]):
+        if plain:
+            # The row where it is now, by label: the helper reads afresh
+            # and taps in one round trip (the read right after the swipe
+            # may still give the row's old place).
+            status, after, note = act_and_read({"tap_label": args.text})
+            if status != "unsent":
+                snap_invalidate()
+                try:
+                    nav_record(None, 'tap "{}"'.format(args.text), None, ok=True)
+                except Exception:
+                    pass
+                rc = _tap_ok(args, args.text, None, via="label")
+                return print_act(status, after, note, "tap") or rc
+        again, _ = read_after_root(prev_root=root, idle_ms=IDLE_ACT_MS)
+        if again is not None:
+            root = again
+            _update_screen_from_dump(root)
+            nodes = walk(root)
+            plan = plan_tap(nodes, w, h, text=args.text, fuzzy=args.fuzzy,
+                            index=args.index, check=not args.no_occlusion_check)
     if plan["action"] == "clipped":
-        root, nodes, plan = _nudge_and_replan(args, root, nodes, plan, w, h)
-        if plan["action"] == "clipped":
-            return _tap_fail(args, '"{}" is cut off at the {} edge of the screen; '
-                             'scroll {} a little and tap again'.format(
-                                 args.text, plan["edge"],
-                                 "up" if plan["edge"] == "top" else "down"))
+        return _tap_fail(args, '"{}" is cut off at the {} edge of the screen; '
+                         'scroll {} a little and tap again'.format(
+                             args.text, plan["edge"],
+                             "up" if plan["edge"] == "top" else "down"))
     if plan["action"] == "nomatch":
         return _tap_fail(args, 'no match for "{}"'.format(args.text))
     if plan["action"] == "ambiguous":
@@ -2193,28 +2212,18 @@ NUDGE_PX = 180  # a nudge moves the content this far: a cut-off row becomes whol
                 # and a page near its top isn't pulled far enough to refresh
 
 
-def _nudge_and_replan(args, root, nodes, plan, w, h):
-    """A row cut off at an edge, nudged into view: the content moves
-    NUDGE_PX away from that edge (down, for the top edge), the screen is
-    read again and the tap planned again, the way a person scrolls a
-    touch before tapping a row at the edge. The plan comes back "clipped"
-    when the nudge couldn't be sent or the row is still a sliver."""
-    direction = "up" if plan["edge"] == "top" else "down"  # as `burner scroll`
+def _nudge(edge):
+    """The content nudged NUDGE_PX away from the edge that cuts a row off
+    (down, for the top edge), the way a person scrolls a touch before
+    tapping a row at the edge. False when the swipe can't be sent."""
+    direction = "up" if edge == "top" else "down"  # as `burner scroll`
     try:
         sent = _scrcpy_swipe(direction, length=NUDGE_PX)
     except Exception:
         sent = False
-    if not sent:
-        return root, nodes, plan
-    _trace("nudged {} {}px: the row was cut off".format(direction, NUDGE_PX))
-    again, _ = read_after_root(prev_root=root, idle_ms=IDLE_SCROLL_MS)
-    if again is None:
-        return root, nodes, plan
-    _update_screen_from_dump(again)
-    nodes = walk(again)
-    plan = plan_tap(nodes, w, h, text=args.text, fuzzy=args.fuzzy,
-                    index=args.index, check=not args.no_occlusion_check)
-    return again, nodes, plan
+    if sent:
+        _trace("nudged {} {}px: the row was cut off".format(direction, NUDGE_PX))
+    return sent
 
 
 def nav_record_action(from_nodes, action_desc, to_fp=None, ok=True):

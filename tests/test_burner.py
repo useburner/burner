@@ -3518,6 +3518,33 @@ class LabelTapTests(OfflineTestCase):
             pc.cmd_tap(self.parse(["tap", "OK", "--index", "1"]))
         self.assertNotIn("tap_label", calls[0])
 
+    def test_tap_nudges_a_cut_off_row_then_taps_it_by_label(self):
+        # espn.com, Oct 4: the row is cut off at the top edge on the first
+        # read; after the nudge the helper reads afresh and taps by label
+        # (the read right after the swipe may still give the old place)
+        self.allow("wake_async", return_value=mock.Mock())
+        self.allow("ui_dump", return_value=ET.fromstring(CLIPPED_XML))
+        tc = self.allow("tap_center")
+        self.allow("nav_record")
+        swipe = self.allow("_scrcpy_swipe", return_value=True)
+        acts = []
+
+        def u2(cmd, arg="", timeout=30):
+            acts.append(json.loads(arg))
+            if len(acts) == 1:
+                pc._u2_status = "err act not sent: 'Box Score' is cut off at the screen's edge"
+                return None
+            pc._u2_status = "ok"
+            return WHOLE_XML
+        self.allow("u2sock", side_effect=u2)
+        with self.cap() as (out, err):
+            rc = pc.cmd_tap(self.parse(["tap", "Box Score"]))
+        self.assertEqual(rc, 0, "stdout=%r stderr=%r" % (out.getvalue(), err.getvalue()))
+        swipe.assert_called_once_with("up", length=pc.NUDGE_PX)  # content down
+        self.assertEqual([("tap_label" in a) for a in acts], [True, True])
+        tc.assert_not_called()
+        self.assertIn("tapped Box Score (label)", out.getvalue())
+
     def test_helper_label_target(self):
         mod = _u2mux()
         # the node's centre, by text or by description, case-insensitive
@@ -3535,8 +3562,9 @@ class LabelTapTests(OfflineTestCase):
             mod.label_target(CLIPPED_XML, "Box Score")
         self.assertIn("cut off", str(cm.exception))
         self.assertEqual(mod.label_target(WHOLE_XML, "Box Score"), (796, 491))
-        # a tap by label is a click by coordinates: a touch, no lookup on
-        # the phone (the selector click threw on a web node, Oct 4)
+        # a tap by label reads the screen afresh and taps the row where it
+        # is now, by coordinates: a touch, no lookup on the phone (the
+        # selector click threw on a web node, Oct 4)
         dm = mod.U2Daemon.__new__(mod.U2Daemon)
         import threading
         dm._lock, dm._cache_lock = threading.RLock(), threading.Lock()
@@ -3544,7 +3572,8 @@ class LabelTapTests(OfflineTestCase):
         dm._last_restart, dm._restart_error = -1e9, None
         dm._mute_since, dm._wordless_seen = None, False
         dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()
-        dm.d = _FakeServer([], screen_on=True)
+        mod.log = lambda *a: None
+        dm.d = _FakeServer([SAMPLE_XML], screen_on=True)
         sent = []
 
         def batch(calls, timeout=45.0):
@@ -3553,6 +3582,22 @@ class LabelTapTests(OfflineTestCase):
         dm._batch = batch
         dm.cmd_act(json.dumps({"tap_label": "OK"}))
         self.assertEqual(sent[0][1], ("click", [250, 450]))
+        self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])  # one fresh read, which agreed
+        # the row moved since the assistant's read (a web page's rows report
+        # their old place for a moment after a scroll): it may still be
+        # moving, so one more read, and the newest place is tapped
+        moved = SAMPLE_XML.replace("[100,400][400,500]", "[100,440][400,540]")
+        moved2 = SAMPLE_XML.replace("[100,400][400,500]", "[100,460][400,560]")
+        dm.d = _FakeServer([moved, moved2], screen_on=True)
+        dm.cmd_act(json.dumps({"tap_label": "OK"}))
+        self.assertEqual(sent[-1][1], ("click", [250, 510]))
+        self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"] * 2)
+        # the read before the tap fails: nothing was sent, and it says so
+        dm.d = _FakeServer([], screen_on=True)
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"tap_label": "OK"}))
+        self.assertTrue(str(cm.exception).startswith("act not sent: the read before it failed"),
+                        str(cm.exception))
 
 
 class StartAndSettingsTests(OfflineTestCase):

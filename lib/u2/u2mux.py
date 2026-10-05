@@ -1011,18 +1011,42 @@ class U2Daemon:
         have happened. "act failed after sending: ..." means just that."""
         spec = json.loads(arg) if arg.strip() else {}
         if "tap_label" in spec:
-            # Tap what the assistant was just shown: the label must be on
-            # the newest read, read under 30s ago, exactly once. Anything
+            # Tap the row with this label where it is now: on a fresh
+            # read, not the assistant's. (A web page's rows report their
+            # old place for a moment after a scroll, espn.com Oct 4: the
+            # tap at a row's old place hit the link below it.) When the
+            # row has moved since the assistant's read it may still be
+            # moving: one more read, and the newest place is tapped. The
+            # label must be on the read exactly once and whole; anything
             # else is "not sent": the caller reads the screen and taps by
             # coordinates instead.
             spec = dict(spec)
             label = spec.pop("tap_label")
-            if _time.monotonic() - self._last_xml_t > 30:
-                raise RuntimeError("act not sent: the last read is too old")
+            before = self._last_xml
             try:
-                spec["tap"] = list(label_target(self._last_xml, label))
+                with _t("tap read"):
+                    xml = self._dump(fresh=True)
+            except Exception as e:
+                raise RuntimeError("act not sent: the read before it failed (%s)"
+                                   % err_text(e, 100))
+            try:
+                center = label_target(xml, label)
             except RuntimeError as e:
                 raise RuntimeError("act not sent: %s" % e)
+            try:
+                old = label_target(before, label)
+            except RuntimeError:
+                old = None
+            if old is not None and old != center:
+                log("%r moved since the last read (%s -> %s); reading again"
+                    % (label, old, center))
+                try:
+                    with _t("tap read (again)"):
+                        xml = self._dump(fresh=True)
+                    center = label_target(xml, label)
+                except Exception as e:
+                    raise RuntimeError("act not sent: %s" % err_text(e, 100))
+            spec["tap"] = list(center)
         calls = act_calls(spec)
         acted = [i for i, (m, _) in enumerate(calls) if m in ACTION_METHODS]
         timeout = int(spec.get("idle", 2000)) / 1000.0 + 20
