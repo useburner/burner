@@ -1187,6 +1187,8 @@ class U2Daemon:
                 page.visible_at = 0.0
             log("the page says it is hidden now; the screen reader says what is in front")
             return None
+        if page is not None:
+            page.last_read = screen  # the page's pixels to the screen's: a touch by --xy maps back
         last = getattr(self, "_last_xml", "")
         info = screen_of(last) if last else None
         return _cdp().page_xml(screen, webview_top(last), info[1] if info else 0)
@@ -1799,6 +1801,43 @@ class U2Daemon:
                 xml = self._after_page(r["screen"])
                 self._remember(xml)
             return xml.encode()
+        if "tap" in spec and self._page() is not None:
+            # A touch by --xy or a snap handle on a page in Chrome: the page
+            # takes it at the point itself, with the read in the same round
+            # trip (cdp.touch_at); the screen reader's click paid a pause
+            # read, an idle wait and a page read after (2.9-3.6s a tap on
+            # the ESPN pages, Oct 5). A point outside the WebView (the
+            # address bar) is the screen reader's, below. The phone's windows
+            # are looked at meanwhile: a dialog that came up since the read
+            # the point was taken from is said (the touch went under it).
+            page, last = self._web, self._last_xml
+            shot, rect = getattr(page, "last_read", None), webview_rect(last)
+            x, y = int(spec["tap"][0]), int(spec["tap"][1])
+            if shot and rect and rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                with self._lock:
+                    self.invalidate()
+                    look = _Look(self)
+                    try:
+                        with _t("web touch"):
+                            r = _cdp().touch_at(page, x, y, shot, webview_top(last),
+                                                int(spec.get("idle", 1200)))
+                    except _cdp().NothingSent as e:
+                        raise RuntimeError("act not sent: the page couldn't be asked (%s)" % e)
+                    except Exception as e:
+                        self._web = None
+                        raise RuntimeError("act failed after sending: %s" % err_text(e, 120))
+                    over = look.over()
+                    if over is not None:
+                        with _t("dump rpc (window over)"):
+                            xml = read_screen(self.d)
+                        self._remember(xml)
+                        raise RuntimeError("act failed after sending: a window over the page (%s %r) "
+                                           "has the screen; the touch went under it" % over)
+                    xml = self._after_page(r["screen"])
+                    self._remember(xml)
+                if spec.get("quiet"):
+                    return b"ok"
+                return xml.encode()
         if "tap_label" in spec:
             if spec.get("index") is not None:
                 # Which of several rows: the caller reads and plans.

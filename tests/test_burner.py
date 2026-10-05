@@ -1496,13 +1496,23 @@ class SnapTests(OfflineTestCase):
         self.allow("wake_async")
         self.allow("ui_dump", return_value=ET.fromstring(AMBI_XML))
         tc = self.allow("tap_center")
-        self.allow("u2sock", return_value="100")
+        calls = []
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30:
+                   calls.append((cmd, json.loads(arg) if cmd == "act" else arg)) or ("ok" if cmd == "act" else "100"))
         args = self.parse(["tap", "--quiet", "@e2"])
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_tap(args)
         self.assertEqual(rc, 0)
-        tc.assert_called_once_with(650, 450)  # Cancel button coords
+        # one trip through the helper: the Cancel button's point, no screen back
+        self.assertIn(("act", {"tap": [650, 450], "quiet": True, "idle": pc.IDLE_ACT_MS}), calls)
+        tc.assert_not_called()
         self.assertIn("@e2", out.getvalue())
+        # the helper away: the tap over scrcpy, as before
+        self.allow("u2sock", return_value=None)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_tap(self.parse(["tap", "--quiet", "@e2"]))
+        self.assertEqual(rc, 0)
+        tc.assert_called_once_with(650, 450)  # Cancel button coords
 
     def test_tap_stale_snap_fails(self):
         args = self.parse(["tap", "--no-evidence", "@e1"])
@@ -6630,3 +6640,98 @@ class PhoneAsksTests(OfflineTestCase):
         dm._last_xml, dm._last_xml_t = "", mod._time.monotonic()
         self.assertEqual(dm.cmd_dump("cached"), b"")
         self.assertEqual(dm.d.calls, [])
+
+
+# --------------------------------- 28. a tap by --xy in one round trip
+
+class CoordinateTapTests(OfflineTestCase):
+    def test_touch_at_maps_the_screen_point_into_the_page(self):
+        cdp = _cdp()
+
+        class Page(_ScriptedPage):
+            def call_many(self, cmds, timeout=10.0, raise_errors=True):
+                self.sent = cmds
+                return super().call_many(cmds, timeout, raise_errors)
+        page = Page(cdp, {"READ_JS": WEB_SCREEN})
+        r = cdp.touch_at(page, 553, 463, WEB_SCREEN, 283)  # the Box Score row's corner (dpr 2, no zoom)
+        self.assertEqual((r["screen"], r["how"], r["ready"]), (WEB_SCREEN, "touch", "complete"))
+        self.assertEqual(page.calls, [("many", ["Input.dispatchTouchEvent", "Input.dispatchTouchEvent", "READ_JS"])])
+        self.assertEqual(page.sent[0][1]["touchPoints"], [{"x": 276.5, "y": 90.0}])
+        # a zoomed-out page (no viewport meta): the scale and the corner count
+        zoomed = dict(WEB_SCREEN, vs=0.5, vx=0, vy=0)
+        page = Page(cdp, {"READ_JS": zoomed})
+        cdp.touch_at(page, 553, 463, zoomed, 283)
+        self.assertEqual(page.sent[0][1]["touchPoints"], [{"x": 553.0, "y": 180.0}])
+
+    def test_the_helper_hands_a_point_on_the_page_to_the_page(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = WebPathTests._fake_cdp(self, mod, calls)
+        fake.touch_at = lambda page, x, y, screen, top, idle_ms=1200: (
+            calls.append(("touch_at", x, y, top, screen is page.last_read))
+            or {"screen": WEB_SCREEN, "ready": "complete", "how": "touch"})
+        fake.front_page = lambda dev, current=None: current  # the page in hand, as the real one keeps it
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm._web = _FakePage()
+        dm._web.visible_at = 1e9
+        dm._web.last_read = WEB_SCREEN
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        dm.d = _FakeServer([])  # the screen reader isn't asked
+        dm._batch = mock.Mock(side_effect=AssertionError("no click through the screen reader"))
+        xml = dm.cmd_act(json.dumps({"tap": [796, 491], "idle": 1200})).decode()
+        self.assertEqual(calls, [("touch_at", 796, 491, 283, True)])
+        self.assertIn('text="Box Score"', xml)
+        self.assertEqual(dm.d.looks, 1)  # the windows, looked at in the touch's wait
+        # a quiet one: no screen back, and the read kept for the next step
+        calls.clear()
+        dm._last_xml = CHROME_XML.replace("Box Score", "Scores")  # the page read before, without the row
+        self.assertEqual(dm.cmd_act(json.dumps({"tap": [796, 491], "quiet": True, "idle": 1200})), b"ok")
+        self.assertIn('text="Box Score"', dm._last_xml)
+        # a point outside the WebView (the address bar): the screen reader's click, as before
+        dm._last_xml = CHROME_XML
+        sent = []
+        dm._batch = lambda c, timeout=45.0: sent.append(c) or [None] * (len(c) - 1) + [CHROME_XML]
+        calls.clear()
+        dm.cmd_act(json.dumps({"tap": [540, 100], "idle": 1200}))
+        self.assertEqual([m for m, _ in sent[0]][:2], ["wakeUp", "click"])
+        self.assertEqual(sent[0][1][1], [540, 100])
+        self.assertEqual([c for c in calls if c[0] == "touch_at"], [])
+        # a window over the page since the read the point came from: said,
+        # and the screen reader's read is the newest
+        calls.clear()
+        dm.d = _FakeServer([SHADE_OVER_PAGE_XML], windows=SHADE_WINDOWS)
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"tap": [796, 491], "idle": 1200}))
+        self.assertIn("act failed after sending: a window over the page", str(cm.exception))
+        self.assertEqual(dm._last_xml, SHADE_OVER_PAGE_XML)
+
+    def test_a_tap_by_xy_plans_from_the_helper_s_newest_read(self):
+        self.allow("wake_async", return_value=mock.Mock())
+        self.allow("u2_invalidate")
+        self.allow("nav_record_action")
+        self.allow("ui_dump", side_effect=AssertionError("no read of its own: the helper's newest read is the screen"))
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append((cmd, json.loads(arg) if cmd == "act" else arg))
+            if cmd == "dump" and arg == "cached":
+                return TAP_XML
+            return SAMPLE_XML if cmd == "act" else "100"
+        self.allow("u2sock", side_effect=u2)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_tap(self.parse(["tap", "--xy", "0.5,0.5"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual(calls[0], ("dump", "cached"))
+        self.assertEqual([c for c in calls if c[0] == "act"], [("act", {"tap": [540, 1200], "idle": pc.IDLE_ACT_MS})])
+        self.assertIn("tapped --xy 0.5,0.5", out.getvalue())
+        self.assertIn("screen: com.example", out.getvalue())
+        # no young read at the helper: a read of its own, as before
+        self.allow("ui_dump", return_value=ET.fromstring(TAP_XML))
+        calls.clear()
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30:
+                   calls.append((cmd, arg)) or ("" if arg == "cached" else SAMPLE_XML if cmd == "act" else "100"))
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_tap(self.parse(["tap", "--xy", "0.5,0.5"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual(calls[0], ("dump", "cached"))

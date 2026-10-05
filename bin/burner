@@ -1506,16 +1506,29 @@ def asked_line(asked):
         asked["text"], " / ".join(asked["options"]))
 
 
-def _asked_now():
-    """The system question on the helper's newest read of the screen (no
-    round trip to the phone: a chain looks between its steps), or None:
-    none asked, or no young read to look at."""
+def _cached_root():
+    """The helper's newest read of the screen, parsed (its CACHED_READ_S
+    old at most; no round trip to the phone), or None: the helper is
+    away, or its read is too old to be the screen now."""
     try:
         xml = u2sock("dump", "cached", timeout=5)
         if not xml or "<node" not in xml:
             return None
         root = ET.fromstring(xml)
-        _update_screen_from_dump(root)
+    except Exception:
+        return None
+    _update_screen_from_dump(root)
+    return root
+
+
+def _asked_now():
+    """The system question on the helper's newest read of the screen (no
+    round trip to the phone: a chain looks between its steps), or None:
+    none asked, or no young read to look at."""
+    root = _cached_root()
+    if root is None:
+        return None
+    try:
         return system_prompt(walk(root), *screen_dims())
     except Exception:
         return None
@@ -2370,8 +2383,15 @@ def cmd_tap(args):
                 read_after(quiet=args.quiet or as_json(args))
                 return rc
     waker.join()
-    root = ui_dump()
-    _update_screen_from_dump(root)
+    root = None
+    if args.xy is not None or snap_xy is not None:
+        # the point was taken from the screen the assistant was shown: the
+        # helper's newest read is that screen, and the check for what is
+        # over the point needs no read of its own (0.6-1s on a page)
+        root = _cached_root()
+    if root is None:
+        root = ui_dump()
+        _update_screen_from_dump(root)
     nodes = walk(root)
 
     if args.xy is not None or snap_xy is not None:
@@ -2482,10 +2502,15 @@ def _tap_then_read(args, label, xy, root):
     """The tap and the screen it ends on. One round trip through the UI
     helper when it can; else the tap over scrcpy and a read after."""
     if args.quiet or as_json(args):
-        tap_center(*xy)
-        rc = _tap_ok(args, label, xy)
-        read_after(quiet=True)
-        return rc
+        # no screen back: the helper taps and waits for the UI to go quiet
+        # in one trip (and keeps its read for a chain's next step)
+        status, _after, _note = act_and_read({"tap": [xy[0], xy[1]], "quiet": True}, prev_root=root)
+        if status == "unsent":
+            tap_center(*xy)
+            read_after(quiet=True)
+        elif status != "ok":
+            return print_act(status, None, "", "tap")
+        return _tap_ok(args, label, xy)
     status, after, note = act_and_read({"tap": [xy[0], xy[1]]}, prev_root=root)
     if status == "unsent":
         tap_center(*xy)

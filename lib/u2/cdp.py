@@ -1062,6 +1062,29 @@ def tap(page, label, index=None, idle_ms=1200):
             "screen": screen, "ready": ready}
 
 
+def touch_at(page, x, y, screen, top, idle_ms=1200):
+    """A touch at (x, y), device pixels of the screen, on the page (a tap
+    by --xy or a snap handle): the point in the page's own CSS pixels by
+    the mapping of `screen`, the page's last read (see page_xml; `top`
+    is the WebView's top edge on the screen), the touch, and the read
+    READ_LATER_MS later in the same round trip; a touch that starts a
+    load is waited out and read afresh. {"screen", "ready", "how"}."""
+    k = float(screen.get("vs") or 1) * float(screen.get("dpr") or 1)
+    cx, cy = x / k, (y - top) / k
+    page.loading = False
+    how, after = touch(page, cx, cy, then=[_evaluate(_later(_js(READ_JS, 600), READ_LATER_MS))])
+    shot, ready = None, "complete"
+    if after and not page.loading:
+        try:
+            shot = _value(after[0])
+        except RuntimeError:
+            shot = None  # the document went away under the read: a load
+    if shot is None or page.loading:
+        probe = after_touch(page, None, idle_ms)
+        shot, ready = read(page), probe.get("ready")
+    return {"screen": shot, "ready": ready, "how": how}
+
+
 def touch_hit(page, hit, then=()):
     """Touch the element FIND_JS found (`hit`, with its place): what
     covers it is closed first, its place taken afresh after a scroll
