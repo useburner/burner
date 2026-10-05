@@ -317,6 +317,14 @@ class Page:
                 if "id" not in m:
                     self._event(m)
 
+    def wait_loading(self, cap_s):
+        """Wait, listening, until a load of the main frame starts, `cap_s`
+        at most. True when one did."""
+        end = time.monotonic() + cap_s
+        while not self.loading and time.monotonic() < end:
+            self.listen(min(0.1, max(0.0, end - time.monotonic())))
+        return self.loading
+
     def wait_parsed(self, cap_s):
         """Wait, listening, until the loading document is parsed, `cap_s`
         at most. True when it is."""
@@ -782,10 +790,11 @@ FIND_JS = r"""
   // calendar) is not: its controls are small
   let over = null;
   if (covered) { const oc = top.closest(ACTIVE); if (oc && spans(box(oc), r)) { over = oc; covered = false; window.__burnerTarget = oc; } }
+  const link = (over || el).closest('a[href]');
   return {found: true, count: 1, used: used, label: (names(el)[0] || '').slice(0, 60),
           x: cx - (vv ? vv.offsetLeft : 0), y: cy - (vv ? vv.offsetTop : 0),
           moved: moved, blurred: blurred, covered: covered, notField: notField, tag: (over || el).tagName.toLowerCase(),
-          over: over ? over.tagName.toLowerCase() : '',
+          over: over ? over.tagName.toLowerCase() : '', href: link ? link.href : '',
           cover: covered ? (top.tagName + ' ' + squash(top.innerText).slice(0, 40)) : '', url: location.href};
 })"""
 
@@ -918,6 +927,7 @@ def _value(res):
 
 
 READ_LATER_MS = 250  # the read in a touch's round trip: this long after it
+LINK_LOAD_S = 1.0    # a touched link to another page: its load is given this long to start
 
 
 def read(page, cap=600):
@@ -1190,6 +1200,12 @@ def tap(page, label, index=None, idle_ms=1200):
             screen = _value(after[0])
         except RuntimeError:
             screen = None  # the document went away under the read: a load
+    if screen is not None and not page.loading and leaves_for(hit, screen):
+        # a link to another page, and the page not going there yet a
+        # moment after the touch: its load is given LINK_LOAD_S to start
+        # (a listing opened half a second after the touch; the read before
+        # that showed the list it left, and read as "nothing happened", Oct 5)
+        page.wait_loading(LINK_LOAD_S)
     if screen is None or page.loading:
         probe = after_touch(page, hit.get("url"), idle_ms)
         screen, ready = read(page), probe.get("ready")
@@ -1200,6 +1216,17 @@ def tap(page, label, index=None, idle_ms=1200):
             "at": [hit.get("x"), hit.get("y")], "tag": hit.get("tag") or "",
             "over": hit.get("over") or "", "moved": bool(hit.get("moved")),
             "covered": bool(hit.get("covered"))}
+
+
+def leaves_for(hit, screen):
+    """Whether the touch on `hit` (FIND_JS's answer) should take the page
+    elsewhere, and `screen` (the read a moment after it) shows it hasn't
+    gone yet: a link to another web address (not the page's own, a
+    fragment aside), and the read's address still the page's. Pure."""
+    href = (hit.get("href") or "").split("#")[0]
+    here = (hit.get("url") or "").split("#")[0]
+    now = ((screen or {}).get("url") or here).split("#")[0]
+    return bool(href) and href.startswith("http") and href != here and now == here
 
 
 def touch_at(page, x, y, screen, top, idle_ms=1200):

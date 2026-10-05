@@ -4246,6 +4246,9 @@ class _FakePage:
     def listen(self, seconds):
         pass
 
+    def wait_loading(self, cap_s):
+        return self.loading
+
     def wait_parsed(self, cap_s):
         return True
 
@@ -5097,6 +5100,37 @@ class WebPathTests(OfflineTestCase):
         self.assertIn("de", [n.get("content-desc") for n in root.iter("node")])
         self.assertIn("title", xml)
         self.assertNotIn("\x00", xml)
+
+    def test_a_tap_on_a_link_waits_for_its_load_to_start(self):
+        # airbnb.com, Oct 5: a listing's link touched, the read 250ms later
+        # still the list, the listing up half a second after that
+        cdp = _cdp()
+        here, there = "https://www.airbnb.com/s/homes", "https://www.airbnb.com/rooms/1"
+        found = {"found": True, "count": 1, "label": "guest suite", "x": 164, "y": 650, "url": here, "href": there}
+        old, new = dict(WEB_SCREEN, url=here), dict(WEB_SCREEN, url=there, title="the listing")
+        waits = []
+
+        class Late(_ScriptedPage):
+            def wait_loading(self, cap_s):
+                waits.append(cap_s)
+                self.loading = True  # the load started within the wait
+                return True
+
+            def wait_parsed(self, cap_s):
+                self.loading = False
+                return True
+        page = Late(cdp, {"FIND_JS": found, "READ_JS": [old, new]})
+        r = cdp.tap(page, "guest suite")
+        self.assertEqual((r["screen"]["title"], r["ready"], waits), ("the listing", "complete", [cdp.LINK_LOAD_S]))
+        # the page already elsewhere a moment after the touch, a link to
+        # the page itself, or no link: no wait
+        for hit, screen in ((found, new), (dict(found, href=here + "#top"), old), (dict(found, href=""), old)):
+            self.assertFalse(cdp.leaves_for(hit, screen))
+        self.assertTrue(cdp.leaves_for(found, old))
+        self.assertTrue(cdp.leaves_for(found, {}))  # a read without an address: not gone yet
+        waits.clear()
+        page = Late(cdp, {"FIND_JS": dict(found, href=""), "READ_JS": old})
+        self.assertEqual((cdp.tap(page, "guest suite")["screen"], waits), (old, []))
 
     def test_tap_reads_the_page_in_the_touch_round_trip(self):
         cdp = _cdp()
