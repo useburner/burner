@@ -241,6 +241,29 @@ class Page:
                 raise RuntimeError("%s: %s" % (method, m["error"].get("message", m["error"])))
             return m.get("result", {})
 
+    def call_many(self, cmds, timeout=10.0):
+        """Several commands sent at once, one round trip: their results
+        in order. cmds: [(method, params), ...]. Raises on the first
+        command that failed, after all have been answered."""
+        ids = []
+        self.ws.s.settimeout(timeout)
+        for method, params in cmds:
+            self.n += 1
+            ids.append(self.n)
+            self.ws.send(json.dumps({"id": self.n, "method": method, "params": params}))
+        got = {}
+        while len(got) < len(ids):
+            m = json.loads(self.ws.recv())
+            if m.get("id") in ids:
+                got[m["id"]] = m
+        out = []
+        for i, (method, _) in zip(ids, cmds):
+            m = got[i]
+            if "error" in m:
+                raise RuntimeError("%s: %s" % (method, m["error"].get("message", m["error"])))
+            out.append(m.get("result", {}))
+        return out
+
     def eval(self, expression, timeout=10.0):
         """The value of a page script (a promise is awaited)."""
         r = self.call("Runtime.evaluate", timeout, expression=expression,
@@ -551,16 +574,34 @@ def settle(page, idle_ms=1200, poll_s=0.15, quiet_s=0.3, url=None, loading=False
 
 def touch(page, x, y):
     """A touch at (x, y) in CSS pixels of the viewport, the way a finger
-    lands; falls back to the element's own click when touch events are
-    refused."""
+    lands (down and up sent together: one round trip); falls back to the
+    element's own click when touch events are refused."""
     try:
-        page.call("Input.dispatchTouchEvent", 5.0, type="touchStart",
-                  touchPoints=[{"x": x, "y": y}])
-        page.call("Input.dispatchTouchEvent", 5.0, type="touchEnd", touchPoints=[])
+        page.call_many([("Input.dispatchTouchEvent",
+                         {"type": "touchStart", "touchPoints": [{"x": x, "y": y}]}),
+                        ("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})],
+                       timeout=5.0)
         return "touch"
     except RuntimeError:
         page.eval("window.__burnerTarget && window.__burnerTarget.click(); 'clicked'")
         return "click"
+
+
+def after_touch(page, url, idle_ms=1200, pause_s=0.2):
+    """What a touch led to, with one probe after a short pause: a page
+    loading (a new url, or a document not yet parsed) is waited out (see
+    settle); anything else is read at once, since what a touch changes
+    on a page is there within the pause. Returns the last probe."""
+    time.sleep(pause_s)
+    try:
+        probe = page.eval(SETTLE_JS, timeout=5.0) or {}
+    except Exception:
+        return {"ready": "?"}
+    if probe.get("vis") == "visible":
+        page.visible_at = time.monotonic()
+    if probe.get("ready") == "loading" or (url and probe.get("url") != url):
+        return settle(page, idle_ms, url=url, loading=True)
+    return probe
 
 
 def find(page, label, top=0):
@@ -603,7 +644,7 @@ def tap(page, label, index=None, idle_ms=1200):
     if hit.get("moved"):
         time.sleep(0.3)  # the scroll into view
     how = touch(page, hit["x"], hit["y"])
-    probe = settle(page, idle_ms, url=hit.get("url"))
+    probe = after_touch(page, hit.get("url"), idle_ms)
     return {"found": True, "count": 1, "label": hit.get("label"), "how": how,
             "screen": read(page), "ready": probe.get("ready")}
 
@@ -646,8 +687,8 @@ def type_text(page, text, idle_ms=800):
     if not ok:
         raise NotSent("no field has the focus on the page")
     page.call("Input.insertText", 10.0, text=text)
-    probe = settle(page, idle_ms)
-    return {"screen": read(page), "ready": probe.get("ready")}
+    time.sleep(0.25)  # the field's own reaction (a list of suggestions)
+    return {"screen": read(page), "ready": "complete"}
 
 
 def scroll(page, direction="down", times=1, fraction=0.6, idle_ms=500):
@@ -665,5 +706,5 @@ def scroll(page, direction="down", times=1, fraction=0.6, idle_ms=500):
         moved += r.get("moved") or 0
         if i < times - 1:
             time.sleep(0.15)
-    probe = settle(page, idle_ms)
-    return {"moved": moved, "screen": read(page), "ready": probe.get("ready")}
+    time.sleep(min(0.15, idle_ms / 1000.0))  # a scroll loads nothing: the rows are in place
+    return {"moved": moved, "screen": read(page), "ready": "complete"}

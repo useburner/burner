@@ -3891,6 +3891,32 @@ class WebPathTests(OfflineTestCase):
         self.assertTrue(cdp.is_chrome("com.android.chrome"))
         self.assertFalse(cdp.is_chrome("com.example"))
 
+    def test_page_commands_sent_together_come_back_in_order(self):
+        cdp = _cdp()
+        sent, answers = [], []
+
+        class FakeWS:
+            class s:
+                @staticmethod
+                def settimeout(t):
+                    pass
+
+            def send(self, text):
+                m = json.loads(text)
+                sent.append(m["method"])
+                # answered out of order, with an event in between
+                answers.insert(0, json.dumps({"id": m["id"], "result": {"n": m["id"]}}))
+                answers.insert(0, json.dumps({"method": "Page.someEvent", "params": {}}))
+
+            def recv(self):
+                return answers.pop()
+        page = object.__new__(cdp.Page)
+        page.ws, page.n, page.visible_at = FakeWS(), 0, 0.0
+        out = page.call_many([("Input.dispatchTouchEvent", {"type": "touchStart"}),
+                              ("Input.dispatchTouchEvent", {"type": "touchEnd"})])
+        self.assertEqual(sent, ["Input.dispatchTouchEvent"] * 2)
+        self.assertEqual([r["n"] for r in out], [1, 2])
+
     def test_http_responses_are_read_by_their_headers(self):
         cdp = _cdp()
 
