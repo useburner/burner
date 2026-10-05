@@ -3634,19 +3634,26 @@ def _scroll_plain(direction, times, quiet=False):
             return _scroll_plain_adb(direction, times - i, quiet=quiet)
         if i < times - 1:
             time.sleep(0.3)  # let one swipe land before the next starts
-    # Still in the app? The same small call as before the swipes (the
-    # active window's package), so like is compared with like: a read's
-    # majority package can differ when another app's dialog is in front.
-    t0 = time.time()
-    now = _screen_pkg if live_screen_dims() else None
-    _trace("scroll front-app check {:.2f}s".format(time.time() - t0))
-    left = now not in (None, pkg)
+    # Still in the app? The read that follows says so (its majority
+    # package); only when that differs from the app before the swipes is
+    # the small active-window call made, so like is compared with like
+    # (another app's dialog in front reads as that app while the window
+    # is still ours). One round trip fewer on every scroll (Oct 4).
     root, note = None, ""
     if quiet:
+        t0 = time.time()
+        now = _screen_pkg if live_screen_dims() else None
+        _trace("scroll front-app check {:.2f}s".format(time.time() - t0))
         time.sleep(max(0.0, 0.6 - (time.time() - t0)))
         u2_invalidate()
     else:
         root, note = read_after_root()
+        now = pkg
+        if root is None or dump_package(root) not in (None, pkg):
+            t0 = time.time()
+            now = _screen_pkg if live_screen_dims() else None
+            _trace("scroll front-app check {:.2f}s".format(time.time() - t0))
+    left = now not in (None, pkg)
     if left:
         print("scroll left {} (now in {}); stopped.".format(pkg, now),
               file=sys.stderr)

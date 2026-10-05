@@ -2202,13 +2202,15 @@ class FastPathTests(OfflineTestCase):
     def test_plain_scroll_via_scrcpy_reads_once_and_catches_leaving_the_app(self):
         self.allow("wake")
         self.allow("u2_invalidate")
-        # The app in front is asked the same way before and after the
-        # swipes (the active window), never compared with a read's
-        # majority package: another app's dialog in front would differ.
+        # The read after the swipes says which app is in front; only when
+        # that differs from the app before them is the active window asked
+        # too (another app's dialog in front reads as that app while the
+        # window is still ours), so like is compared with like.
         screens = iter(["1080 2400 com.example", "1080 2400 com.android.launcher"])
+        launcher_xml = SAMPLE_XML.replace('package="com.example"', 'package="com.android.launcher"')
 
         def u2(cmd, arg="", timeout=30):
-            return next(screens) if cmd == "screen" else SAMPLE_XML
+            return next(screens) if cmd == "screen" else launcher_xml
         u2sock = self.allow("u2sock", side_effect=u2)
         sc = self.allow("scrcpy_send", return_value=True)
         adb = self.allow("adb_or_ensure")
@@ -2222,9 +2224,9 @@ class FastPathTests(OfflineTestCase):
         adb.assert_not_called()
         dump.assert_not_called()  # the one read rides on the helper's act
         self.assertEqual([c[0][0] for c in u2sock.call_args_list],
-                         ["screen", "screen", "act"])
+                         ["screen", "act", "screen"])
         self.assertIn("scroll left com.example", err.getvalue())
-        self.assertIn("screen: com.example", out.getvalue())
+        self.assertIn("screen: com.android.launcher", out.getvalue())
 
     def test_plain_scroll_via_scrcpy_prints_the_screen(self):
         self.allow("wake")
@@ -2242,6 +2244,8 @@ class FastPathTests(OfflineTestCase):
         self.assertIn("scrolled down x1", out.getvalue())
         self.assertIn("screen: com.example", out.getvalue())
         self.assertIn("Hello (300,250)", out.getvalue())
+        # still in the app per the read: no second screen-info round trip
+        self.assertEqual([c[0][0] for c in pc.u2sock.call_args_list], ["screen", "act"])
 
     def test_plain_scroll_one_adb_call_and_no_dump(self):
         self.allow("wake")
