@@ -644,7 +644,7 @@ def touch(page, x, y):
         return "click"
 
 
-def after_touch(page, url=None, idle_ms=1200, listen_s=0.25):
+def after_touch(page, url=None, idle_ms=1200, listen_s=0.15):
     """What a touch led to, heard from the page's events (no round trip,
     and no question to a page mid-navigation, which Chrome answers only
     once the new page is up): a navigation is waited out until the new

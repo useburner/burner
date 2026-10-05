@@ -729,7 +729,12 @@ class U2Daemon:
         else None: a native screen, or Chrome out of reach, and the
         screen reader's path applies."""
         last = getattr(self, "_last_xml", "")
-        info = screen_of(last) if last else None
+        cached = getattr(self, "_front_cache", None)
+        if cached is not None and cached[0] is last:
+            info = cached[1]  # the same read as last time: no second parse
+        else:
+            info = screen_of(last) if last else None
+            self._front_cache = (last, info)
         if not info or not _cdp().is_chrome(info[2]):
             return None
         if _time.monotonic() < getattr(self, "_web_retry_at", 0.0):
