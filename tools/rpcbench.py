@@ -121,13 +121,13 @@ def main():
         post(rpc("deviceInfo", []))
 
     def dump():
-        wire, data = post(rpc("dumpWindowHierarchy", [False, None]))
+        wire, data = post(rpc("dumpWindowHierarchy", [False, 50]))
         return "{}B wire".format(wire)
 
     def batch():
         body = json.dumps([
             {"jsonrpc": "2.0", "id": 1, "method": "waitForIdle", "params": [500]},
-            {"jsonrpc": "2.0", "id": 2, "method": "dumpWindowHierarchy", "params": [False, None]},
+            {"jsonrpc": "2.0", "id": 2, "method": "dumpWindowHierarchy", "params": [False, 50]},
         ])
         wire, data = post(body)
         try:
@@ -147,9 +147,9 @@ def main():
         # comes back. (waitForWindowUpdate is never batched: inside a
         # batch it crashed the phone's server on Oct 4.)
         body = json.dumps([
-            {"jsonrpc": "2.0", "id": 1, "method": "dumpWindowHierarchy", "params": [False, None]},
+            {"jsonrpc": "2.0", "id": 1, "method": "dumpWindowHierarchy", "params": [False, 50]},
             {"jsonrpc": "2.0", "id": 2, "method": "waitForIdle", "params": [500]},
-            {"jsonrpc": "2.0", "id": 3, "method": "dumpWindowHierarchy", "params": [False, None]},
+            {"jsonrpc": "2.0", "id": 3, "method": "dumpWindowHierarchy", "params": [False, 50]},
         ])
         wire, data = post(body)
         parsed = json.loads(data)

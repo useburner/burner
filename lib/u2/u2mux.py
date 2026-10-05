@@ -230,6 +230,10 @@ def install_keepalive():
 
 
 DUMP_RPC_TIMEOUT = 25.0   # a screen read never takes this long; a hung server does
+# The read's depth. Never None: the phone's server takes a null depth as
+# 0 and answers with the window roots alone (two nodes, not one word;
+# Oct 4, after an update, for hours). uiautomator2 itself sends 50.
+DUMP_DEPTH = 50
 PROBE_TIMEOUT = 12.0      # the server check's read
 
 
@@ -237,7 +241,7 @@ def read_screen(d, timeout=DUMP_RPC_TIMEOUT):
     """One screen read with a bound. (A server that still answers
     deviceInfo but hangs on reads is what a bad batch left behind on
     Oct 4; without a bound, every command sat on it.)"""
-    return d.jsonrpc_call("dumpWindowHierarchy", [False, None], timeout=timeout)
+    return d.jsonrpc_call("dumpWindowHierarchy", [False, DUMP_DEPTH], timeout=timeout)
 
 
 def real_screen(xml):
@@ -544,9 +548,9 @@ def act_calls(spec):
     if calls:
         if not sleeps_the_screen(spec):
             calls.insert(0, ("wakeUp", []))
-        calls.append(("dumpWindowHierarchy", [False, None]))
+        calls.append(("dumpWindowHierarchy", [False, DUMP_DEPTH]))
     calls.append(("waitForIdle", [int(spec.get("idle", 2000))]))
-    calls.append(("dumpWindowHierarchy", [False, None]))
+    calls.append(("dumpWindowHierarchy", [False, DUMP_DEPTH]))
     return calls
 
 

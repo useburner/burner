@@ -3938,6 +3938,23 @@ class EmptyScreenTests(OfflineTestCase):
         # a bare read wakes nothing
         self.assertEqual([m for m, _ in mod.act_calls({})],
                          ["waitForIdle", "dumpWindowHierarchy"])
+        # every read asks for a depth: a null one reads as 0 on the phone
+        # (two bare window nodes, Oct 4)
+        for spec in ({}, {"tap": [1, 2]}):
+            for m, params in mod.act_calls(spec):
+                if m == "dumpWindowHierarchy":
+                    self.assertEqual(params, [False, 50])
+
+    def test_helper_read_screen_asks_for_a_depth(self):
+        mod = _u2mux()
+        seen = []
+
+        class Server:
+            def jsonrpc_call(self, method, params, timeout=10):
+                seen.append((method, params, timeout))
+                return SAMPLE_XML
+        self.assertEqual(mod.read_screen(Server()), SAMPLE_XML)
+        self.assertEqual(seen, [("dumpWindowHierarchy", [False, 50], mod.DUMP_RPC_TIMEOUT)])
 
     def test_helper_ensure_server_kills_and_relaunches(self):
         mod = _u2mux()
