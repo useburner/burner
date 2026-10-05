@@ -484,6 +484,7 @@ NO_RETRY = {"tap", "click_text", "set_text", "act"}
 
 _CDP = None
 WEB_RETRY_S = 20.0  # after the page in Chrome was out of reach: the screen reader this long
+WEB_BUSY_RETRY_S = 4.0  # after Chrome's page didn't answer while Chrome is in front
 
 
 def _cdp():
@@ -740,13 +741,14 @@ class U2Daemon:
         if _time.monotonic() < getattr(self, "_web_retry_at", 0.0):
             return None  # out of reach a moment ago: the screen reader, for now
         current = getattr(self, "_web", None)
+        chrome_in_front = True
         if current is not None and not _cdp().visible(current, _cdp().QUICK_PROBE_S):
-            # The page in hand left the front. Chrome may have too: one
-            # look at the screen, and another app in front means the
-            # screen reader's path at once, with no scan of Chrome's tabs
-            # (a background tab answers a script only on its timeout).
-            current.close()
-            self._web = current = None
+            # The page in hand didn't answer at once: it left the front,
+            # or it is busy (right after a navigation). One look at the
+            # screen says which: another app in front means the screen
+            # reader's path at once, with no scan of Chrome's tabs (a
+            # background tab answers a script only on its timeout); Chrome
+            # still in front means the page gets a longer question.
             try:
                 with self._lock:
                     with _t("dump rpc (front check)"):
@@ -756,16 +758,22 @@ class U2Daemon:
             if has_words(xml):
                 self._remember(xml)
                 self._front_cache = (xml, screen_of(xml))
-                if not _cdp().is_chrome((self._front_cache[1] or (0, 0, ""))[2]):
-                    return None
+                chrome_in_front = _cdp().is_chrome((self._front_cache[1] or (0, 0, ""))[2])
+            if not chrome_in_front or not _cdp().visible(current, _cdp().PROBE_S):
+                current.close()
+                self._web = current = None
+            if not chrome_in_front:
+                return None
         try:
             with _t("web page"):
                 self._web = _cdp().front_page(getattr(self.d, "_dev", None), current)
         except Exception as e:
             self._web = None
-            self._web_retry_at = _time.monotonic() + WEB_RETRY_S
+            # Chrome in front but no page answering (busy, or a native
+            # screen of Chrome's): the next command asks again soon.
+            self._web_retry_at = _time.monotonic() + WEB_BUSY_RETRY_S
             log("the page in Chrome is out of reach (%s); the screen reader for %.0fs"
-                % (err_text(e, 100), WEB_RETRY_S))
+                % (err_text(e, 100), WEB_BUSY_RETRY_S))
             return None
         return self._web
 
