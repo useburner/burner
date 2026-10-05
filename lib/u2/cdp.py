@@ -359,13 +359,8 @@ class Page:
 
     def eval(self, expression, timeout=10.0):
         """The value of a page script (a promise is awaited)."""
-        r = self.call("Runtime.evaluate", timeout, expression=expression,
-                      returnByValue=True, awaitPromise=True)
-        if "exceptionDetails" in r:
-            ex = r["exceptionDetails"]
-            text = ex.get("exception", {}).get("description") or ex.get("text") or "error"
-            raise RuntimeError("page script failed: %s" % text.splitlines()[0][:120])
-        return r.get("result", {}).get("value")
+        return _value(self.call("Runtime.evaluate", timeout, expression=expression,
+                                returnByValue=True, awaitPromise=True))
 
     def close(self):
         self.ws.close()
@@ -750,8 +745,8 @@ def _later(expression, ms):
 
 
 def _value(res):
-    """The value of a page script's result from call_many; raises on a
-    script that failed or wasn't answered, as eval does."""
+    """The value of a page script's result from call or call_many;
+    raises on a script that failed or wasn't answered."""
     if isinstance(res, Exception):
         raise RuntimeError(str(res))
     if "exceptionDetails" in res:
@@ -778,6 +773,15 @@ def _read_untouched(page):
         return read(page)
     except Exception as e:
         raise NotSent(str(e)[:120])
+
+
+def _read_or_again(page, res):
+    """The page read that rode in a round trip (its result from
+    call_many), or a read of its own when that one failed."""
+    try:
+        return _value(res)
+    except RuntimeError:
+        return read(page)
 
 
 CLASSES = {"field": "android.widget.EditText", "check": "android.widget.CheckBox",
@@ -883,7 +887,6 @@ def settle(page, idle_ms=1200, poll_s=0.15, quiet_s=0.3, url=None, loading=False
     its rows can be read any time. Returns the last probe."""
     t0 = time.monotonic()
     last, since = None, t0
-    probe = {}
     while True:
         try:
             probe = page.eval(SETTLE_JS, timeout=5.0) or {}
@@ -1184,7 +1187,7 @@ def fill(page, label, text, index=None):
         # page hides its box): touched, as a person would, and the text
         # goes to the field that opens (TARGET_JS), looked for once more
         # when the page is still drawing it
-        how = touch_hit(page, hit)[0]
+        touch_hit(page, hit)
         after_touch(page, hit.get("url"))
         target, filled = _target_fill(page, label, text)
         if not target.get("ok"):
@@ -1211,12 +1214,8 @@ def fill(page, label, text, index=None):
     value = filled.get("value")
     if mode in ("insert", "set"):
         value = (_value(res[-2]) or {}).get("value")
-    try:
-        screen = _value(res[-1])
-    except RuntimeError:
-        screen = read(page)
     return {"found": True, "count": 1, "label": hit.get("label"), "mode": mode, "how": how,
-            "value": value, "screen": screen}
+            "value": value, "screen": _read_or_again(page, res[-1])}
 
 
 def type_text(page, text, idle_ms=800):
@@ -1238,12 +1237,8 @@ def type_text(page, text, idle_ms=800):
     if sel.get("direct") and str(sel.get("value", "")) != text:
         raise NotDone("the %s field didn't take %r (it holds %r)"
                       % (sel.get("type"), text, sel.get("value")))
-    try:
-        screen = _value(res[2])
-    except RuntimeError:
-        screen = read(page)
-    return {"screen": screen, "ready": "complete", "direct": bool(sel.get("direct")),
-            "only": bool(sel.get("only"))}
+    return {"screen": _read_or_again(page, res[2]), "ready": "complete",
+            "direct": bool(sel.get("direct")), "only": bool(sel.get("only"))}
 
 
 def scroll(page, direction="down", times=1, fraction=0.6, idle_ms=500):
@@ -1262,8 +1257,4 @@ def scroll(page, direction="down", times=1, fraction=0.6, idle_ms=500):
             moved += (_value(r) or {}).get("moved") or 0
         except RuntimeError:
             pass
-    try:
-        screen = _value(res[-1])
-    except RuntimeError:
-        screen = read(page)
-    return {"moved": moved, "screen": screen, "ready": "complete"}
+    return {"moved": moved, "screen": _read_or_again(page, res[-1]), "ready": "complete"}

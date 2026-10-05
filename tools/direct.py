@@ -38,7 +38,7 @@ def connect_direct(ip, port, timeout=8.0):
     if not proxy:
         return socket.create_connection((ip, port), timeout)
     rest = proxy.split("://", 1)[-1]
-    auth, host = (rest.rsplit("@", 1) + [""])[:2] if "@" in rest else ("", rest)
+    auth, host = rest.rsplit("@", 1) if "@" in rest else ("", rest)
     host = host.split(":")[0]
     s = socket.create_connection((host, 3130), timeout)
     req = "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n" % (ip, port, ip, port)

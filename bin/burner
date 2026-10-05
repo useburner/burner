@@ -2881,7 +2881,7 @@ def cmd_press(args):
     except Exception:
         pass
     print("pressed {}".format(label))
-    read_after(quiet=getattr(args, "quiet", False))
+    read_after(quiet=quiet)
     return 0
 
 
@@ -3072,7 +3072,7 @@ def cmd_start(args):
     except Exception:
         pass
     print("launched {}".format(args.package))
-    launch_read(getattr(args, "quiet", False))
+    launch_read(quiet)
     return 0
 
 
@@ -4290,9 +4290,10 @@ def cmd_settings(args):
 
 
 def cmd_open(args):
-    if (args.url.startswith(("http://", "https://"))
-            and (not args.package or args.package in WEB_APPS)
-            and not getattr(args, "quiet", False)):
+    quiet = getattr(args, "quiet", False)
+    for_chrome = (args.url.startswith(("http://", "https://"))
+                  and (not args.package or args.package in WEB_APPS))
+    if for_chrome and not quiet:
         # Chrome in front: its current tab loads the link, through the
         # page (one round trip; a launch opens a new tab every time and
         # pays 1.5s to contact it). Anything else launches the link below.
@@ -4316,7 +4317,7 @@ def cmd_open(args):
     # when several apps claim the link (e.g. Play Store and Aurora Store).
     if args.package:
         script += " " + _sh_quote(args.package)
-    if args.url.startswith(("http://", "https://")) and (not args.package or args.package in WEB_APPS):
+    if for_chrome:
         # Chrome reuses the tab it opened for this id instead of adding
         # one per link (a phone had 107 tabs, Oct 5), so the page's
         # session stays on one tab, with no first contact per open
@@ -4325,7 +4326,7 @@ def cmd_open(args):
     adb_or_ensure("shell", script)
     u2_invalidate()
     print("opened {}".format(args.url))
-    launch_read(getattr(args, "quiet", False))
+    launch_read(quiet)
     return 0
 
 

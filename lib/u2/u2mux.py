@@ -158,9 +158,10 @@ def connect_direct(ip, port, timeout):
     used (http.client's tunnel was closed by the proxy without a reply,
     Oct 5). Raises OSError when the proxy or the phone refuses."""
     import base64
-    if tailnet_proxy() is None:
+    proxy = tailnet_proxy()
+    if proxy is None:
         return socket.create_connection((ip, int(port)), timeout)
-    host, auth = tailnet_proxy()
+    host, auth = proxy
     s = socket.create_connection((host, 3130), timeout)
     try:
         req = "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n" % (ip, int(port), ip, int(port))
@@ -244,7 +245,8 @@ class KeepAliveHTTP:
         direct and adb, eight times in two minutes, Oct 5, 04:11), when
         the phone's address isn't known, or when the route failed lately."""
         ip = phone_config().get("PHONE_TAILSCALE_IP", "")
-        if tailnet_proxy() is not None or not ip or ip.startswith("YOUR_")                 or _time.monotonic() < self._direct_retry_at:
+        if (tailnet_proxy() is not None or not ip or ip.startswith("YOUR_")
+                or _time.monotonic() < self._direct_retry_at):
             return None
         return ip, int(port)
 
@@ -353,7 +355,6 @@ class KeepAliveHTTP:
 
     def request(self, dev, port, method, path, data=None, timeout=10.0,
                 print_request=False, replay=True):
-        import http.client
         from uiautomator2.core import HTTPResponse, HTTPError
         # The on-phone server gzips its JSON when asked: a screen read's
         # 50-150KB crosses the link as 5-15KB (it matters on a slow link).
@@ -722,10 +723,7 @@ def batch_results(replies, n):
     Exception for a call that failed. Pure."""
     if not isinstance(replies, list):
         raise RuntimeError("no batch support: %s" % str(replies)[:80])
-    by_id = {}
-    for r in replies:
-        if isinstance(r, dict):
-            by_id[r.get("id")] = r
+    by_id = {r.get("id"): r for r in replies if isinstance(r, dict)}
     out = []
     for i in range(1, n + 1):
         r = by_id.get(i, {})
@@ -1812,7 +1810,8 @@ def iter_nodes(xml):
     import xml.etree.ElementTree as ET
 
     def rec(n, web):
-        web = web or "webview" in (n.get("class") or "").lower()
+        cls = (n.get("class") or "").lower()
+        web = web or "webview" in cls
         m = _BOUNDS_RE.match(n.get("bounds", ""))
         if m:
             x1, y1, x2, y2 = map(int, m.groups())
@@ -1822,7 +1821,7 @@ def iter_nodes(xml):
                        "rect": (x1, y1, x2, y2),
                        "enabled": n.get("enabled") != "false",
                        "clickable": n.get("clickable") == "true", "web": web,
-                       "field": "edittext" in (n.get("class") or "").lower()}
+                       "field": "edittext" in cls}
         for c in n:
             yield from rec(c, web)
     yield from rec(ET.fromstring(xml), False)
