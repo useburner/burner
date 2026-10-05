@@ -113,8 +113,65 @@ def _t(label):
                 pass
 
 
+def phone_config():
+    """config.env next to bin/burner, as a dict (what tunnel.sh reads):
+    PHONE_TAILSCALE_IP names the phone on the tailnet."""
+    cfg = {}
+    path = os.path.join(os.path.dirname(LOG_FILE), "..", "config.env")
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return cfg
+
+
+def tailnet_proxy():
+    """(host, auth) of the HTTP CONNECT proxy a hosted assistant reaches
+    the tailnet through (HTTPS_PROXY, port 3130, exactly as tunnel.sh),
+    or None when this computer is on the tailnet itself."""
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    if not proxy:
+        return None
+    rest = proxy.split("://", 1)[-1].rstrip("/")
+    auth, host = rest.rsplit("@", 1) if "@" in rest else ("", rest)
+    return host.split(":")[0], auth
+
+
+def direct_http(ip, port, timeout):
+    """An HTTP connection to ip:port on the tailnet: direct, or a CONNECT
+    tunnel through the proxy (see tailnet_proxy). Not connected yet."""
+    import base64
+    import http.client
+    proxy = tailnet_proxy()
+    if proxy is None:
+        return http.client.HTTPConnection(ip, port, timeout=timeout)
+    host, auth = proxy
+    conn = http.client.HTTPConnection(host, 3130, timeout=timeout)
+    headers = {}
+    if auth:
+        headers["Proxy-Authorization"] = "Basic " + base64.b64encode(auth.encode()).decode()
+    conn.set_tunnel(ip, port, headers=headers)
+    return conn
+
+
+DIRECT_RETRY_S = 300.0  # a direct route that failed is tried again after this
+
+
 class KeepAliveHTTP:
     """Persistent HTTP/1.1 connection to the on-device u2 server.
+
+    Straight over the tailnet when the phone's address is known and the
+    server answers there (its port, through the proxy a hosted assistant
+    reaches the tailnet with): a request then crosses the link once. A
+    bare call through adb's streams took 0.4-0.75s from Muse's box (Oct
+    5): each request goes as adb packets with their acknowledgements.
+    A direct route that fails is left alone for DIRECT_RETRY_S, and
+    adb's streams carry the requests, as before.
 
     Stock uiautomator2 (3.7) opens a fresh adb `tcp:9008` stream for every
     RPC and closes it after — ~150-270ms of setup per call over Tailscale.
@@ -139,6 +196,21 @@ class KeepAliveHTTP:
         self._last_real = 0.0
         self._target = None  # (dev, port) of the most recent request
         self._warm_thread = None
+        self._direct_retry_at = 0.0  # when a failed direct route is tried again
+        self.direct = None  # True once the direct route answered, False after it failed
+
+    def _direct_target(self, port):
+        """(ip, port) of the server straight over the tailnet, or None
+        when the phone's address isn't known or the route failed lately."""
+        ip = phone_config().get("PHONE_TAILSCALE_IP", "")
+        if not ip or ip.startswith("YOUR_") or _time.monotonic() < self._direct_retry_at:
+            return None
+        return ip, int(port)
+
+    def _open_direct(self, ip, port):
+        conn = direct_http(ip, port, 8.0)
+        conn.connect()
+        return conn
 
     def start_warmer(self):
         import threading
@@ -173,6 +245,19 @@ class KeepAliveHTTP:
                 self._lock.release()
 
     def _open(self, dev, port):
+        direct = self._direct_target(port)
+        if direct is not None:
+            try:
+                c = self._open_direct(*direct)
+                if not self.direct:
+                    log("the phone's UI server answers straight over the tailnet (%s:%d)" % direct)
+                self.direct = True
+                return c
+            except (OSError, ValueError) as e:
+                self.direct = False
+                self._direct_retry_at = _time.monotonic() + DIRECT_RETRY_S
+                log("no direct route to the UI server (%s:%d: %s); through adb for %.0fs"
+                    % (direct[0], direct[1], err_text(e, 80), DIRECT_RETRY_S))
         from uiautomator2.core import AdbHTTPConnection
         c = AdbHTTPConnection(dev, port=port)
         c.connect()

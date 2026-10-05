@@ -4203,6 +4203,48 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(ws.recv(), '{"id":1,"result":{"ok":true}}')
         self.assertIsNone(ws._handshake_key)
 
+    def test_helper_reaches_the_server_straight_over_the_tailnet(self):
+        mod = _u2mux()
+        ka = mod.KeepAliveHTTP()
+        opened = []
+
+        class Conn:
+            def __init__(self, how):
+                self.how = how
+
+            def connect(self):
+                pass
+        ka._open_direct = lambda ip, port: opened.append(("direct", ip, port)) or Conn("direct")
+        adb = mock.Mock(return_value=Conn("adb"))
+        with mock.patch.object(mod, "phone_config", return_value={"PHONE_TAILSCALE_IP": "100.64.0.9"}), \
+                mock.patch.dict(sys.modules, {"uiautomator2": mock.Mock(), "uiautomator2.core": mock.Mock(AdbHTTPConnection=adb)}):
+            c = ka._open(SimpleNamespace(serial="s"), 9008)
+            self.assertEqual((c.how, ka.direct, opened), ("direct", True, [("direct", "100.64.0.9", 9008)]))
+            adb.assert_not_called()
+            # the route fails: adb's streams, and no new try for a while
+            ka._open_direct = mock.Mock(side_effect=ConnectionRefusedError("refused"))
+            c = ka._open(SimpleNamespace(serial="s"), 9008)
+            self.assertEqual((c.how, ka.direct), ("adb", False))
+            adb.assert_called_once()
+            c = ka._open(SimpleNamespace(serial="s"), 9008)
+            self.assertEqual(ka._open_direct.call_count, 1)  # not tried again yet
+        # no address known: adb's streams, no attempt
+        ka2 = mod.KeepAliveHTTP()
+        ka2._open_direct = mock.Mock(side_effect=AssertionError("no address, no direct try"))
+        with mock.patch.object(mod, "phone_config", return_value={}), \
+                mock.patch.dict(sys.modules, {"uiautomator2": mock.Mock(), "uiautomator2.core": mock.Mock(AdbHTTPConnection=adb)}):
+            self.assertEqual(ka2._open(SimpleNamespace(serial="s"), 9008).how, "adb")
+        # the proxy of a hosted assistant, as tunnel.sh reads it
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://user:pw@proxy.example:3128"}):
+            self.assertEqual(mod.tailnet_proxy(), ("proxy.example", "user:pw"))
+            conn = mod.direct_http("100.64.0.9", 9008, 5.0)
+            self.assertEqual((conn.host, conn.port, conn._tunnel_host, conn._tunnel_port),
+                             ("proxy.example", 3130, "100.64.0.9", 9008))
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": ""}):
+            self.assertIsNone(mod.tailnet_proxy())
+            conn = mod.direct_http("100.64.0.9", 9008, 5.0)
+            self.assertEqual((conn.host, conn.port), ("100.64.0.9", 9008))
+
     def test_an_answered_command_proves_the_page_on_screen(self):
         cdp = _cdp()
         answers = []
