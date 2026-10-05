@@ -3871,6 +3871,45 @@ class WebPathTests(OfflineTestCase):
         self.assertTrue(cdp.is_chrome("com.android.chrome"))
         self.assertFalse(cdp.is_chrome("com.example"))
 
+    def test_http_responses_are_read_by_their_headers(self):
+        cdp = _cdp()
+
+        def feed(*chunks):
+            it = iter(chunks)
+            return lambda n: next(it, b"")
+        body = b'[{"id": "1"}]'
+        # by Content-Length, with the connection left open (no close)
+        status, got = cdp.recv_http(feed(
+            b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body), body))
+        self.assertEqual((status, got), ("HTTP/1.1 200 OK", body))
+        # chunked
+        status, got = cdp.recv_http(feed(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n[{\"id\r\n",
+            b"8\r\n\": \"1\"}]\r\n0\r\n\r\n"))
+        self.assertEqual(got, body)
+        # to the close
+        status, got = cdp.recv_http(feed(b"HTTP/1.1 200 OK\r\n\r\n[{\"id\": ", b"\"1\"}]"))
+        self.assertEqual(got, body)
+
+    def test_helper_leaves_an_unreachable_page_alone_for_a_while(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = self._fake_cdp(mod, calls)
+
+        def down(dev, current=None):
+            raise TimeoutError("timed out")
+        fake.front_page = down
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([SAMPLE_XML, SAMPLE_XML])
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        self.assertEqual(dm._dump(fresh=True), SAMPLE_XML)  # the screen reader instead
+        self.assertEqual(calls, [])
+        self.assertGreater(dm._web_retry_at, mod._time.monotonic())
+        dm._last_xml = CHROME_XML
+        fake.front_page = lambda dev, current=None: self.fail("asked again within the cooldown")
+        self.assertEqual(dm._dump(fresh=True), SAMPLE_XML)
+
     def test_page_read_becomes_a_screen_read(self):
         cdp = _cdp()
         xml = cdp.page_xml(WEB_SCREEN, 283, 2400)

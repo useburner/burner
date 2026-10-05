@@ -70,7 +70,7 @@ class WebSocket:
     the phone's DevTools socket). Text messages in and out; pings answered;
     a close frame or a dropped stream raises ConnectionError."""
 
-    def __init__(self, sock, path, host="localhost", timeout=10.0):
+    def __init__(self, sock, path, host="localhost", timeout=6.0):
         self.s = sock
         self.s.settimeout(timeout)
         self.buf = b""
@@ -147,23 +147,74 @@ def open_stream(dev):
     return dev.create_connection(adbutils.Network.LOCAL_ABSTRACT, SOCKET_NAME)
 
 
-def http_get(dev, path, timeout=5.0):
+def dechunk(data):
+    """The body of a chunked transfer (sizes in hex, a 0 chunk ends it). Pure."""
+    out, pos = b"", 0
+    while True:
+        end = data.find(b"\r\n", pos)
+        if end < 0:
+            break
+        size = int(data[pos:end].split(b";")[0].strip() or b"0", 16)
+        if size == 0:
+            break
+        out += data[end + 2:end + 2 + size]
+        pos = end + 2 + size + 2
+    return out
+
+
+def recv_http(recv):
+    """One HTTP/1.1 response read with `recv(n)`: (status line, body).
+    The body is read by Content-Length, by chunks, or to the close,
+    whichever the headers say: Chrome keeps the connection open despite
+    "Connection: close", so a read to the close waits for the timeout
+    (the first live run, Oct 4). Pure given recv."""
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = recv(65536)
+        if not chunk:
+            break
+        data += chunk
+    head, _, body = data.partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    status = lines[0].decode("utf-8", "replace")
+    headers = {}
+    for line in lines[1:]:
+        k, _, v = line.partition(b":")
+        headers[k.strip().lower()] = v.strip()
+    if headers.get(b"transfer-encoding", b"").lower() == b"chunked":
+        while not (body.startswith(b"0\r\n") or b"\r\n0\r\n" in body):
+            chunk = recv(65536)
+            if not chunk:
+                break
+            body += chunk
+        body = dechunk(body)
+    elif b"content-length" in headers:
+        n = int(headers[b"content-length"] or b"0")
+        while len(body) < n:
+            chunk = recv(65536)
+            if not chunk:
+                break
+            body += chunk
+        body = body[:n]
+    else:
+        while True:
+            chunk = recv(65536)
+            if not chunk:
+                break
+            body += chunk
+    return status, body
+
+
+def http_get(dev, path, timeout=4.0):
     """JSON from DevTools' small HTTP side (/json lists the pages)."""
     s = open_stream(dev)
     s.settimeout(timeout)
     try:
         s.sendall(("GET %s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
                    % path).encode())
-        data = b""
-        while True:
-            chunk = s.recv(65536)
-            if not chunk:
-                break
-            data += chunk
+        status, body = recv_http(s.recv)
     finally:
         s.close()
-    head, _, body = data.partition(b"\r\n\r\n")
-    status = head.split(b"\r\n", 1)[0].decode("utf-8", "replace")
     if " 200 " not in status:
         raise RuntimeError("DevTools %s: %s" % (path, status[:80] or "no answer"))
     return json.loads(body.decode("utf-8", "replace"))

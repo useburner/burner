@@ -483,6 +483,7 @@ DUMP_TTL = 2.0  # seconds a cached hierarchy dump stays valid
 NO_RETRY = {"tap", "click_text", "set_text", "act"}
 
 _CDP = None
+WEB_RETRY_S = 20.0  # after the page in Chrome was out of reach: the screen reader this long
 
 
 def _cdp():
@@ -727,13 +728,17 @@ class U2Daemon:
         info = screen_of(last) if last else None
         if not info or not _cdp().is_chrome(info[2]):
             return None
+        if _time.monotonic() < getattr(self, "_web_retry_at", 0.0):
+            return None  # out of reach a moment ago: the screen reader, for now
         try:
             with _t("web page"):
                 self._web = _cdp().front_page(getattr(self.d, "_dev", None),
                                               getattr(self, "_web", None))
         except Exception as e:
             self._web = None
-            log("the page in Chrome is out of reach (%s)" % err_text(e, 100))
+            self._web_retry_at = _time.monotonic() + WEB_RETRY_S
+            log("the page in Chrome is out of reach (%s); the screen reader for %.0fs"
+                % (err_text(e, 100), WEB_RETRY_S))
             return None
         return self._web
 
