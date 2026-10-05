@@ -21,6 +21,8 @@ T_INJECT_TEXT = 1
 T_INJECT_TOUCH_EVENT = 2
 T_INJECT_SCROLL_EVENT = 3
 T_BACK_OR_SCREEN_ON = 4
+T_EXPAND_NOTIFICATION_PANEL = 5
+T_COLLAPSE_PANELS = 7
 T_SET_CLIPBOARD = 9
 T_START_APP = 16
 
@@ -147,6 +149,15 @@ class ScrcpyControl:
     def wake(self):
         self.keyevent(KEYCODE_WAKEUP)
 
+    def expand_notifications(self):
+        """Pull the notification shade down (the server asks the status
+        bar), as `cmd statusbar expand-notifications` does over adb."""
+        self._send(struct.pack(">B", T_EXPAND_NOTIFICATION_PANEL))
+
+    def collapse_panels(self):
+        """Close the shade and the quick settings."""
+        self._send(struct.pack(">B", T_COLLAPSE_PANELS))
+
     def set_clipboard(self, text, paste=False):
         data = text.encode("utf-8")
         self._send(struct.pack(">BqBi", T_SET_CLIPBOARD, 0, 1 if paste else 0, len(data)) + data)
@@ -248,6 +259,8 @@ def main(argv):
         line = "text " + " ".join(argv[2:])
     elif cmd == "startapp":
         line = f"startapp {argv[2]}"
+    elif cmd in ("shade", "collapse"):
+        line = cmd
     else:
         print(f"unknown command {cmd}")
         return 2

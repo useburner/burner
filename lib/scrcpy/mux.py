@@ -172,6 +172,10 @@ class Mux:
             c.scroll(int(x), int(y), h, v)
         elif cmd == "startapp":
             c.start_app(arg.strip())
+        elif cmd == "shade":
+            c.expand_notifications()
+        elif cmd == "collapse":
+            c.collapse_panels()
         elif cmd == "ping":
             if not c.ping():
                 raise RuntimeError("ping failed")

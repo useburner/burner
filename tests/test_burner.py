@@ -3876,6 +3876,30 @@ class HelperStalenessTests(OfflineTestCase):
         pc._u2_checked = True
 
 
+class NotificationsTests(OfflineTestCase):
+    def test_the_shade_opens_and_closes_through_the_scrcpy_helper(self):
+        sc = self.allow("scrcpy_send", return_value=True)
+        adb = self.allow("adb_or_ensure")
+        self.allow("u2_invalidate")
+        self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
+        self.allow("notification_rows", return_value=[("Wispr Flow: dictation ready", 500)])
+        self.allow("screen_dims", return_value=(1080, 2400))
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_notifications(self.parse(["notifications"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual([c[0][0] for c in sc.call_args_list], ["wake", "shade", "collapse"])
+        adb.assert_not_called()
+        self.assertIn("Wispr Flow: dictation ready", out.getvalue())
+        # the helper is away: adb opens and closes the shade, as before
+        sc.side_effect = RuntimeError("no scrcpy")
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_notifications(self.parse(["notifications"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual([c[0] for c in adb.call_args_list],
+                         [("shell", "input keyevent 224; cmd statusbar expand-notifications"),
+                          ("shell", "cmd", "statusbar", "collapse")])
+
+
 class StartAndSettingsTests(OfflineTestCase):
     def test_start_goes_over_scrcpy_and_reads_once(self):
         sc = self.allow("scrcpy_send", return_value=True)

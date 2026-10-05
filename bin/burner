@@ -4135,14 +4135,29 @@ def parse_notifications(root):
     return [t for t, _ in notification_rows(root)]
 
 
+def _shade(what):
+    """Open ("shade") or close ("collapse") the notification shade through
+    the scrcpy helper: True when it did (the screen woken first for the
+    open), False when the helper is away or older, and adb must."""
+    try:
+        if what == "shade" and not scrcpy_send("wake"):
+            return False
+        return bool(scrcpy_send(what))
+    except Exception:
+        return False
+
+
 def cmd_notifications(args):
     """Summarise every notification the phone is showing, without touching
     them. Pulls the shade down, reads it (scrolling for more), closes it.
     Android hides notification text from dumpsys, so the shade is the only
     place the words are."""
-    # One adb call wakes the screen and pulls the shade down. The first dump
-    # takes about as long as the shade does to open, so there is no sleep.
-    adb_or_ensure("shell", "input keyevent 224; cmd statusbar expand-notifications")
+    # The scrcpy helper's open connection wakes the screen and pulls the
+    # shade down in a few milliseconds; else one adb call does both (about
+    # a second over the link). The first dump takes about as long as the
+    # shade does to open, so there is no sleep.
+    if not _shade("shade"):
+        adb_or_ensure("shell", "input keyevent 224; cmd statusbar expand-notifications")
     u2_invalidate()  # a dump cached before the shade opened would show no rows
     lines = []
     try:
@@ -4162,7 +4177,8 @@ def cmd_notifications(args):
                 break
             _scroll_swipe("down")
     finally:
-        adb_or_ensure("shell", "cmd", "statusbar", "collapse")
+        if not _shade("collapse"):
+            adb_or_ensure("shell", "cmd", "statusbar", "collapse")
         u2_invalidate()
     lines = drop_repeats(lines)  # the same row seen again after a scroll
     if not lines:
