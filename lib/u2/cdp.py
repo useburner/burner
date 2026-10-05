@@ -313,13 +313,14 @@ READ_JS = r"""
     el.matches('script,style,noscript,svg,template,iframe') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT });
   for (let el = walker.nextNode(); el && out.length < cap; el = walker.nextNode()) {
     if (used.some(a => a.contains(el))) continue;
+    const field = el.matches(FIELD), check = el.matches(CHECK), active = el.matches(ACTIVE);
+    let text = own(el), desc = attr(el), fromText = false;
+    if (!text && !desc && active && !field) { const t = squash(el.innerText); if (t && t.length <= 80) { text = t; fromText = true; } }
+    if (!text && !desc && !field && !check) continue;
     const r = el.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0 || r.bottom <= 0 || r.top >= vh || r.right <= 0 || r.left >= vw) continue;
     if (el.checkVisibility ? !el.checkVisibility({visibilityProperty: true, opacityProperty: true}) : false) continue;
-    const field = el.matches(FIELD), check = el.matches(CHECK), active = el.matches(ACTIVE);
-    let text = own(el), desc = attr(el);
-    if (!text && !desc && active && !field) { const t = squash(el.innerText); if (t && t.length <= 80) { text = t; used.push(el); } }
-    if (!text && !desc && !field && !check) continue;
+    if (fromText) used.push(el);
     const key = text + '|' + desc + '|' + Math.round(r.left) + ',' + Math.round(r.top) + ',' + Math.round(r.right) + ',' + Math.round(r.bottom);
     if (seen.has(key)) continue;
     seen.add(key);
@@ -364,7 +365,7 @@ FIND_JS = r"""
   const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   for (let t = tw.nextNode(); t; t = tw.nextNode()) { const p = t.parentElement; if (p && squash(t.nodeValue) && !skip(p)) cands.add(p); }
   for (const el of document.body.querySelectorAll('[aria-label],[alt],[title],[placeholder],input,' + ACTIVE)) if (!skip(el)) cands.add(el);
-  const names = el => { const n = [own(el), attr(el)]; if (el.matches(ACTIVE)) { const t = squash(el.textContent); if (t && t.length <= 80) n.push(t); } return n.filter(Boolean).map(s => s.toLowerCase()); };
+  const names = el => { const n = [own(el), attr(el)]; if (el.matches(ACTIVE)) { const t = squash(el.innerText); if (t && t.length <= 80) n.push(t); } return n.filter(Boolean).map(s => s.toLowerCase()); };
   const alts = label.split('||').map(squash).filter(Boolean);
   let used = '';
   const find = test => { for (const alt of alts) { const want = alt.toLowerCase(); const h = [];
@@ -385,7 +386,7 @@ FIND_JS = r"""
   if (!inView(r) || r.top < 0 || r.bottom > vh) { el.scrollIntoView({block: 'center', inline: 'nearest'}); r = box(el); moved = true; }
   window.__burnerTarget = el;
   return {found: true, count: 1, used: used, label: (names(el)[0] || '').slice(0, 60),
-          x: r.left + r.width / 2, y: r.top + r.height / 2, moved: moved};
+          x: r.left + r.width / 2, y: r.top + r.height / 2, moved: moved, url: location.href};
 })"""
 
 # A settle probe: the page's readiness and a count of DOM changes, so a
@@ -503,12 +504,20 @@ def page_xml(screen, top, screen_h=0, pkg="com.android.chrome"):
             + "\n".join(parts) + "\n</hierarchy>")
 
 
-def settle(page, idle_ms=1200, poll_s=0.15, quiet_s=0.3):
-    """Wait until the page has stopped changing for `quiet_s` (and is
-    loaded), `idle_ms` at most. Returns the last probe."""
+QUIET_CAP_S = 0.5  # a wait for a quiet DOM, at most: a live page never stops changing
+LOAD_CAP_S = 2.5   # a wait for a page that is loading, at most
+
+
+def settle(page, idle_ms=1200, poll_s=0.15, quiet_s=0.3, url=None):
+    """Wait for the page after a touch or a scroll. A navigation (the url
+    differs from `url`, the one before the touch) or a load in progress
+    is waited out: until the page is complete and quiet for `quiet_s`,
+    `idle_ms` at most but at least LOAD_CAP_S. Otherwise a quiet spell of
+    the DOM is waited for QUIET_CAP_S at most (a live page never stops
+    changing; its rows can be read any time). Returns the last probe."""
     t0 = time.monotonic()
-    last, since = None, time.monotonic()
-    probe = {}
+    last, since = None, t0
+    probe, loading = {}, False
     while True:
         try:
             probe = page.eval(SETTLE_JS, timeout=5.0) or {}
@@ -516,13 +525,16 @@ def settle(page, idle_ms=1200, poll_s=0.15, quiet_s=0.3):
                 page.visible_at = time.monotonic()
         except Exception:
             probe = {"ready": "?", "mut": None}
-        key = (probe.get("ready"), probe.get("mut"), probe.get("url"))
         now = time.monotonic()
+        if probe.get("ready") not in ("complete", "?") or (url and probe.get("url") != url):
+            loading = True
+        key = (probe.get("ready"), probe.get("mut"), probe.get("url"))
         if key != last:
             last, since = key, now
         elif probe.get("ready") == "complete" and now - since >= quiet_s:
             return probe
-        if now - t0 >= idle_ms / 1000.0:
+        limit = max(idle_ms / 1000.0, LOAD_CAP_S) if loading else min(idle_ms / 1000.0, QUIET_CAP_S)
+        if now - t0 >= limit:
             return probe
         time.sleep(poll_s)
 
@@ -562,7 +574,7 @@ def tap(page, label, index=None, idle_ms=1200):
     if hit.get("moved"):
         time.sleep(0.3)  # the scroll into view
     how = touch(page, hit["x"], hit["y"])
-    probe = settle(page, idle_ms)
+    probe = settle(page, idle_ms, url=hit.get("url"))
     return {"found": True, "count": 1, "label": hit.get("label"), "how": how,
             "screen": read(page), "ready": probe.get("ready")}
 

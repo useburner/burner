@@ -134,6 +134,10 @@ Details that save a step:
   Apps that ignore it get the text as key presses instead, automatically.
 - `burner wait` polls on the phone every quarter second; a tap right after it
   needs no new read.
+- In Chrome, burner reads, scrolls and taps the page itself, not the phone's
+  screen reader (which falls behind on busy pages): a label tap lands on the
+  page's own element, `burner scroll` scrolls the page, and the address bar
+  prints as an `[EditText]` row with the URL. Other apps read as before.
 - A recipe file has one step per line in `burner do` format, `#` comments,
   and `$VAR` from the environment: `PLAY_PACKAGE=com.example.app burner recipe play-install`.
 - `burner update` keeps `config.env`, the pairing and your own recipes.
