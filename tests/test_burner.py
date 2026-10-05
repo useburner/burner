@@ -4221,13 +4221,20 @@ class WebPathTests(OfflineTestCase):
             c = ka._open(SimpleNamespace(serial="s"), 9008)
             self.assertEqual((c.how, ka.direct, opened), ("direct", True, [("direct", "100.64.0.9", 9008)]))
             adb.assert_not_called()
-            # the route fails: adb's streams, and no new try for a while
+            # the route fails twice in a row: adb's streams, and no new try for a while
             ka._open_direct = mock.Mock(side_effect=ConnectionRefusedError("refused"))
-            c = ka._open(SimpleNamespace(serial="s"), 9008)
+            with mock.patch.object(mod._time, "sleep"):
+                c = ka._open(SimpleNamespace(serial="s"), 9008)
             self.assertEqual((c.how, ka.direct), ("adb", False))
             adb.assert_called_once()
             c = ka._open(SimpleNamespace(serial="s"), 9008)
-            self.assertEqual(ka._open_direct.call_count, 1)  # not tried again yet
+            self.assertEqual(ka._open_direct.call_count, 2)  # the two tries; none since
+            # one refusal, then it answers: the route stays
+            ka2 = mod.KeepAliveHTTP()
+            ka2._open_direct = mock.Mock(side_effect=[ConnectionRefusedError("refused"), Conn("direct")])
+            with mock.patch.object(mod._time, "sleep"):
+                self.assertEqual(ka2._open(SimpleNamespace(serial="s"), 9008).how, "direct")
+            self.assertTrue(ka2.direct)
         # no address known: adb's streams, no attempt
         ka2 = mod.KeepAliveHTTP()
         ka2._open_direct = mock.Mock(side_effect=AssertionError("no address, no direct try"))

@@ -197,7 +197,7 @@ def direct_http(ip, port, timeout):
     return DirectHTTPConnection(ip, int(port), timeout=timeout)
 
 
-DIRECT_RETRY_S = 300.0  # a direct route that failed is tried again after this
+DIRECT_RETRY_S = 60.0  # a direct route that failed twice is tried again after this
 
 
 class KeepAliveHTTP:
@@ -285,17 +285,24 @@ class KeepAliveHTTP:
     def _open(self, dev, port):
         direct = self._direct_target(port)
         if direct is not None:
-            try:
-                c = self._open_direct(*direct)
-                if not self.direct:
-                    log("the phone's UI server answers straight over the tailnet (%s:%d)" % direct)
-                self.direct = True
-                return c
-            except (OSError, ValueError) as e:
-                self.direct = False
-                self._direct_retry_at = _time.monotonic() + DIRECT_RETRY_S
-                log("no direct route to the UI server (%s:%d: %s); through adb for %.0fs"
-                    % (direct[0], direct[1], err_text(e, 80), DIRECT_RETRY_S))
+            # twice: the proxy closed one CONNECT in two without a reply
+            # while a stream was being replaced (Oct 5, 03:46), and the
+            # next one went through
+            for attempt in range(2):
+                try:
+                    c = self._open_direct(*direct)
+                    if not self.direct:
+                        log("the phone's UI server answers straight over the tailnet (%s:%d)" % direct)
+                    self.direct = True
+                    return c
+                except (OSError, ValueError) as e:
+                    if attempt == 0:
+                        _time.sleep(0.3)
+                        continue
+                    self.direct = False
+                    self._direct_retry_at = _time.monotonic() + DIRECT_RETRY_S
+                    log("no direct route to the UI server (%s:%d: %s); through adb for %.0fs"
+                        % (direct[0], direct[1], err_text(e, 80), DIRECT_RETRY_S))
         from uiautomator2.core import AdbHTTPConnection
         c = AdbHTTPConnection(dev, port=port)
         c.connect()
