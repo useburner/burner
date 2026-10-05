@@ -702,8 +702,12 @@ class U2Daemon:
                 # Stamped even when the restart failed: the cooldown
                 # keeps a broken server from being restarted on every read.
                 self._last_restart = _time.monotonic()
-            # warm up: one dump so later calls are fast
-            read_screen(self.d)
+            # warm up: one dump so later calls are fast; it is the first
+            # read, so a helper just (re)started knows the app in front
+            # (a page in Chrome is read as a page from the first command)
+            xml = read_screen(self.d)
+            if has_words(xml):
+                self._last_xml, self._last_xml_t = xml, _time.monotonic()
             log("connected to", TARGET)
 
     def invalidate(self):
@@ -994,6 +998,33 @@ class U2Daemon:
         t0 = _time.monotonic()
         deadline = t0 + float(p.get("timeout", 30))
         polls, healed, fresh = 0, False, False
+        page = self._page()
+        if page is not None:
+            # A page in Chrome is asked for the words (cdp.find): the
+            # whole document, as the screen reader's tree held rows
+            # below the fold too; a read of the page when they are there.
+            while True:
+                polls += 1
+                try:
+                    with _t("web find"):
+                        n = _cdp().find(page, text, webview_top(self._last_xml))
+                except Exception as e:
+                    self._web = None
+                    log("the page couldn't be asked (%s); the screen reader" % err_text(e, 100))
+                    break
+                waited = int((_time.monotonic() - t0) * 1000)
+                if absent and not n.get("found"):
+                    return json.dumps({"gone": True, "waited_ms": waited, "polls": polls}).encode()
+                if not absent and n.get("found"):
+                    xml = self._page_read()
+                    if xml is not None:
+                        with self._lock:
+                            self._remember(xml)
+                    n = dict(n, waited_ms=waited, polls=polls)
+                    return json.dumps(n).encode()
+                if _time.monotonic() + POLL_S > deadline:
+                    raise U2NotFound("timeout waiting for %r" % text)
+                _time.sleep(POLL_S)
         while True:
             polls += 1
             try:

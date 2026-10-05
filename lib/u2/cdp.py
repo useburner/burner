@@ -351,7 +351,7 @@ READ_JS = r"""
 # it is scrolled into view). Several controls: their count and words,
 # no choice, unless `index` picks one.
 FIND_JS = r"""
-(function(label, index){
+(function(label, index, query){
   const squash = s => (s || '').replace(/\s+/g, ' ').trim();
   const own = el => { let t = ''; for (const c of el.childNodes) if (c.nodeType === 3) t += c.nodeValue; return squash(t); };
   const attr = el => squash(el.getAttribute('aria-label') || el.getAttribute('alt') || el.getAttribute('title') || el.getAttribute('placeholder') || (el.tagName === 'INPUT' ? el.value : ''));
@@ -383,6 +383,11 @@ FIND_JS = r"""
   }
   const el = controls[pick || 0];
   let r = box(el), moved = false;
+  if (query) {
+    return {found: true, count: controls.length, used: used, label: (names(el)[0] || '').slice(0, 60),
+            l: r.left, t: r.top, w: r.width, h: r.height, inview: inView(r), dpr: window.devicePixelRatio || 1,
+            enabled: !(el.disabled || el.getAttribute('aria-disabled') === 'true')};
+  }
   if (!inView(r) || r.top < 0 || r.bottom > vh) { el.scrollIntoView({block: 'center', inline: 'nearest'}); r = box(el); moved = true; }
   window.__burnerTarget = el;
   return {found: true, count: 1, used: used, label: (names(el)[0] || '').slice(0, 60),
@@ -429,7 +434,7 @@ def _js(fn, *args):
     return "(%s)(%s)" % (fn, ", ".join(json.dumps(a) for a in args))
 
 
-def read(page, cap=160):
+def read(page, cap=600):
     """The page's rows (see READ_JS), with title, url, readiness and the
     viewport's size and pixel ratio."""
     return page.eval(_js(READ_JS, cap)) or {}
@@ -553,6 +558,25 @@ def touch(page, x, y):
     except RuntimeError:
         page.eval("window.__burnerTarget && window.__burnerTarget.click(); 'clicked'")
         return "click"
+
+
+def find(page, label, top=0):
+    """Whether the page has an element with these words (see FIND_JS),
+    anywhere in the document: {"found": False}, or {"found": True,
+    "text", "bounds" (device pixels, `top` down the screen), "enabled",
+    "inview", "count"}. A wait's probe: cheaper than a read, and it sees
+    below the fold, as the screen reader's tree did."""
+    hit = page.eval(_js(FIND_JS, label, None, True)) or {}
+    if not hit.get("found"):
+        return {"found": False}
+    dpr = float(hit.get("dpr") or 1)
+    x1 = int(round(hit.get("l", 0) * dpr))
+    y1 = int(round(top + hit.get("t", 0) * dpr))
+    x2 = int(round((hit.get("l", 0) + hit.get("w", 0)) * dpr))
+    y2 = int(round(top + (hit.get("t", 0) + hit.get("h", 0)) * dpr))
+    return {"found": True, "text": hit.get("label") or label, "desc": "",
+            "bounds": "[%d,%d][%d,%d]" % (x1, y1, x2, y2), "enabled": bool(hit.get("enabled", True)),
+            "inview": bool(hit.get("inview")), "count": hit.get("count", 1)}
 
 
 def tap(page, label, index=None, idle_ms=1200):

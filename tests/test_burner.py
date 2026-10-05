@@ -4073,6 +4073,35 @@ class WebPathTests(OfflineTestCase):
         xml = dm.cmd_act(json.dumps({"tap_label": "Box Score", "index": 1, "idle": 900})).decode()
         self.assertEqual(calls[-1], ("tap", "Box Score", 1, 900))
 
+    def test_helper_waits_by_asking_the_page(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = self._fake_cdp(mod, calls)
+        answers = iter([{"found": False}, {"found": False},
+                        {"found": True, "text": "Top Stories", "desc": "", "bounds": "[0,2600][540,2660]",
+                         "enabled": True, "inview": False, "count": 1}])
+
+        def find(page, label, top=0):
+            calls.append(("find", label, top))
+            return next(answers)
+        fake.find = find
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])  # the screen reader is never asked
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        out = json.loads(dm.cmd_wait_for(json.dumps({"text": "Top Stories", "timeout": 5})))
+        self.assertTrue(out["found"])
+        self.assertEqual((out["text"], out["bounds"], out["polls"]), ("Top Stories", "[0,2600][540,2660]", 3))
+        self.assertEqual([c for c in calls if c[0] == "find"], [("find", "Top Stories", 283)] * 3)
+        self.assertIn('text="Box Score"', dm._last_xml)  # the page read once the words were there
+        # gone: the page no longer has the words
+        fake.find = lambda page, label, top=0: {"found": False}
+        out = json.loads(dm.cmd_wait_for(json.dumps({"text": "Top Stories", "timeout": 5, "absent": True})))
+        self.assertTrue(out["gone"])
+        # a timeout is the usual miss
+        with self.assertRaises(mod.U2NotFound):
+            dm.cmd_wait_for(json.dumps({"text": "Top Stories", "timeout": 0.3}))
+
     def test_helper_opens_a_link_in_the_page(self):
         mod = _u2mux()
         EmptyScreenTests.no_sleep(self, mod)
