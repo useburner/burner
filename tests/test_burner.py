@@ -3776,12 +3776,31 @@ class StartAndSettingsTests(OfflineTestCase):
         self.allow("scrcpy_send", return_value=True)
         self.allow("u2_invalidate")
         self.allow("nav_record")
-        self.allow("u2sock", return_value=SAMPLE_XML)
+        reads = self.allow("u2sock", return_value=SAMPLE_XML)
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_start(self.parse(["start", "com.other"]))
         self.assertEqual(rc, 1)
         self.assertIn("com.other didn't come to the front; com.example is still open",
                       err.getvalue())
+        # read again while the window may still be coming, then the verdict
+        self.assertEqual(reads.call_count, 1 + pc.LAUNCH_REREADS)
+
+    def test_start_waits_for_the_window_to_come_up(self):
+        # a start from the home screen: the first read still shows the
+        # launcher (Oct 5: "didn't come to the front" 0.8s in, exit 1)
+        self.allow("scrcpy_send", return_value=True)
+        self.allow("u2_invalidate")
+        self.allow("nav_record")
+        launcher = SAMPLE_XML.replace("com.example", "com.android.launcher")
+        calls = []
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30:
+                   calls.append(cmd) or (launcher if len(calls) == 1 else SAMPLE_XML))
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_start(self.parse(["start", "com.example"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual(calls, ["act", "act"])
+        self.assertIn("screen: com.example", out.getvalue())
+        self.assertNotIn("screen: com.android.launcher", out.getvalue())
 
     def test_start_uses_adb_without_the_scrcpy_helper(self):
         self.allow("scrcpy_send", side_effect=RuntimeError("no scrcpy"))

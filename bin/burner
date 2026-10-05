@@ -1373,6 +1373,8 @@ def looks_half_drawn(rows, prev_rows):
 # paid 2.5s on every page open and 2s after every tap).
 IDLE_ACT_MS = 1200      # the read after a tap, a key or typed text
 IDLE_LAUNCH_MS = 1000   # the read after a launch or a link
+LAUNCH_REREADS = 4      # reads after a launch while another app is still in
+                        # front (0.4s apart): the window takes a moment to come
 IDLE_SCROLL_MS = 500    # the read after a swipe: it stops dead, the content is
                         # in place at once (a busy web page never goes quiet)
 
@@ -2103,7 +2105,6 @@ def cmd_tap(args):
             snap_xy = snap_resolve(args.text)
         except ValueError as e:
             return _tap_fail(args, str(e))
-    waker = wake_async()
     plain = (args.xy is None and snap_xy is None and not args.fuzzy
              and not args.settle and not as_json(args) and not args.no_occlusion_check)
     if plain:
@@ -2123,7 +2124,6 @@ def cmd_tap(args):
             spec["quiet"] = True
         status, root, note = act_and_read(spec)
         if status != "unsent":
-            waker.join()
             snap_invalidate()
             try:
                 nav_record(None, 'tap "{}"'.format(args.text), None, ok=True)
@@ -2133,6 +2133,9 @@ def cmd_tap(args):
             if args.quiet and status == "ok":
                 return rc
             return print_act(status, root, note, "tap") or rc
+    # No label tap by the helper (its batch wakes the screen itself): the
+    # wake runs while the row is looked up here.
+    waker = wake_async()
     if args.no_occlusion_check and args.xy is None and snap_xy is None \
             and not args.fuzzy and args.index is None and not args.settle:
         r = u2sock("click_text", args.text, timeout=20)
@@ -2958,7 +2961,7 @@ def cmd_start(args):
         except Exception:
             pass
         print("launched {}".format(args.package))
-        front = launch_read(quiet)
+        front = launch_read(quiet, expect=args.package)
         if front and front != args.package:
             print("{} didn't come to the front; {} is still open. Try "
                   "`burner press BACK` or `burner press HOME`, then start it "
@@ -2989,27 +2992,37 @@ def cmd_start(args):
     return 0
 
 
-def launch_read(quiet):
+def launch_read(quiet, expect=None):
     """The screen after a launch or a link: one round trip that waits for
     the new window, lets it go quiet (IDLE_LAUNCH_MS at most: a web page
     with ads never does, and a person reads it as soon as the part they
-    want is drawn) and reads it, re-reading a thin screen once.
-    Returns the package in front, or None when it isn't known."""
+    want is drawn) and reads it, re-reading a thin screen once. With
+    `expect` (the package launched), a read that still shows another
+    app is repeated while the window is coming up, LAUNCH_REREADS times
+    at most (a start from the home screen read the launcher 0.8s in and
+    said the app didn't come to the front, Oct 5). Returns the package
+    in front, or None when it isn't known."""
     if quiet:
         read_after(quiet=True, idle_ms=IDLE_LAUNCH_MS)
         return None
     time.sleep(0.3)  # the launch's first window is still coming
-    status, root, note = act_and_read({}, idle_ms=IDLE_LAUNCH_MS, rereads=1)
-    if status == "unsent":
-        root, note = read_after_root(idle_ms=IDLE_LAUNCH_MS, rereads=1)
-        if root is None:
+    for attempt in range(LAUNCH_REREADS + 1):
+        status, root, note = act_and_read({}, idle_ms=IDLE_LAUNCH_MS, rereads=1)
+        if status == "unsent":
+            root, note = read_after_root(idle_ms=IDLE_LAUNCH_MS, rereads=1)
+            if root is None:
+                return None
+        elif status != "ok":
+            print("couldn't read the screen afterwards ({}); run burner state".format(
+                status), file=sys.stderr)
             return None
-    elif status != "ok":
-        print("couldn't read the screen afterwards ({}); run burner state".format(
-            status), file=sys.stderr)
-        return None
+        front = dump_package(root)
+        if not expect or front == expect or attempt == LAUNCH_REREADS:
+            break
+        _trace("{} in front, not {} yet; reading again".format(front, expect))
+        time.sleep(0.4)
     print_screen(root, note=note)
-    return dump_package(root)
+    return front
 
 
 def shot_fast(out):
