@@ -4227,6 +4227,55 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(ws.recv(), '{"id":1,"result":{"ok":true}}')
         self.assertIsNone(ws._handshake_key)
 
+    def test_a_direct_stream_is_kept_warm_with_a_ping(self):
+        mod = _u2mux()
+        ka = mod.KeepAliveHTTP()
+        pings = []
+
+        class Resp:
+            status, will_close = 200, False
+
+            def read(self):
+                return b"pong"
+
+        class Conn:
+            class sock:
+                @staticmethod
+                def settimeout(t):
+                    pass
+
+            def request(self, method, path, headers=None):
+                pings.append((method, path))
+
+            def getresponse(self):
+                return Resp()
+
+            def close(self):
+                pings.append("closed")
+        dev = SimpleNamespace(serial="s")
+        key = (dev.serial, 9008)
+        ka._target, ka._last_real, ka.direct = (dev, 9008), mod._time.monotonic(), True
+        ka._conns[key] = [Conn(), mod._time.monotonic() - ka.REFRESH_S - 1]
+        ka._open = mock.Mock(side_effect=AssertionError("no fresh stream: the ping keeps this one"))
+        ka._warm_once()
+        self.assertEqual(pings, [("GET", "/ping")])
+        self.assertLess(mod._time.monotonic() - ka._conns[key][1], 1.0)  # its clock started over
+        ka._warm_once()
+        self.assertEqual(pings, [("GET", "/ping")])  # young again: nothing to do
+        # the ping fails (the server dropped the stream): a fresh one is swapped in
+        ka._conns[key][1] = mod._time.monotonic() - ka.REFRESH_S - 1
+        ka._conns[key][0].getresponse = mock.Mock(side_effect=ConnectionError("gone"))
+        ka._open = mock.Mock(return_value=Conn())
+        ka._warm_once()
+        ka._open.assert_called_once()
+        self.assertIn("closed", pings)
+        # over adb a fresh stream is swapped in, as before
+        ka.direct = False
+        ka._conns[key][1] = mod._time.monotonic() - ka.REFRESH_S - 1
+        ka._open = mock.Mock(return_value=Conn())
+        ka._warm_once()
+        ka._open.assert_called_once()
+
     def test_helper_reaches_the_server_straight_over_the_tailnet(self):
         mod = _u2mux()
         ka = mod.KeepAliveHTTP()

@@ -259,28 +259,62 @@ class KeepAliveHTTP:
     def _warm_loop(self):
         while True:
             _time.sleep(0.5)
-            tgt = self._target
-            now = _time.monotonic()
-            if tgt is None or now - self._last_real > self.WARM_S:
-                continue
-            ent = self._conns.get((tgt[0].serial, tgt[1]))
-            if ent is not None and now - ent[1] < self.REFRESH_S:
-                continue
             try:
-                fresh = self._open(*tgt)
+                self._warm_once()
             except Exception:
-                continue
-            key = (tgt[0].serial, tgt[1])
+                pass
+
+    def _ping(self, conn, timeout=4.0):
+        """GET /ping on an open stream: True when the server answered and
+        keeps the stream (its idle clock starts over)."""
+        conn.sock.settimeout(timeout)
+        conn.request("GET", "/ping", headers={"User-Agent": "uiautomator2", "Accept-Encoding": "",
+                                              "Connection": "keep-alive"})
+        resp = conn.getresponse()
+        resp.read()
+        return resp.status == 200 and not resp.will_close
+
+    def _warm_once(self):
+        """One round of keeping the stream warm (see the class): nothing
+        to do, a ping on a direct stream, or a fresh stream swapped in."""
+        tgt = self._target
+        now = _time.monotonic()
+        if tgt is None or now - self._last_real > self.WARM_S:
+            return
+        key = (tgt[0].serial, tgt[1])
+        ent = self._conns.get(key)
+        if ent is not None and now - ent[1] < self.REFRESH_S:
+            return
+        if ent is not None and self.direct:
+            # a direct stream is kept with a ping on it: a fresh one costs
+            # a CONNECT through the proxy, which refused one in two while
+            # a stream was being swapped (Oct 5, 03:46)
             if not self._lock.acquire(blocking=False):
-                fresh.close()  # a real request is running; it keeps the conn warm
-                continue
+                return  # a real request is running; it keeps the stream warm
             try:
-                old = self._conns.get(key)
-                if old is not None:
-                    old[0].close()
-                self._conns[key] = [fresh, _time.monotonic()]
+                ent = self._conns.get(key)
+                if ent is not None and self._ping(ent[0]):
+                    ent[1] = _time.monotonic()
+                    return
+            except Exception:
+                pass
             finally:
                 self._lock.release()
+            # the ping failed: the stream is gone, a fresh one below
+        try:
+            fresh = self._open(*tgt)
+        except Exception:
+            return
+        if not self._lock.acquire(blocking=False):
+            fresh.close()  # a real request is running; it keeps the conn warm
+            return
+        try:
+            old = self._conns.get(key)
+            if old is not None:
+                old[0].close()
+            self._conns[key] = [fresh, _time.monotonic()]
+        finally:
+            self._lock.release()
 
     def _open(self, dev, port):
         direct = self._direct_target(port)
