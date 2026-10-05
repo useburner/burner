@@ -2551,8 +2551,11 @@ def cmd_type(args):
     # last text field). Elsewhere: focus the field first, then type.
     if args.field and not args.slow and not quiet:
         status, root, note = act_and_read({"set_text": args.text, "field": args.field})
-        if status == "ok" or status == "lost" or status.startswith("failed"):
+        if status == "ok" or status == "lost":
             print("typed {} chars into {}".format(len(args.text), args.field))
+            return print_act(status, root, note, "typing")
+        if status.startswith("failed"):
+            # the helper had it and says why it didn't work: no claim of typing
             return print_act(status, root, note, "typing")
     if args.field:
         got = focus_field(args.field)

@@ -1295,9 +1295,15 @@ class U2Daemon:
                                         spec.get("index"))
                 except _cdp().NotSent as e:
                     raise RuntimeError("act not sent: %s" % e)
+                except _cdp().NotDone as e:
+                    raise RuntimeError("act failed after sending: %s" % e)
                 except Exception as e:
                     self._web = None
                     raise RuntimeError("act failed after sending: %s" % err_text(e, 120))
+                if r.get("how", "").startswith("tap+"):
+                    log("web fill: %r is not a field; tapped it, typed into the field %s"
+                        % (spec["field"], {"tap+focus": "that took the focus", "tap+label": "with that label",
+                                           "tap+only": "in view"}.get(r["how"], "found")))
                 if not r.get("found"):
                     raise RuntimeError("act not sent: no field labelled %r on the page" % spec["field"])
                 if r.get("count", 1) != 1:
@@ -1315,9 +1321,13 @@ class U2Daemon:
                                              int(spec.get("idle", 800)))
                 except _cdp().NotSent as e:
                     raise RuntimeError("act not sent: %s" % e)
+                except _cdp().NotDone as e:
+                    raise RuntimeError("act failed after sending: %s" % e)
                 except Exception as e:
                     self._web = None
                     raise RuntimeError("act failed after sending: %s" % err_text(e, 120))
+                if r.get("only"):
+                    log("web type: nothing had the focus; the one text field in view took the text")
                 xml = self._page_xml(r["screen"])
                 self._remember(xml)
             return xml.encode()

@@ -3902,6 +3902,43 @@ class _FakePage:
         pass
 
 
+class _ScriptedPage(_FakePage):
+    """A page that answers each of cdp's scripts by name ({"FIND_JS":
+    result, ...}; a list answers in turn, its last answer repeated) and
+    records every call: ("eval", name), ("many", [methods]) or (method,
+    params). call_many answers the first command with the SELECT_JS
+    answer, as type_text's batch wants."""
+
+    def __init__(self, cdp, answers):
+        self.cdp, self.answers, self.calls = cdp, answers, []
+
+    def _name(self, expression):
+        for name in ("FIND_JS", "TARGET_JS", "FILL_JS", "FILLED_JS", "READ_JS", "PLACE_JS",
+                     "SELECT_JS", "SETTLE_JS", "SCROLL_JS"):
+            if expression.startswith("(" + getattr(self.cdp, name)):
+                return name
+        return expression[:40]
+
+    def _answer(self, name):
+        a = self.answers.get(name)
+        if isinstance(a, list):
+            return a.pop(0) if len(a) > 1 else a[0]
+        return a
+
+    def eval(self, expression, timeout=10.0):
+        name = self._name(expression)
+        self.calls.append(("eval", name))
+        return self._answer(name)
+
+    def call(self, method, timeout=10.0, **params):
+        self.calls.append((method, params))
+        return {}
+
+    def call_many(self, cmds, timeout=10.0):
+        self.calls.append(("many", [c[0] for c in cmds]))
+        return [{"result": {"value": self._answer("SELECT_JS")}}] + [{}] * (len(cmds) - 1)
+
+
 class WebPathTests(OfflineTestCase):
     def test_websocket_frames_round_trip(self):
         cdp = _cdp()
@@ -4082,7 +4119,7 @@ class WebPathTests(OfflineTestCase):
             calls.append(("scroll", direction, times, idle_ms))
             return {"moved": 1200, "screen": WEB_SCREEN}
         fake = types.SimpleNamespace(
-            is_chrome=real.is_chrome, page_xml=real.page_xml, NotSent=real.NotSent,
+            is_chrome=real.is_chrome, page_xml=real.page_xml, NotSent=real.NotSent, NotDone=real.NotDone,
             front_page=lambda dev, current=None: _FakePage(), visible=lambda page, timeout=1.5: True,
             QUICK_PROBE_S=0.7,
             read=lambda page, cap=160: calls.append(("read",)) or WEB_SCREEN,
@@ -4264,6 +4301,103 @@ class WebPathTests(OfflineTestCase):
         with self.assertRaises(RuntimeError) as cm:
             dm.cmd_act(json.dumps({"set_text": "x", "field": "Nope"}))
         self.assertEqual(str(cm.exception), "act not sent: no field labelled 'Nope' on the page")
+
+    def test_fill_on_a_button_taps_it_and_types_into_the_field_that_opens(self):
+        # mobile Wikipedia at phone width: the search box is hidden and
+        # "Search" is the magnifier button; its touch opens a box with the focus
+        cdp = _cdp()
+        on_button = {"found": True, "count": 1, "label": "search", "notField": True, "tag": "span",
+                     "x": 305, "y": 27, "url": "https://en.m.wikipedia.org/"}
+        page = _ScriptedPage(cdp, {
+            "FIND_JS": on_button, "TARGET_JS": {"ok": True, "how": "focus", "label": "search wikipedia"},
+            "FILL_JS": {"ok": True, "mode": "insert"}, "FILLED_JS": {"ok": True, "value": "Pixel 7"},
+            "READ_JS": WEB_SCREEN})
+        with mock.patch.object(cdp.time, "sleep"):
+            r = cdp.fill(page, "Search", "Pixel 7")
+        self.assertEqual((r["found"], r["how"], r["value"]), (True, "tap+focus", "Pixel 7"))
+        self.assertEqual([c[1] if c[0] == "eval" else c[0] for c in page.calls],
+                         ["FIND_JS", "many", "TARGET_JS", "FILL_JS", "Input.insertText", "FILLED_JS", "READ_JS"])
+        self.assertEqual(page.calls[1], ("many", ["Input.dispatchTouchEvent", "Input.dispatchTouchEvent"]))
+        # the touch led to a page with the box (no focus): the field with the label
+        page = _ScriptedPage(cdp, {
+            "FIND_JS": on_button, "TARGET_JS": [{"ok": False, "fields": 0}, {"ok": True, "how": "label", "label": "search wikipedia"}],
+            "FILL_JS": {"ok": True, "mode": "insert"}, "FILLED_JS": {"ok": True, "value": "Pixel 7"},
+            "READ_JS": WEB_SCREEN})
+        with mock.patch.object(cdp.time, "sleep"):
+            r = cdp.fill(page, "Search", "Pixel 7")
+        self.assertEqual(r["how"], "tap+label")
+        self.assertEqual([c[1] for c in page.calls if c[0] == "eval"],
+                         ["FIND_JS", "TARGET_JS", "TARGET_JS", "FILL_JS", "FILLED_JS", "READ_JS"])
+
+    def test_fill_says_when_the_button_opened_no_field(self):
+        cdp = _cdp()
+        page = _ScriptedPage(cdp, {
+            "FIND_JS": {"found": True, "count": 1, "label": "search", "notField": True, "tag": "span",
+                        "x": 305, "y": 27, "url": "u"},
+            "TARGET_JS": {"ok": False, "fields": 2, "named": 0}, "READ_JS": WEB_SCREEN})
+        with mock.patch.object(cdp.time, "sleep"), self.assertRaises(cdp.NotDone) as cm:
+            cdp.fill(page, "Search", "Pixel 7")
+        self.assertEqual(str(cm.exception),
+                         "'Search' is a span, not a field; tapping it opened 2 text fields, none labelled 'Search'")
+        self.assertNotIn("Input.insertText", [c[0] for c in page.calls])
+
+    def test_fill_of_a_field_touches_nothing(self):
+        cdp = _cdp()
+        page = _ScriptedPage(cdp, {
+            "FIND_JS": {"found": True, "count": 1, "label": "email", "tag": "input", "type": "email", "url": "u"},
+            "FILL_JS": {"ok": True, "mode": "insert"}, "FILLED_JS": {"ok": True, "value": "a@b.c"},
+            "READ_JS": WEB_SCREEN})
+        with mock.patch.object(cdp.time, "sleep"):
+            r = cdp.fill(page, "Email", "a@b.c")
+        self.assertEqual((r["how"], r["value"]), ("fill", "a@b.c"))
+        self.assertNotIn("many", [c[0] for c in page.calls])
+
+    def test_type_takes_the_one_field_in_view_when_nothing_has_the_focus(self):
+        cdp = _cdp()
+        page = _ScriptedPage(cdp, {"SELECT_JS": {"ok": True, "direct": False, "type": "search", "only": True},
+                                   "READ_JS": WEB_SCREEN})
+        with mock.patch.object(cdp.time, "sleep"):
+            r = cdp.type_text(page, "Pixel 7")
+        self.assertTrue(r["only"])
+        self.assertEqual(page.calls[0], ("many", ["Runtime.evaluate", "Input.insertText"]))
+        page = _ScriptedPage(cdp, {"SELECT_JS": {"ok": False, "fields": 2}})
+        with self.assertRaises(cdp.NotSent) as cm:
+            cdp.type_text(page, "Pixel 7")
+        self.assertEqual(str(cm.exception), "no field has the focus on the page "
+                         "(2 text fields in view; tap one, or type --field with its label)")
+
+    def test_helper_keeps_the_page_when_a_fill_did_not_take(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = self._fake_cdp(mod, calls)
+
+        def fill(page, label, text, index=None):
+            raise fake.NotDone("%r is a span, not a field; tapping it opened no text field" % label)
+        fake.fill = fill
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"set_text": "Pixel 7", "field": "Search"}))
+        self.assertEqual(str(cm.exception), "act failed after sending: 'Search' is a span, not a field; "
+                         "tapping it opened no text field")
+        self.assertIsNotNone(dm._web)  # the page session is fine: no reconnect
+
+    def test_type_field_that_failed_on_the_phone_claims_no_typing(self):
+        self.allow("u2_invalidate")
+        self.allow("nav_record")
+
+        def u2(cmd, arg="", timeout=30):
+            pc._u2_status = ("err act failed after sending: 'Search' is a span, not a field; "
+                             "tapping it opened no text field")
+            return None
+        self.allow("u2sock", side_effect=u2)
+        with self.cap() as (out, err):
+            rc = pc.cmd_type(self.parse(["type", "--field", "Search", "Pixel 7"]))
+        self.assertEqual(rc, 1)
+        self.assertNotIn("typed", out.getvalue())
+        self.assertIn("the typing failed on the phone ('Search' is a span, not a field", err.getvalue())
 
     def test_type_into_a_labelled_field_is_one_helper_op(self):
         calls = []

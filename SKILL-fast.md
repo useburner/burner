@@ -33,11 +33,18 @@ Every step you take costs a round trip, so the fewer steps, the faster.
    opens inside the app when it is installed. Deep links too: `burner open market://details?id=com.tinder com.android.vending`.
 5. **Chain steps you are sure of:** `burner do 'start com.tinder; wait "Likes"'`
    runs them in one call and prints the last screen. `burner recipes` lists saved chains.
+   A keypad (a calculator, a timer, a PIN) is one chain, not a command per key:
+   `burner do 'tap 1; tap 2; tap 3; tap multiply; tap 4; tap 5; tap equals'`
+   (each key is found by its label on the screen; symbol keys have word labels,
+   which `burner state` shows: multiply, equals, delete).
 6. **Tap by the words on the row:** `burner tap "Connected devices"`. Two
    matches: add `--index 1`. No words on it: `burner snap`, then `burner tap @e3`.
 7. **Type into the focused field:** `burner type "text"` (`--field "Search"`
-   taps that field first). It prints the screen, so check the text there before
-   any Send, Post, Buy or Submit tap, and only tap it with the user's go-ahead.
+   finds that field by its label; when the label is on a button, such as a
+   site's search icon, it taps the button and types into the box that opens).
+   With nothing focused, the one text box on screen takes the text. It prints
+   the screen, so check the text there before any Send, Post, Buy or Submit
+   tap, and only tap it with the user's go-ahead.
 8. A command that fails or hangs: run `burner ensure` once and try again. If it
    still fails, tell the user plainly what it printed (it says what is wrong).
    When the user asks why something was slow, `burner log --last 20` shows

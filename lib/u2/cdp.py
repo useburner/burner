@@ -32,6 +32,11 @@ CHROME_PACKAGES = ("com.android.chrome", "com.chrome.beta", "com.chrome.dev",
                    "com.chrome.canary", "org.chromium.chrome")
 
 
+class NotDone(RuntimeError):
+    """The page took the action but it didn't do what was asked (a field
+    that didn't take the text): the page session is fine."""
+
+
 class NotSent(RuntimeError):
     """A tap that failed before anything touched the page."""
 
@@ -463,6 +468,7 @@ FIND_JS = r"""
   const own = el => { let t = ''; for (const c of el.childNodes) if (c.nodeType === 3) t += c.nodeValue; return squash(t); };
   const attr = el => squash(el.getAttribute('aria-label') || el.getAttribute('alt') || el.getAttribute('title') || el.getAttribute('placeholder') || (el.tagName === 'INPUT' ? el.value : ''));
   const ACTIVE = 'a[href],button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=switch],[role=option],[onclick]';
+  const FIELDS = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=image]):not([type=file]),textarea,select,[contenteditable=true],[role=textbox],[role=searchbox],[role=combobox]';
   const vw = innerWidth, vh = innerHeight;
   const skip = el => !!el.closest('script,style,noscript,svg,template');
   const labelOf = el => { try { const l = el.labels && el.labels[0]; if (!l) return '';
@@ -498,6 +504,13 @@ FIND_JS = r"""
   // a label beside the control it labels is that control
   // a label found by its words stands for the control it labels
   controls = controls.map(el => (el.tagName === 'LABEL' && el.control) ? el.control : el).filter((el, i, a) => a.indexOf(el) === i);
+  // text goes into a field; words on a button or a link (a search icon
+  // where the page hides its box) name what opens one: that is touched
+  let notField = false;
+  if (fill) {
+    const fields = controls.filter(el => el.matches(FIELDS));
+    if (fields.length) controls = fields; else notField = true;
+  }
   const seen = controls.filter(el => inView(box(el)));
   if (seen.length) controls = seen;
   const pick = (index === null || index === undefined) ? null : index;
@@ -514,7 +527,7 @@ FIND_JS = r"""
     s.dispatchEvent(new Event('change', {bubbles: true}));
     return {found: true, count: 1, used: used, label: squash(el.text).slice(0, 60), chose: true, url: location.href};
   }
-  if (fill) {
+  if (fill && !notField) {
     // the field to fill: kept for FILL_JS, never touched (a touch opens a
     // picker or moves a slider; a text field is focused there)
     if (!inView(r)) el.scrollIntoView({block: 'center', inline: 'nearest'});
@@ -551,14 +564,44 @@ FIND_JS = r"""
   if (act && act !== el && !el.contains(act) && act.matches('input,textarea,[contenteditable=true]')) { act.blur(); blurred = true; }
   const vv = window.visualViewport;
   // what is under the aimed point: a widget's popup (a date field's
-  // calendar) over the target swallows the touch
+  // calendar) over the target swallows the touch; a part of the same
+  // control (an icon beside a button's hidden words) is the target itself
   const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
   const top = document.elementFromPoint(cx, cy);
-  const covered = !!(top && top !== el && !el.contains(top) && !top.contains(el));
+  const ctl = el.closest(ACTIVE) || el;
+  const covered = !!(top && top !== el && !ctl.contains(top) && !top.contains(el));
   return {found: true, count: 1, used: used, label: (names(el)[0] || '').slice(0, 60),
           x: cx - (vv ? vv.offsetLeft : 0), y: cy - (vv ? vv.offsetTop : 0),
-          moved: moved, blurred: blurred, covered: covered,
+          moved: moved, blurred: blurred, covered: covered, notField: notField, tag: el.tagName.toLowerCase(),
           cover: covered ? (top.tagName + ' ' + squash(top.innerText).slice(0, 40)) : '', url: location.href};
+})"""
+
+# After a touch on what opens a field (a search icon): the field the text
+# goes into, kept for FILL_JS. The field with the focus (an overlay's box
+# takes it); else the field with the label (the page that opened has its
+# own box); else the one field in view (a person types into the only box).
+TARGET_JS = r"""
+(function(label){
+  const squash = s => (s || '').replace(/\s+/g, ' ').trim();
+  const FIELDS = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=image]):not([type=file]):not([type=checkbox]):not([type=radio]),textarea,[contenteditable=true],[role=textbox],[role=searchbox],[role=combobox]';
+  const vh = innerHeight, vw = innerWidth;
+  const inView = el => { const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < vh && r.right > 0 && r.left < vw
+      && (el.checkVisibility ? el.checkVisibility({visibilityProperty: true, opacityProperty: true}) : true); };
+  const labelOf = el => { try { const l = el.labels && el.labels[0]; if (!l) return '';
+    let t = ''; for (const c of l.childNodes) { if (c.nodeType === 3) t += c.nodeValue + ' '; else if (c.nodeType === 1 && !c.matches('input,select,textarea,button')) t += c.textContent + ' '; }
+    return squash(t); } catch (e) { return ''; } };
+  const names = el => [el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('title'), labelOf(el), el.name]
+    .map(squash).filter(Boolean).map(s => s.toLowerCase());
+  const a = document.activeElement;
+  if (a && a !== document.body && a.matches(FIELDS)) { window.__burnerTarget = a; return {ok: true, how: 'focus', label: names(a)[0] || ''}; }
+  const fields = Array.from(document.querySelectorAll(FIELDS)).filter(inView);
+  const want = squash(label).toLowerCase();
+  const named = fields.filter(el => names(el).some(n => n === want || n.includes(want)));
+  const pick = named.length === 1 ? named[0] : (!named.length && fields.length === 1 ? fields[0] : null);
+  if (!pick) return {ok: false, fields: fields.length, named: named.length};
+  window.__burnerTarget = pick;
+  return {ok: true, how: named.length === 1 ? 'label' : 'only', label: names(pick)[0] || ''};
 })"""
 
 # The place of the element FIND kept, against the visual viewport (what
@@ -573,7 +616,8 @@ PLACE_JS = r"""
   if (top < 0 || bottom > vh) { el.scrollIntoView({block: 'center', inline: 'nearest'}); r = el.getBoundingClientRect(); }
   const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
   const over = document.elementFromPoint(cx, cy);
-  const covered = !!(over && over !== el && !el.contains(over) && !over.contains(el));
+  const ctl = el.closest('a[href],button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=switch],[role=option],[onclick]') || el;
+  const covered = !!(over && over !== el && !ctl.contains(over) && !over.contains(el));
   return {x: cx - (vv ? vv.offsetLeft : 0), y: cy - (vv ? vv.offsetTop : 0), covered: covered};
 })"""
 
@@ -804,6 +848,17 @@ def tap(page, label, index=None, idle_ms=1200):
         time.sleep(0.15)
         return {"found": True, "count": 1, "label": hit.get("label"),
                 "how": "chose" if hit.get("chose") else "focus", "screen": read(page)}
+    how = touch_hit(page, hit)
+    probe = after_touch(page, hit.get("url"), idle_ms)
+    return {"found": True, "count": 1, "label": hit.get("label"), "how": how,
+            "screen": read(page), "ready": probe.get("ready")}
+
+
+def touch_hit(page, hit):
+    """Touch the element FIND_JS found (`hit`, with its place): what
+    covers it is closed first, its place taken afresh after a scroll
+    into view, a keyboard going or a popup closing, and a cover that
+    stays is bypassed with the element's own click. Returns how."""
     if hit.get("covered"):
         # something lies over the target (a date field's calendar):
         # Escape closes a widget's popup, as it would for a person
@@ -821,12 +876,8 @@ def tap(page, label, index=None, idle_ms=1200):
     if hit.get("covered"):
         # still covered: the element's own click, past whatever lies over it
         page.eval("window.__burnerTarget && window.__burnerTarget.click(); 'clicked'")
-        how = "click"
-    else:
-        how = touch(page, hit["x"], hit["y"])
-    probe = after_touch(page, hit.get("url"), idle_ms)
-    return {"found": True, "count": 1, "label": hit.get("label"), "how": how,
-            "screen": read(page), "ready": probe.get("ready")}
+        return "click"
+    return touch(page, hit["x"], hit["y"])
 
 
 def navigate(page, url, idle_ms=1000):
@@ -847,8 +898,19 @@ def navigate(page, url, idle_ms=1000):
 # The focused field's content selected, so inserted text replaces it.
 SELECT_JS = r"""
 (function(text){
-  const el = document.activeElement;
-  if (!el || el === document.body) return {ok: false};
+  let el = document.activeElement, only = false;
+  if (!el || el === document.body || !el.matches('input,textarea,select,[contenteditable=true],[role=textbox],[role=searchbox],[role=combobox]')) {
+    // nothing has the focus: the one text field in view takes the text,
+    // as a person would tap the only box; none or several: no guess
+    const FIELDS = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=image]):not([type=file]):not([type=checkbox]):not([type=radio]),textarea,[contenteditable=true],[role=textbox],[role=searchbox],[role=combobox]';
+    const vh = innerHeight, vw = innerWidth;
+    const fields = Array.from(document.querySelectorAll(FIELDS)).filter(f => { const r = f.getBoundingClientRect();
+      return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < vh && r.right > 0 && r.left < vw
+        && (f.checkVisibility ? f.checkVisibility({visibilityProperty: true, opacityProperty: true}) : true); });
+    if (fields.length !== 1) return {ok: false, fields: fields.length};
+    el = fields[0]; only = true;
+    try { el.focus(); } catch (e) {}
+  }
   const type = (el.type || '').toLowerCase();
   if (/^(date|time|month|week|datetime-local|color|range)$/.test(type)) {
     // these take no typed text: the value is set (2026-10-05, 14:30,
@@ -858,13 +920,13 @@ SELECT_JS = r"""
     el.value = text;
     el.dispatchEvent(new Event('input', {bubbles: true}));
     el.dispatchEvent(new Event('change', {bubbles: true}));
-    return {ok: true, direct: true, value: el.value, type: type};
+    return {ok: true, direct: true, value: el.value, type: type, only: only};
   }
   try {
     if (typeof el.select === 'function') el.select();
     else { const r = document.createRange(); r.selectNodeContents(el); const s = getSelection(); s.removeAllRanges(); s.addRange(r); }
   } catch (e) {}
-  return {ok: true, direct: false, type: type};
+  return {ok: true, direct: false, type: type, only: only};
 })"""
 
 
@@ -931,9 +993,27 @@ def fill(page, label, text, index=None):
     if hit.get("count", 1) != 1:
         hit["screen"] = read(page)
         return hit
+    how = "fill"
+    if hit.get("notField"):
+        # the words are on a button or a link (a search icon where the
+        # page hides its box): touched, as a person would, and the text
+        # goes to the field that opens (TARGET_JS), looked for once more
+        # when the page is still drawing it
+        how = touch_hit(page, hit)
+        after_touch(page, hit.get("url"))
+        target = page.eval(_js(TARGET_JS, label)) or {}
+        if not target.get("ok"):
+            time.sleep(0.5)
+            target = page.eval(_js(TARGET_JS, label)) or {}
+        if not target.get("ok"):
+            n = target.get("fields", 0)
+            raise NotDone("%r is a %s, not a field; tapping it opened %s" % (
+                label, hit.get("tag") or "button",
+                "no text field" if not n else "%d text fields, none labelled %r" % (n, label)))
+        how = "tap+" + target.get("how", "fill")
     res = page.eval(_js(FILL_JS, text))
     if not res.get("ok"):
-        raise RuntimeError("%r: %s" % (label, res.get("why", "the field didn't take it")))
+        raise NotDone("%r: %s" % (label, res.get("why", "the field didn't take it")))
     mode = res.get("mode")
     if mode == "insert":
         page.call("Input.insertText", 10.0, text=text)
@@ -941,7 +1021,7 @@ def fill(page, label, text, index=None):
     elif mode == "set":
         res = page.eval(_js(FILLED_JS, text))
     time.sleep(0.2)  # the field's own reaction (a list of suggestions)
-    return {"found": True, "count": 1, "label": hit.get("label"), "mode": mode,
+    return {"found": True, "count": 1, "label": hit.get("label"), "mode": mode, "how": how,
             "value": res.get("value"), "screen": read(page)}
 
 
@@ -957,12 +1037,15 @@ def type_text(page, text, idle_ms=800):
         raise NotSent(str(e)[:120])
     sel = (res[0].get("result") or {}).get("value") or {}
     if not sel.get("ok"):
-        raise NotSent("no field has the focus on the page")
+        n = sel.get("fields", 0)
+        raise NotSent("no field has the focus on the page" + (
+            " (%d text fields in view; tap one, or type --field with its label)" % n if n else ""))
     if sel.get("direct") and str(sel.get("value", "")) != text:
-        raise RuntimeError("the %s field didn't take %r (it holds %r)"
-                           % (sel.get("type"), text, sel.get("value")))
+        raise NotDone("the %s field didn't take %r (it holds %r)"
+                      % (sel.get("type"), text, sel.get("value")))
     time.sleep(0.25)  # the field's own reaction (a list of suggestions)
-    return {"screen": read(page), "ready": "complete", "direct": bool(sel.get("direct"))}
+    return {"screen": read(page), "ready": "complete", "direct": bool(sel.get("direct")),
+            "only": bool(sel.get("only"))}
 
 
 def scroll(page, direction="down", times=1, fraction=0.6, idle_ms=500):
