@@ -580,13 +580,27 @@ class JsonOutputTests(OfflineTestCase):
     def test_json_tap_no_match_errors_to_stderr(self):
         self._tap_mocks(TAP_XML)
         args = self.parse(["tap", "Nope", "--json"])
-        with self.cap() as (out, err):
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_tap(args)
         self.assertEqual(rc, 1)
         data = json.loads(out.getvalue())
         self.assertFalse(data["ok"])
         self.assertIn("error", data)
         self.assertIn('no match for "Nope"', err.getvalue())
+        self.assertGreaterEqual(pc.ui_dump.call_count, 2)  # one more read before giving up
+
+    def test_tap_reads_once_more_when_the_label_is_still_drawing(self):
+        self._tap_mocks(TAP_XML)
+        blank = ET.fromstring(TAP_XML.replace("Not now", ""))
+        self.allow("ui_dump", side_effect=[blank, ET.fromstring(TAP_XML)])
+        tc = self.allow("tap_center")
+        args = self.parse(["tap", "Not now", "--json", "--no-evidence"])
+        with mock.patch.object(pc.time, "sleep") as slept, self.cap() as (out, err):
+            rc = pc.cmd_tap(args)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out.getvalue())["tapped"]["text"], "Not now")
+        tc.assert_called_once_with(200, 300)
+        slept.assert_any_call(0.7)  # the pause before the second read
 
     def test_json_tap_xy_refused_by_real_overlay(self):
         self._tap_mocks(OVERLAY_XML)
