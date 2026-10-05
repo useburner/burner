@@ -45,8 +45,25 @@ PID_PATH = os.path.join(ROOT, "run", "u2-mux.pid")
 TARGET = "127.0.0.1:15555"
 
 
+LOG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.realpath(__file__)))), "run", "u2mux.log")
+LOG_CAP = 1 << 20  # the log starts over past this size
+
+
 def log(*a):
-    print("[u2mux]", *a, file=sys.stderr, flush=True)
+    """A line to stderr and to run/u2mux.log (the helper's stderr goes
+    nowhere once it runs in the background; the file says what it did,
+    with the time of day)."""
+    line = " ".join(str(x) for x in a)
+    print("[u2mux]", line, file=sys.stderr, flush=True)
+    try:
+        mode = "a"
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_CAP:
+            mode = "w"
+        with open(LOG_FILE, mode, encoding="utf-8") as f:
+            f.write("%s %s\n" % (time.strftime("%H:%M:%S"), line))
+    except OSError:
+        pass
 
 
 class U2NotFound(Exception):
@@ -1100,7 +1117,7 @@ class U2Daemon:
                     page.wait_parsed(min(2.0, max(0.1, deadline - _time.monotonic())))
                 try:
                     with _t("web find"):
-                        n = _cdp().find(page, text, webview_top(self._last_xml))
+                        n, screen = _cdp().find_read(page, text, webview_top(self._last_xml))
                 except Exception as e:
                     fails += 1
                     if fails > 1:
@@ -1114,7 +1131,8 @@ class U2Daemon:
                 if absent and not n.get("found"):
                     return json.dumps({"gone": True, "waited_ms": waited, "polls": polls}).encode()
                 if not absent and n.get("found"):
-                    xml = self._page_read()
+                    # the read came in the poll's round trip
+                    xml = self._page_xml(screen) if screen else self._page_read()
                     if xml is not None:
                         with self._lock:
                             self._remember(xml)

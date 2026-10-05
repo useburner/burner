@@ -2089,11 +2089,9 @@ def plan_tap(nodes, w, h, text=None, xy=None, fuzzy=False, index=None,
         return {"action": "nobounds"}
     moved = False
     if check:
-        over = row_over(nodes, node, hits, pt)
-        if over is not None:
-            oc = over.get("center") or (None, None)
-            edge = "top" if oc[1] is not None and oc[1] < pt[1] else "bottom"
-            return {"action": "covered", "node": node, "cover": over, "edge": edge}
+        # a row over another on a page is the page's own business: a tap
+        # by label there asks the page what is under the point (the guess
+        # from the rows sent a tap nudging for 12s over a banner, Oct 5)
         cover = is_point_covered(nodes, pt[0], pt[1], node)
         if cover is not None:
             alt = find_uncovered_point(node, nodes)

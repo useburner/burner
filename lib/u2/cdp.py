@@ -865,13 +865,42 @@ def after_touch(page, url=None, idle_ms=1200, listen_s=0.15):
     return {"ready": "complete"}
 
 
+def _target_fill(page, label, text):
+    """After a touch on what opens a field: the field (TARGET_JS) and
+    its fill (FILL_JS), one round trip: (target, filled)."""
+    res = page.call_many([_evaluate(_js(TARGET_JS, label)), _evaluate(_js(FILL_JS, text))],
+                         raise_errors=False)
+    out = []
+    for r in res:
+        try:
+            out.append(_value(r) or {})
+        except RuntimeError:
+            out.append({})
+    return out[0], out[1]
+
+
+def find_read(page, label, top=0):
+    """find() with the read in the same round trip: (the find's answer,
+    the screen). A wait's poll that lands has its read at once."""
+    res = page.call_many([_evaluate(_js(FIND_JS, label, None, True)), _evaluate(_js(READ_JS, 600))],
+                         raise_errors=False)
+    try:
+        screen = _value(res[1]) or None
+    except RuntimeError:
+        screen = None
+    return _found(_value(res[0]) or {}, label, top), screen
+
+
 def find(page, label, top=0):
     """Whether the page has an element with these words (see FIND_JS),
     anywhere in the document: {"found": False}, or {"found": True,
     "text", "bounds" (device pixels, `top` down the screen), "enabled",
     "inview", "count"}. A wait's probe: cheaper than a read, and it sees
     below the fold, as the screen reader's tree did."""
-    hit = page.eval(_js(FIND_JS, label, None, True)) or {}
+    return _found(page.eval(_js(FIND_JS, label, None, True)) or {}, label, top)
+
+
+def _found(hit, label, top):
     if not hit.get("found"):
         return {"found": False}
     dpr = float(hit.get("dpr") or 1)
@@ -1077,17 +1106,16 @@ def fill(page, label, text, index=None):
         # when the page is still drawing it
         how = touch_hit(page, hit)[0]
         after_touch(page, hit.get("url"))
-        target = page.eval(_js(TARGET_JS, label)) or {}
+        target, filled = _target_fill(page, label, text)
         if not target.get("ok"):
-            time.sleep(0.5)
-            target = page.eval(_js(TARGET_JS, label)) or {}
+            time.sleep(0.5)  # the page still drawing the field
+            target, filled = _target_fill(page, label, text)
         if not target.get("ok"):
             n = target.get("fields", 0)
             raise NotDone("%r is a %s, not a field; tapping it opened %s" % (
                 label, hit.get("tag") or "button",
                 "no text field" if not n else "%d text fields, none labelled %r" % (n, label)))
         how = "tap+" + target.get("how", "fill")
-        filled = page.eval(_js(FILL_JS, text)) or {}
     else:
         filled = _value(res[1]) or {}
     if not filled.get("ok"):

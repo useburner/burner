@@ -606,10 +606,10 @@ class JsonOutputTests(OfflineTestCase):
     def test_plan_tap_refuses_a_row_cut_off_at_the_edge(self):
         plan = pc.plan_tap(pc.walk(ET.fromstring(CLIPPED_XML)), 1080, 2400, text="Box Score")
         self.assertEqual((plan["action"], plan["edge"]), ("clipped", "top"))
-        # a row under another row (a sticky bar's link earlier in the tree)
+        # a row under another row on a page: the page's own business (a
+        # tap by label asks the page what is under the point), no guess here
         plan = pc.plan_tap(pc.walk(ET.fromstring(COVERED_XML)), 1080, 2400, text="Box Score")
-        self.assertEqual((plan["action"], plan["edge"], plan["cover"]["text"]),
-                         ("covered", "top", "Standings"))
+        self.assertEqual(plan["action"], "tap")
         native = COVERED_XML.replace("android.webkit.WebView", "android.widget.FrameLayout")
         plan = pc.plan_tap(pc.walk(ET.fromstring(native)), 1080, 2400, text="Box Score")
         self.assertEqual(plan["action"], "tap")  # later is on top on a native screen
@@ -632,30 +632,18 @@ class JsonOutputTests(OfflineTestCase):
         swipe.assert_called_once_with("up", length=pc.nudge_px(2400))
         tc.assert_called_once_with(796, 491)
 
-    def test_tap_nudges_a_covered_row_from_under_the_bar(self):
+    def test_tap_on_a_page_row_under_another_is_not_nudged(self):
+        # the page's own check decides covers; the rows' guess cost 12s of
+        # nudging over a banner (Oct 5): tapped where the row is
         self._tap_mocks(COVERED_XML)
         swipe = self.allow("_scrcpy_swipe", return_value=True)
-        self.allow("read_after_root", return_value=(ET.fromstring(WHOLE_XML), ""))
         tc = self.allow("tap_center")
         args = self.parse(["tap", "Box Score", "--json", "--no-evidence"])
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_tap(args)
         self.assertEqual(rc, 0, "stdout=%r stderr=%r" % (out.getvalue(), err.getvalue()))
-        swipe.assert_called_once_with("up", length=pc.nudge_px(2400))
+        swipe.assert_not_called()
         tc.assert_called_once_with(796, 491)
-
-    def test_tap_gives_up_on_a_row_that_stays_covered(self):
-        self._tap_mocks(COVERED_XML)
-        swipe = self.allow("_scrcpy_swipe", return_value=True)
-        self.allow("read_after_root", return_value=(ET.fromstring(COVERED_XML), ""))
-        tc = self.allow("tap_center")
-        args = self.parse(["tap", "Box Score", "--json", "--no-evidence"])
-        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
-            rc = pc.cmd_tap(args)
-        self.assertEqual(rc, 1)
-        self.assertEqual(swipe.call_count, pc.NUDGE_ROUNDS)
-        tc.assert_not_called()
-        self.assertIn('"Box Score" is under "Standings"', err.getvalue())
 
     def test_tap_says_when_a_cut_off_row_cannot_be_nudged(self):
         self._tap_mocks(CLIPPED_XML)
@@ -4455,6 +4443,7 @@ class WebPathTests(OfflineTestCase):
             calls.append(("find", label, top))
             return next(answers)
         fake.find = find
+        fake.find_read = lambda page, label, top=0: (fake.find(page, label, top), WEB_SCREEN)
         dm = EmptyScreenTests._daemon(self, mod)
         dm.d = _FakeServer([])  # the screen reader is never asked
         dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
@@ -4545,7 +4534,7 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(page.calls, [
             ("many", ["FIND_JS", "FILL_JS"]),  # the fill rides with the find: a field takes it there
             ("many", ["Input.dispatchTouchEvent", "Input.dispatchTouchEvent"]),  # not a field: touched
-            ("eval", "TARGET_JS"), ("eval", "FILL_JS"),
+            ("many", ["TARGET_JS", "FILL_JS"]),  # the field that opened, filled in the same trip
             ("many", ["Input.insertText", "FILLED_JS", "READ_JS"])])
         # the touch led to a page with the box (no focus): the field with the label
         page = _ScriptedPage(cdp, {
@@ -4555,8 +4544,8 @@ class WebPathTests(OfflineTestCase):
         with mock.patch.object(cdp.time, "sleep"):
             r = cdp.fill(page, "Search", "Pixel 7")
         self.assertEqual(r["how"], "tap+label")
-        self.assertEqual([c[1] for c in page.calls if c[0] == "eval"],
-                         ["TARGET_JS", "TARGET_JS", "FILL_JS"])
+        self.assertEqual([c for c in page.calls if c[1] and c[1][0] == "TARGET_JS"],
+                         [("many", ["TARGET_JS", "FILL_JS"])] * 2)
 
     def test_fill_says_when_the_button_opened_no_field(self):
         cdp = _cdp()
@@ -4597,6 +4586,15 @@ class WebPathTests(OfflineTestCase):
         r = cdp.tap(page, "Box Score")
         self.assertEqual(page.calls[-1], ("eval", "READ_JS"))
         self.assertEqual(r["screen"], WEB_SCREEN)
+
+    def test_a_wait_poll_that_lands_reads_in_its_round_trip(self):
+        cdp = _cdp()
+        hit = {"found": True, "label": "box score", "l": 10, "t": 20, "w": 100, "h": 30, "inview": True,
+               "dpr": 2, "enabled": True, "count": 1}
+        page = _ScriptedPage(cdp, {"FIND_JS": hit, "READ_JS": WEB_SCREEN})
+        n, screen = cdp.find_read(page, "Box Score", top=283)
+        self.assertEqual((n["found"], n["bounds"], screen), (True, "[20,323][220,383]", WEB_SCREEN))
+        self.assertEqual(page.calls, [("many", ["FIND_JS", "READ_JS"])])
 
     def test_scroll_is_one_round_trip(self):
         cdp = _cdp()
