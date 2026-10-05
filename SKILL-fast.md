@@ -131,6 +131,7 @@ Look
   burner status                     is it up? battery, charging, screen, storage, apps
   burner notifications              read the phone's notifications (changes nothing)
   burner apps [name]                installed apps (--all includes system apps)
+  burner tabs                       Chrome's open tabs: a count, then each address and title
 
 Act (each prints the screen it ends on)
   burner tap "Text"                 tap by label (--index N, --fuzzy, "A || B", @e3 from snap)

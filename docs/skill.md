@@ -1,4 +1,4 @@
-> Install: curl -fsSL https://useburner.si/install.sh | bash (full guide below). Skill rev 27c2191d: if `burner version` shows a different rev, run `burner update`.
+> Install: curl -fsSL https://useburner.si/install.sh | bash (full guide below). Skill rev 724c90f2: if `burner version` shows a different rev, run `burner update`.
 
 # burner
 
@@ -204,6 +204,7 @@ Act
 
 Apps and links
   burner apps [name]                installed apps (--all includes system apps)
+  burner tabs                       Chrome's open tabs: a count, then each address and title
   burner notifications              read the phone's notifications (changes nothing)
   burner start <package>            open an app
   burner settings [page]            open a Settings page by name (bluetooth, wifi, display, battery...)

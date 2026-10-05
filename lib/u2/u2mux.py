@@ -1499,6 +1499,13 @@ class U2Daemon:
             return self._dump(fresh=True, page_first=True, hint=link).encode()
         return self._dump(fresh=(arg.strip() == "fresh")).encode()
 
+    def cmd_tabs(self, _):
+        """Chrome's tabs as DevTools lists them: JSON [{"id", "url",
+        "title"}], for `burner tabs`."""
+        tabs = _cdp().pages(getattr(self.d, "_dev", None))
+        return json.dumps([{"id": t.get("id", ""), "url": t.get("url", ""), "title": t.get("title", "")}
+                           for t in tabs]).encode()
+
     def cmd_invalidate(self, _):
         self.invalidate()
         return b""

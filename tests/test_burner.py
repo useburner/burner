@@ -7388,3 +7388,39 @@ class AirbnbRoundTests(OfflineTestCase):
             self.assertEqual(pc.cmd_press(self.parse(["press", "BACK"])), 0)
         self.assertEqual([c[1] for c in calls], [{"key": 3, "idle": pc.IDLE_HOME_MS}, {"key": 4, "idle": pc.IDLE_ACT_MS}])
         self.assertIn("pressed HOME", out.getvalue())
+
+    def test_burner_tabs_lists_chrome_s_tabs(self):
+        mod = _u2mux()
+        calls = []
+        fake = WebPathTests._fake_cdp(self, mod, calls)
+        fake.pages = lambda dev: [{"id": "A", "url": "https://www.airbnb.com/s/homes", "title": "Airbnb", "type": "page"},
+                                  {"id": "B", "url": "https://www.espn.com/nfl/", "title": "NFL", "type": "page"}]
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        self.assertEqual(json.loads(dm.cmd_tabs("").decode()),
+                         [{"id": "A", "url": "https://www.airbnb.com/s/homes", "title": "Airbnb"},
+                          {"id": "B", "url": "https://www.espn.com/nfl/", "title": "NFL"}])
+        self.allow("u2sock", return_value=dm.cmd_tabs("").decode())
+        with self.cap() as (out, err):
+            self.assertEqual(pc.cmd_tabs(self.parse(["tabs"])), 0)
+        self.assertEqual(out.getvalue(), "2 tabs in Chrome" + chr(10) + "  https://www.airbnb.com/s/homes  Airbnb"
+                         + chr(10) + "  https://www.espn.com/nfl/  NFL" + chr(10))
+        self.allow("u2sock", return_value="")
+        with self.cap() as (out, err):
+            self.assertEqual(pc.cmd_tabs(self.parse(["tabs"])), 1)
+        self.assertIn("can't be listed", err.getvalue())
+
+    def test_a_link_launched_carries_burner_s_own_tab_id(self):
+        adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
+        self.allow("u2_invalidate")
+        def u2(cmd, arg="", timeout=30):
+            if cmd == "act":
+                pc._u2_status = "err act not sent: not a page"  # Chrome not in front: the link is launched
+                return None
+            return CHROME_XML if cmd == "dump" else "100"
+        self.allow("u2sock", side_effect=u2)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            pc.cmd_open(self.parse(["open", "https://www.airbnb.com/s/homes"]))
+        script = adb.call_args_list[0][0][1]
+        self.assertIn("--es com.android.browser.application_id burner", script)
+        self.assertNotIn("application_id com.android.chrome", script)

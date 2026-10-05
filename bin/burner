@@ -4831,8 +4831,9 @@ def cmd_open(args):
         # Chrome reuses the tab it opened for this id instead of adding
         # one per link (a phone had 107 tabs, Oct 5), so the page's
         # session stays on one tab, with no first contact per open
-        script += " --es com.android.browser.application_id {}".format(
-            _sh_quote(args.package or "com.android.chrome"))
+        # (an id of burner's own: Chrome's own package name as the id
+        # opened a new tab every time, five tabs with one address, Oct 5)
+        script += " --es com.android.browser.application_id burner"
     adb_or_ensure("shell", script)
     u2_invalidate()
     print("opened {}".format(args.url))
@@ -5137,6 +5138,10 @@ def build_parser():
                        help="latest Amazon order status (one-shot, stops at order list)")
     p.set_defaults(fn=cmd_amazon_status)
 
+    p = sub.add_parser("tabs", help="Chrome's open tabs, as its DevTools lists them")
+    p.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                   help="machine-readable JSON on stdout")
+    p.set_defaults(fn=cmd_tabs)
     p = sub.add_parser("version",
                        help="which burner build and skill revision this is")
     p.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
@@ -5256,6 +5261,28 @@ def cmd_recipe(args):
                     return 1
                 steps.append(line)
     return cmd_do(argparse.Namespace(flow="; ".join(steps)))
+
+
+def cmd_tabs(args):
+    """Chrome's open tabs as its DevTools lists them: a count, then each
+    tab's address and title. For the tab scan's sake (a phone had 107
+    tabs, and every link opened from the background added one, Oct 5)."""
+    r = u2sock("tabs", "", timeout=15)
+    try:
+        tabs = json.loads(r) if r else None
+    except ValueError:
+        tabs = None
+    if not isinstance(tabs, list):
+        print("burner: Chrome's tabs can't be listed (the UI helper is away, or Chrome isn't running)",
+              file=sys.stderr)
+        return 1
+    if as_json(args):
+        print(json.dumps(tabs))
+        return 0
+    print("{} tab{} in Chrome".format(len(tabs), "" if len(tabs) == 1 else "s"))
+    for t in tabs:
+        print("  {}  {}".format((t.get("url") or "")[:90], (t.get("title") or "")[:50]).rstrip())
+    return 0
 
 
 def cmd_recipes(args):

@@ -207,6 +207,7 @@ Act
 
 Apps and links
   burner apps [name]                installed apps (--all includes system apps)
+  burner tabs                       Chrome's open tabs: a count, then each address and title
   burner notifications              read the phone's notifications (changes nothing)
   burner start <package>            open an app
   burner settings [page]            open a Settings page by name (bluetooth, wifi, display, battery...)
