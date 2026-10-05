@@ -954,6 +954,13 @@ def walk(root):
     return out
 
 
+def tappable_row(node):
+    """True for a row that takes a tap: clickable itself, or inside a
+    clickable row (a button's words). Pure."""
+    return bool(node.get("clickable")) or any(
+        p.attrib.get("clickable") == "true" for p in node.get("parents", ()))
+
+
 def clickable_target(node):
     """Return center of the node or its nearest clickable ancestor."""
     if node["clickable"] and node["center"][0] is not None:
@@ -2281,6 +2288,14 @@ def plan_tap(nodes, w, h, text=None, xy=None, fuzzy=False, index=None,
                  if "EditText" in (c.get("class") or "") and (c.get("text") or "").lower() == used.lower()]
         if typed and len(typed) < len(controls):
             controls = [c for c in controls if id(c) not in typed]
+    if len(controls) > 1:
+        # the words on a button beside the same words as plain text (Play's
+        # "Open" button and the word "Open" in the listing, Oct 5; a
+        # dialog's title and its button): the one that can be tapped is the
+        # control, the rest are words. Two buttons alike stay ambiguous.
+        tappable = [c for c in controls if tappable_row(c)]
+        if len(tappable) == 1:
+            controls = tappable
     if len(controls) > 1 and index is None:
         return {"action": "ambiguous", "used": used, "hits": controls,
                 "fuzzy": fuzzy_used}

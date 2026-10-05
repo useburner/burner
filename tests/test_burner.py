@@ -1391,6 +1391,29 @@ class AmbiguousTapTests(OfflineTestCase):
         only_box = TYPED_XML.replace('text="Pixel 7" class="android.widget.TextView"', 'text="Other" class="android.widget.TextView"')
         self.assertEqual(mod.label_target(only_box, "Pixel 7"), (550, 360))  # alone, the box is the row
 
+    def test_the_tappable_row_among_same_words_is_the_control(self):
+        # a button and plain text with the same words (Play's "Open"
+        # button beside the word "Open" in the listing): the button
+        headed = AMBI_XML.replace(
+            '<node text="OK" class="android.widget.Button" bounds="[100,400][400,500]" clickable="true"',
+            '<node text="OK" class="android.widget.TextView" bounds="[100,400][400,500]" clickable="false"')
+        rc, out, err, tc = self._tap(["tap", "OK"], xml=headed)
+        self.assertEqual(rc, 0, err)
+        tc.assert_called_once_with(250, 650)  # the button, not the words above it
+        mod = _u2mux()
+        self.assertEqual(mod.label_target(headed, "OK"), (250, 650))
+        # words inside a clickable row count as tappable: two such stay ambiguous
+        carded = headed.replace(
+            '<node text="OK" class="android.widget.TextView" bounds="[100,400][400,500]" clickable="false" enabled="true" focused="false" checked="false"/>',
+            '<node text="" class="android.widget.LinearLayout" bounds="[50,380][450,520]" clickable="true" enabled="true" focused="false" checked="false">'
+            '<node text="OK" class="android.widget.TextView" bounds="[100,400][400,500]" clickable="false" enabled="true" focused="false" checked="false"/></node>')
+        rc, out, err, tc = self._tap(["tap", "OK"], xml=carded)
+        self.assertEqual(rc, 1)
+        self.assertIn("ambiguous tap", err)
+        with self.assertRaises(RuntimeError):
+            mod.label_target(carded, "OK")
+        self.assertTrue(mod.can_tap(list(mod.iter_nodes(carded)), list(mod.iter_nodes(carded))[2]))
+
     def test_ambiguous_json_shape(self):
         self.allow("wake_async")
         self.allow("ui_dump", return_value=ET.fromstring(AMBI_XML))

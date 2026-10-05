@@ -876,6 +876,19 @@ def takes_tap(n, target, size):
     return (x2 - x1) * (y2 - y1) >= 0.4 * size[0] * size[1]
 
 
+def can_tap(nodes, n):
+    """True for a row that takes a tap: clickable itself, or inside a
+    clickable row (see iter_nodes: parent). Pure."""
+    if n["clickable"]:
+        return True
+    p = n.get("parent")
+    while p is not None:
+        if nodes[p]["clickable"]:
+            return True
+        p = nodes[p].get("parent")
+    return False
+
+
 def descends(nodes, i, ids):
     """True when nodes[i] is inside one of the nodes whose id() is in
     `ids` (see iter_nodes: parent). Pure."""
@@ -986,6 +999,13 @@ def label_node(xml, label):
             typed = [c for c in controls if c[0].get("field") and c[0]["text"].lower() == low]
             if typed and len(typed) < len(controls):
                 controls = [c for c in controls if c not in typed]
+        if len(controls) > 1:
+            # the words on a button beside the same words as plain text
+            # (Play's "Open" button and the word "Open" in the listing,
+            # Oct 5): the one that can be tapped is the control
+            tappable = [c for c in controls if any(can_tap(nodes, n) for n in c)]
+            if len(tappable) == 1:
+                controls = tappable
         if len(controls) > 1:
             raise RuntimeError("%d rows read %r" % (len(controls), alt))
         if any(cut_off(n) for n in controls[0]):
