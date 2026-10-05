@@ -716,12 +716,15 @@ def act_calls(spec):
     if calls:
         if not sleeps_the_screen(spec):
             calls.insert(0, ("wakeUp", []))
-        if spec.get("quiet") and "tap_selector" in spec:
-            # a chained tap by words: the phone waits for the tap's
-            # acknowledgement itself, and the next step finds its control
-            # by words when its turn comes
-            return calls
-        calls.append(("dumpWindowHierarchy", [False, DUMP_DEPTH]))
+        if "tap_selector" in spec:
+            # a tap by words is acknowledged by the UI before the phone
+            # answers it (the click waits for the first event it causes),
+            # so no read stands in for the pause; a chained one ends here:
+            # the next step finds its control by words when its turn comes
+            if spec.get("quiet"):
+                return calls
+        else:
+            calls.append(("dumpWindowHierarchy", [False, DUMP_DEPTH]))
     calls.append(("waitForIdle", [int(spec.get("idle", 2000))]))
     if not spec.get("quiet"):
         # a chained step wants no screen back: the next step reads afresh

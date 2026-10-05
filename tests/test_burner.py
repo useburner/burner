@@ -3731,8 +3731,7 @@ class LabelTapTests(OfflineTestCase):
         dm.cmd_act(json.dumps({"tap_label": "OK"}))
         self.assertEqual(sent[0][1][0], "click")
         self.assertEqual(sent[0][1][1][0]["text"], "OK")
-        self.assertEqual([m for m, _ in sent[0]],
-                         ["wakeUp", "click", "dumpWindowHierarchy", "waitForIdle", "dumpWindowHierarchy"])
+        self.assertEqual([m for m, _ in sent[0]], ["wakeUp", "click", "waitForIdle", "dumpWindowHierarchy"])
         self.assertEqual(dm.d.calls, [])
         # the phone no longer finds it (the screen changed): nothing was
         # tapped, the row is read afresh and tapped where it is now
