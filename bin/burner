@@ -3386,6 +3386,13 @@ def launch_read(quiet, expect=None):
         front = dump_package(root)
         if not expect or front == expect or attempt == LAUNCH_REREADS:
             break
+        if front and any(k in front for k in PROMPT_PKGS):
+            # the app is up and asks the user something (a permission on
+            # its first start): that is the app in front, with a question
+            # (the screen says so; see system_prompt). Not "didn't come to
+            # the front", whose advice was BACK: that answers the prompt
+            front = expect
+            break
         _trace("{} in front, not {} yet; reading again".format(front, expect))
         time.sleep(0.4)
     print_screen(root, note=note)

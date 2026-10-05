@@ -6568,6 +6568,21 @@ class PhoneAsksTests(OfflineTestCase):
             rc = pc.cmd_do(argparse.Namespace(flow="start com.vinted"))
         self.assertEqual(rc, 0)
 
+    def test_start_with_a_permission_prompt_in_front_is_the_app_up_and_asking(self):
+        # a newly installed app asks for a permission on its first start:
+        # the permission controller is in front, with the app under it
+        self.allow("scrcpy_send", return_value=True)
+        self.allow("adb_or_ensure")
+        self.allow("u2_invalidate")
+        self.allow("nav_record")
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30: NOTIFY_XML)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_start(self.parse(["start", "com.vinted"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertIn("launched com.vinted", out.getvalue())
+        self.assertIn("asked: Allow Vinted to send you notifications? | options: Allow / Don't allow", out.getvalue())
+        self.assertNotIn("didn't come to the front", err.getvalue())
+
     def test_the_helper_hands_out_its_newest_read_without_a_round_trip(self):
         mod = _u2mux()
         EmptyScreenTests.no_sleep(self, mod)

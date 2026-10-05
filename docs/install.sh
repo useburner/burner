@@ -53,11 +53,28 @@ elif [ -d "$DEST" ] && [ ! -f "$DEST/$MARKER" ] && [ -n "$(ls -A "$DEST" 2>/dev/
 else
   TMPDIR_B="$(mktemp -d 2>/dev/null || mktemp -d -t burner)" || die "cannot create a temp dir."
   trap 'rm -rf "$TMPDIR_B"' EXIT
-  info "downloading burner..."
+  # The branch's archive on GitHub lags a push by minutes (a cache served
+  # the build before the newest, Oct 5): the branch's head commit is looked
+  # up first and that commit's own archive fetched, which is exact. The
+  # branch archive stands in when the lookup fails (offline, a rate limit).
+  SHA=""
+  if command -v curl >/dev/null 2>&1; then
+    SHA="$(curl -fsSL -H 'Accept: application/vnd.github.sha' "https://api.github.com/repos/useburner/burner/commits/${REF}" 2>/dev/null | tr -dc '0-9a-f' | head -c 40)"
+  elif command -v wget >/dev/null 2>&1; then
+    SHA="$(wget -q -O - --header='Accept: application/vnd.github.sha' "https://api.github.com/repos/useburner/burner/commits/${REF}" 2>/dev/null | tr -dc '0-9a-f' | head -c 40)"
+  fi
+  if [ "${#SHA}" -eq 40 ]; then
+    TARBALL_URL="https://github.com/useburner/burner/archive/${SHA}.tar.gz"
+    SRC_NAME="burner-${SHA}"
+    info "downloading burner ${SHA%"${SHA#???????}"} (the head of ${REF})..."
+  else
+    # GitHub names the folder after the branch, with / turned into -.
+    SRC_NAME="burner-$(printf '%s' "$REF" | tr / -)"
+    info "downloading burner..."
+  fi
   fetch "$TARBALL_URL" "$TMPDIR_B/burner.tar.gz" || die "download failed: $TARBALL_URL"
   tar -xzf "$TMPDIR_B/burner.tar.gz" -C "$TMPDIR_B" || die "could not extract the burner tarball."
-  # GitHub names the folder after the branch, with / turned into -.
-  SRC="$TMPDIR_B/burner-$(printf '%s' "$REF" | tr / -)"
+  SRC="$TMPDIR_B/$SRC_NAME"
   [ -f "$SRC/install.sh" ] || die "unexpected tarball layout (no $(basename "$SRC")/install.sh)."
   mkdir -p "$DEST" || die "cannot create $DEST"
   # Copy contents (including dotfiles) into DEST.
