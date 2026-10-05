@@ -22,4 +22,7 @@ tap "Install"
 # developer's name (OpenAI) while the download is still going.
 # After the install the button row reads "Uninstall" + "Open" (the Pixel 7
 # showed only "Open" once and the old wait sat here for 10 minutes).
+# While the download runs this wait comes back every 30 seconds with what the
+# screen shows (the recipe pauses and prints the `burner do` to go on with):
+# tell the user, then run it.
 wait "Uninstall || Open" --exact --timeout 600

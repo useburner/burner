@@ -2432,6 +2432,116 @@ def _tap_settled_ok(args, label, xy, added, removed, final_fp=None):
     return 0
 
 
+WAIT_SLICE_S = 30    # a wait longer than this comes back after this long with a progress line
+WAIT_REPORT_S = 10   # within a slice, a progress line on stderr this often (for whoever streams)
+WAIT_RESUME_S = 120  # a wait for the same words this soon after a slice ended continues its clock
+WAIT_STILL_RC = 2    # exit code: still waiting (the slice ended; the time allowed did not)
+WAITING_FILE = os.path.join(ROOT, "run", "waiting.json")
+BUSY_WORDS = ("installing", "downloading", "loading", "pending", "verifying", "updating",
+              "connecting", "uploading", "syncing", "processing", "preparing", "waiting",
+              "opening", "signing in", "sending", "searching", "checking", "please wait")
+
+
+def progress_hint(nodes):
+    """What the screen says about something under way, for a wait's
+    progress line: rows with a percentage or a word of doing (Installing,
+    43%, Loading…), two at most, else the first two rows with words.
+    Pure."""
+    texts = []
+    for n in nodes:
+        t = (n["text"] or n["desc"] or "").strip()
+        if t and len(t) <= 60 and t not in texts:
+            texts.append(t)
+    busy = [t for t in texts if re.search(r"\d{1,3}\s?%", t) or t.endswith(("…", "..."))
+            or any(w in t.lower() for w in BUSY_WORDS)]
+    rows = (busy or texts)[:2]
+    if not rows:
+        return "the screen shows no words"
+    return "the screen shows: " + ", ".join(rows)
+
+
+def _wait_key(args):
+    return [args.text, bool(args.absent), bool(getattr(args, "exact", False))]
+
+
+def _wait_clock(args):
+    """When this wait began: a wait for the same words that ended a slice
+    less than WAIT_RESUME_S ago is the same wait, continued (its clock
+    ran on while the assistant told the user); any other starts now."""
+    try:
+        with open(WAITING_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        if d.get("key") == _wait_key(args) and time.time() - float(d.get("last", 0)) <= WAIT_RESUME_S:
+            return float(d["started"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return time.time()
+
+
+def _wait_note(args, started):
+    """A slice ended without the words: when this wait began, for the
+    next call. Never raises."""
+    try:
+        os.makedirs(os.path.dirname(WAITING_FILE), exist_ok=True)
+        with open(WAITING_FILE, "w", encoding="utf-8") as f:
+            json.dump({"key": _wait_key(args), "started": started, "last": time.time()}, f)
+    except OSError:
+        pass
+
+
+def _wait_forget():
+    """The wait ended (found, gone, or given up): no clock to continue."""
+    try:
+        os.remove(WAITING_FILE)
+    except OSError:
+        pass
+
+
+def _wait_hint():
+    """The progress hint from the screen as it is (the helper's last poll
+    is cached, so this costs nothing on the phone)."""
+    try:
+        return progress_hint(walk(ui_dump()))
+    except Exception as e:
+        return "the screen couldn't be read ({})".format(str(e)[:60])
+
+
+def _wait_report(args, so_far):
+    """A progress line on stderr while a wait runs, for whoever streams
+    (a terminal, an assistant's activity log)."""
+    print('burner: still waiting for "{}" ({}s): {}'.format(args.text, int(round(so_far)), _wait_hint()),
+          file=sys.stderr, flush=True)
+
+
+def _wait_still(args, so_far, total):
+    """A slice of a long wait ended without the words: how long so far,
+    what the screen shows, and the way on, as the result (stdout), with
+    exit code WAIT_STILL_RC. The assistant tells the user and runs the
+    same wait again; its clock continues (see _wait_clock)."""
+    hint = _wait_hint()
+    left = max(0, int(round(total - so_far)))
+    if as_json(args):
+        print(json.dumps({"ok": False, "still": True, "text": args.text, "waited": int(round(so_far)),
+                          "left": left, "screen": hint}))
+    else:
+        print('still waiting for "{}": {}s so far, {}s left; {}.'.format(
+            args.text, int(round(so_far)), left, hint))
+        print("Tell the user what is happening, then run the same command again to keep waiting.")
+    return WAIT_STILL_RC
+
+
+def _wait_over(args, started, total, sliced):
+    """The slice is over without the words: still waiting when the wait is
+    a long one with time left (its clock noted for the next call), else
+    the timeout, as before."""
+    so_far = time.time() - started
+    if sliced and so_far < total:
+        _wait_note(args, started)
+        return _wait_still(args, so_far, total)
+    _wait_forget()
+    return _wait_fail(args, 'timeout waiting for "{}"'.format(args.text))
+
+
 def _wait_fail(args, msg):
     """Wait failure: human text on stderr, pure JSON on stdout with --json.
     Attaches failure evidence (screenshot + screen contents) unless --no-evidence."""
@@ -2483,33 +2593,63 @@ def _print_waited_screen(args):
 
 def cmd_wait(args):
     # Fast path: the daemon polls (0.25s interval, fresh dump each poll) and
-    # returns the matched node — one socket call, no per-poll RPC from here.
-    # Matches exact label first, then case-insensitive substring (text/desc)
-    # unless --exact ("Open" is not "OpenAI": a recipe's wait for an
-    # install to finish ended on the developer's name, found in review Oct 5).
+    # returns the matched node — one socket call per chunk of WAIT_REPORT_S,
+    # no per-poll RPC from here. Matches exact label first, then
+    # case-insensitive substring (text/desc) unless --exact ("Open" is not
+    # "OpenAI": a recipe's wait for an install to finish ended on the
+    # developer's name, found in review Oct 5). A wait longer than
+    # WAIT_SLICE_S comes back after a slice with a progress line (exit
+    # WAIT_STILL_RC), so that the assistant can tell the user what is
+    # happening instead of going silent for minutes (Muse showed dots
+    # through a whole install, Oct 5); run again, the same wait continues.
     exact = getattr(args, "exact", False)
-    r = u2sock("wait_for", json.dumps({"text": args.text, "timeout": args.timeout,
-                                       "absent": args.absent, "exact": exact}),
-               timeout=args.timeout + 30)
-    if r == U2_NOT_FOUND:
-        return _wait_fail(args, 'timeout waiting for "{}"'.format(args.text))
-    if r is not None:
+    total = float(args.timeout)
+    started = _wait_clock(args)
+    left = total - (time.time() - started)
+    if left <= 0:
+        _wait_forget()
+        return _wait_fail(args, 'timeout waiting for "{}" ({}s in all)'.format(
+            args.text, int(round(time.time() - started))))
+    sliced = total > WAIT_SLICE_S
+    end = time.monotonic() + (min(left, WAIT_SLICE_S) if sliced else left)
+    helper = True
+    while helper:
+        chunk = min(WAIT_REPORT_S, end - time.monotonic())
+        if chunk <= 0:
+            return _wait_over(args, started, total, sliced)
+        t_chunk = time.monotonic()
+        r = u2sock("wait_for", json.dumps({"text": args.text, "timeout": chunk,
+                                           "absent": args.absent, "exact": exact}),
+                   timeout=chunk + 30)
+        if r is None:
+            break  # no helper: the legacy path
+        if r == U2_NOT_FOUND:
+            if time.monotonic() - t_chunk < chunk / 2:
+                # an older helper answers at once rather than polling its
+                # chunk: the wait is over, as before
+                return _wait_over(args, started, total, False)
+            if time.monotonic() < end:
+                _wait_report(args, time.time() - started)
+            continue
         try:
             n = json.loads(r)
         except ValueError:
             n = None
         if isinstance(n, dict) and n.get("gone"):
+            _wait_forget()
             rc = _wait_gone(args)
             _print_waited_screen(args)
             return rc
         if isinstance(n, dict) and n.get("found"):
+            _wait_forget()
             rc = _wait_found(args, n["text"] or n["desc"] or args.text,
                              n["bounds"], n["enabled"])
             _print_waited_screen(args)
             return rc
+        break  # an answer that is neither: the legacy path
     # Legacy path.
-    deadline = time.time() + args.timeout
     labels = [p.strip() for p in args.text.split("||") if p.strip()] or [args.text]
+    reported = time.monotonic()
     while True:
         nodes = walk(ui_dump())
         hits = []
@@ -2518,16 +2658,21 @@ def cmd_wait(args):
             if hits:
                 break
         if args.absent and not hits:
+            _wait_forget()
             rc = _wait_gone(args)
             _print_waited_screen(args)
             return rc
         if not args.absent and hits:
+            _wait_forget()
             n = hits[0]
             rc = _wait_found(args, n["text"], n["bounds"], n["enabled"], node=n)
             _print_waited_screen(args)
             return rc
-        if time.time() > deadline:
-            return _wait_fail(args, 'timeout waiting for "{}"'.format(args.text))
+        if time.monotonic() >= end:
+            return _wait_over(args, started, total, sliced)
+        if time.monotonic() - reported >= WAIT_REPORT_S:
+            reported = time.monotonic()
+            _wait_report(args, time.time() - started)
         time.sleep(2)
 
 
@@ -4695,6 +4840,13 @@ def cmd_do(args):
             ns.quiet = True  # only the last step prints the screen
         print("do [{}]: {}".format(i, step), flush=True)
         rc = ns.fn(ns)
+        if rc == WAIT_STILL_RC:
+            # a long wait's slice ended: the flow pauses here, and goes on
+            # from this step once the assistant has told the user
+            rest = "; ".join(steps[i - 1:])
+            print("do: paused at step {} (still waiting). Tell the user, then go on with: burner do {}"
+                  .format(i, shlex.quote(rest)))
+            return rc
         if rc:
             print("do: step {} failed, stopping".format(i), file=sys.stderr)
             return rc

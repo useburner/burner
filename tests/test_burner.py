@@ -6247,3 +6247,156 @@ class WindowOverPageTests(OfflineTestCase):
         self.assertEqual([c for c in calls if c[0] == "find"], [("find", "Weekly money check")])  # the page once
         self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])  # then the screen reader, which had the words
         self.assertGreaterEqual(dm.d.looks, 2)  # a look with the find, one with the read
+
+
+# --------------------------------- 26. a long wait never goes silent
+
+class SlicedWaitTests(OfflineTestCase):
+    """`burner wait` above WAIT_SLICE_S comes back every slice with a
+    progress line, and the same wait continues when run again."""
+
+    def _clock(self):
+        clock = {"t": 1000.0}
+        for name in ("monotonic", "time"):
+            p = mock.patch.object(pc.time, name, lambda: clock["t"])
+            p.start()
+            self.addCleanup(p.stop)
+        return clock
+
+    def _waiting_file(self):
+        path = os.path.join(tempfile.mkdtemp(), "waiting.json")
+        p = mock.patch.object(pc, "WAITING_FILE", path)
+        p.start()
+        self.addCleanup(p.stop)
+        return path
+
+    def _polling_helper(self, clock, calls):
+        """A helper that polls each chunk it is given (the clock moves by
+        the chunk) and never finds the words."""
+        def u2(cmd, arg="", timeout=30):
+            if cmd == "wait_for":
+                spec = json.loads(arg)
+                calls.append(spec["timeout"])
+                clock["t"] += spec["timeout"]
+                return pc.U2_NOT_FOUND
+            return SAMPLE_XML
+        self.allow("u2sock", side_effect=u2)
+        self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
+
+    def test_progress_hint(self):
+        nodes = [_wnode(text="Vinted"), _wnode(text="Cancel"), _wnode(text="Installing…"),
+                 _wnode(text="43%"), _wnode(text="Hello")]
+        self.assertEqual(pc.progress_hint(nodes), "the screen shows: Installing…, 43%")
+        self.assertEqual(pc.progress_hint([_wnode(text="Hello"), _wnode(desc="Search"), _wnode(text="OK")]),
+                         "the screen shows: Hello, Search")
+        self.assertEqual(pc.progress_hint([_wnode(text="Please wait...")]), "the screen shows: Please wait...")
+        self.assertEqual(pc.progress_hint([]), "the screen shows no words")
+
+    def test_a_long_wait_comes_back_every_slice_and_continues(self):
+        clock, path, calls = self._clock(), self._waiting_file(), []
+        self._polling_helper(clock, calls)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_wait(self.parse(["wait", "Open", "--timeout", "600", "--no-evidence"]))
+        self.assertEqual(rc, pc.WAIT_STILL_RC)
+        self.assertEqual(calls, [10, 10, 10])  # three chunks of a 30s slice
+        self.assertIn('still waiting for "Open": 30s so far, 570s left; the screen shows: Hello, OK.', out.getvalue())
+        self.assertIn("run the same command again", out.getvalue())
+        self.assertEqual(err.getvalue().count('burner: still waiting for "Open"'), 2)  # between the chunks
+        self.assertTrue(os.path.exists(path))
+        # run again a little later (the assistant told the user): the same wait, continued
+        clock["t"] += 20
+        calls.clear()
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_wait(self.parse(["wait", "Open", "--timeout", "600", "--no-evidence"]))
+        self.assertEqual(rc, pc.WAIT_STILL_RC)
+        self.assertIn('"Open": 80s so far, 520s left', out.getvalue())
+        # another label is another wait, from the start
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            pc.cmd_wait(self.parse(["wait", "Done", "--timeout", "600", "--no-evidence"]))
+        self.assertIn('"Done": 30s so far, 570s left', out.getvalue())
+        # found on a later slice: the clock is forgotten
+        def found(cmd, arg="", timeout=30):
+            if cmd == "wait_for":
+                return json.dumps({"found": True, "text": "Open", "desc": "", "bounds": "[0,0][10,10]",
+                                   "enabled": True})
+            return SAMPLE_XML
+        self.allow("u2sock", side_effect=found)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_wait(self.parse(["wait", "Done", "--timeout", "600", "--quiet"]))
+        self.assertEqual((rc, os.path.exists(path)), (0, False))
+        self.assertIn("found: Open", out.getvalue())
+
+    def test_a_long_wait_gives_up_when_its_time_is_used_up(self):
+        clock, path, calls = self._clock(), self._waiting_file(), []
+        self._polling_helper(clock, calls)
+        with mock.patch.object(pc.time, "sleep"), self.cap():
+            pc.cmd_wait(self.parse(["wait", "Open", "--timeout", "50", "--no-evidence"]))
+        self.assertEqual(calls, [10, 10, 10])
+        calls.clear()
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_wait(self.parse(["wait", "Open", "--timeout", "50", "--no-evidence"]))
+        self.assertEqual(rc, 1)
+        self.assertEqual(calls, [10, 10])  # the 20s left, then the timeout
+        self.assertIn('timeout waiting for "Open"', err.getvalue())
+        self.assertFalse(os.path.exists(path))
+        # a slice long forgotten (the assistant came back much later) starts afresh
+        with mock.patch.object(pc.time, "sleep"), self.cap():
+            pc.cmd_wait(self.parse(["wait", "Open", "--timeout", "600", "--no-evidence"]))
+        clock["t"] += pc.WAIT_RESUME_S + 1
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            pc.cmd_wait(self.parse(["wait", "Open", "--timeout", "600", "--no-evidence"]))
+        self.assertIn('"Open": 30s so far', out.getvalue())
+
+    def test_a_short_wait_is_one_piece_as_before(self):
+        clock, path, calls = self._clock(), self._waiting_file(), []
+        self._polling_helper(clock, calls)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_wait(self.parse(["wait", "Open", "--no-evidence"]))  # --timeout 30
+        self.assertEqual(rc, 1)
+        self.assertEqual(calls, [10, 10, 10])
+        self.assertIn('timeout waiting for "Open"', err.getvalue())
+        self.assertNotIn("still waiting", out.getvalue())
+        self.assertFalse(os.path.exists(path))
+
+    def test_an_older_helper_answering_at_once_ends_the_wait_as_before(self):
+        clock, path, calls = self._clock(), self._waiting_file(), []
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30: calls.append(cmd) or pc.U2_NOT_FOUND)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_wait(self.parse(["wait", "Open", "--timeout", "600", "--no-evidence"]))
+        self.assertEqual((rc, calls), (1, ["wait_for"]))
+        self.assertIn('timeout waiting for "Open"', err.getvalue())
+
+    def test_the_json_form_of_still_waiting(self):
+        clock, path, calls = self._clock(), self._waiting_file(), []
+        self._polling_helper(clock, calls)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_wait(self.parse(["wait", "Open", "--timeout", "600", "--json", "--no-evidence"]))
+        self.assertEqual(rc, pc.WAIT_STILL_RC)
+        data = json.loads(out.getvalue())
+        self.assertEqual((data["ok"], data["still"], data["waited"], data["left"]), (False, True, 30, 570))
+        self.assertEqual(data["screen"], "the screen shows: Hello, OK")
+
+    def test_the_legacy_path_slices_too(self):
+        clock, path = self._clock(), self._waiting_file()
+        self.allow("u2sock", return_value=None)  # no helper
+        self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
+
+        def sleep(s):
+            clock["t"] += s
+        with mock.patch.object(pc.time, "sleep", sleep), self.cap() as (out, err):
+            rc = pc.cmd_wait(self.parse(["wait", "Nope", "--timeout", "600", "--no-evidence"]))
+        self.assertEqual(rc, pc.WAIT_STILL_RC)
+        self.assertIn('still waiting for "Nope": 30s so far', out.getvalue())
+        self.assertGreaterEqual(err.getvalue().count('burner: still waiting for "Nope"'), 2)
+
+    def test_do_pauses_on_a_step_still_waiting(self):
+        self.allow("u2_invalidate")
+        with mock.patch.object(pc, "cmd_wait", return_value=pc.WAIT_STILL_RC), \
+                mock.patch.object(pc, "cmd_press", return_value=0) as press, \
+                self.cap() as (out, err):
+            rc = pc.cmd_do(argparse.Namespace(flow='wait "Uninstall || Open" --exact --timeout 600; press BACK'))
+        self.assertEqual(rc, pc.WAIT_STILL_RC)
+        self.assertIn("do: paused at step 1 (still waiting). Tell the user, then go on with: "
+                      "burner do 'wait \"Uninstall || Open\" --exact --timeout 600; press BACK'", out.getvalue())
+        press.assert_not_called()
+        self.assertEqual(err.getvalue(), "")

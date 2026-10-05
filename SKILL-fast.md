@@ -52,6 +52,14 @@ Every step you take costs a round trip, so the fewer steps, the faster.
    still fails, tell the user plainly what it printed (it says what is wrong).
    When the user asks why something was slow, `burner log --last 20` shows
    each command's time; paste it rather than guessing.
+9. **Say what is happening while it happens.** Before anything that takes more
+   than a few seconds (an install, `burner ensure`, a page slow to load), tell
+   the user in one line what you are doing and about how long. A `burner wait`
+   with `--timeout` above 30 comes back every 30 seconds with what the screen
+   shows (`still waiting for "Open": 30s so far, 570s left; the screen shows:
+   Installing…, 43%`): tell the user in one line, then run the same command
+   again; it continues where it was. A paused `burner do` or recipe prints the
+   command to go on with. Never leave the user looking at dots for minutes.
 
 ## Common requests
 
@@ -59,7 +67,7 @@ Every step you take costs a round trip, so the fewer steps, the faster.
 |---|---|
 | "What's on my burner?" / "Take a screenshot of my burner" | The screen right now: `burner shot --out .` and send the image. |
 | "Use Tinder to…" (any app or service by name) | `burner apps tinder` finds its package, then `burner start <package>`: the launch prints the screen it opens on (`--fresh` for its first screen). If the app isn't installed or stops you at a sign-in wall, read the site in the phone's browser instead: `burner open "https://…" com.android.chrome` (read-only, and tell the user). |
-| "Install Snapchat" (any free app) | `PLAY_PACKAGE=com.snapchat.android burner recipe play-install` with the package (a Play Store link ends in `?id=<package>`). Name only: `APP_QUERY=Vinted burner recipe play-search`, pick the right result (`burner tap "Vinted" --index 0`), then `burner recipe play-install-current`. The recipes open the store themselves; a listing that says Open or Installed means it's already there. Never buy an app. |
+| "Install Snapchat" (any free app) | `PLAY_PACKAGE=com.snapchat.android burner recipe play-install` with the package (a Play Store link ends in `?id=<package>`). Name only: `APP_QUERY=Vinted burner recipe play-search`, pick the right result (`burner tap "Vinted" --index 0`), then `burner recipe play-install-current`. The recipes open the store themselves; a listing that says Open or Installed means it's already there. While the download runs the install recipe comes back every 30 seconds with what the screen shows: tell the user, then run the `burner do` line it prints. Never buy an app. |
 | "Turn on Bluetooth" / a phone setting | `burner settings bluetooth` opens that page in one call (`burner settings` lists the pages: wifi, display, sound, battery, apps, location, `app <package>`...). Switch rows show `(on)` or `(off)`; tap the row to flip it. |
 | "Check my burner" / battery / "is it on?" | `burner status`. |
 | "Check my notifications" / "anything new?" | `burner notifications` prints them and changes nothing. |
@@ -112,7 +120,8 @@ Act (each prints the screen it ends on)
   burner type "text"                type into the focused field (--field "Hint", --clear)
   burner press BACK|HOME|ENTER      press a key (--repeat N)
   burner scroll [down|up|left|right|top|bottom]   scroll the open app (--times N, --to "Text")
-  burner wait "Text"                wait for text (--timeout 30, "A || B" for either, --absent to wait for it to go, --exact for the whole label only)
+  burner wait "Text"                wait for text (--timeout 30, "A || B" for either, --absent to wait for it to go, --exact for the whole label only;
+                                    above 30s it comes back every 30s with what the screen shows: tell the user, run it again)
   burner start <package>            open an app (--fresh: on its first screen)
   burner settings [page]            a Settings page by name: bluetooth, wifi, display, battery, apps, app <package>...
   burner open <url> [package]       open a link, in one app if a package is given
