@@ -239,9 +239,12 @@ class KeepAliveHTTP:
 
     def _direct_target(self, port):
         """(ip, port) of the server straight over the tailnet, or None
-        when the phone's address isn't known or the route failed lately."""
+        when this computer reaches the tailnet through a proxy (its
+        CONNECTs were refused one in two and the route flapped between
+        direct and adb, eight times in two minutes, Oct 5, 04:11), when
+        the phone's address isn't known, or when the route failed lately."""
         ip = phone_config().get("PHONE_TAILSCALE_IP", "")
-        if not ip or ip.startswith("YOUR_") or _time.monotonic() < self._direct_retry_at:
+        if tailnet_proxy() is not None or not ip or ip.startswith("YOUR_")                 or _time.monotonic() < self._direct_retry_at:
             return None
         return ip, int(port)
 

@@ -4294,6 +4294,11 @@ class WebPathTests(OfflineTestCase):
             c = ka._open(SimpleNamespace(serial="s"), 9008)
             self.assertEqual((c.how, ka.direct, opened), ("direct", True, [("direct", "100.64.0.9", 9008)]))
             adb.assert_not_called()
+            # through a proxy (a hosted assistant): adb's streams, no direct try
+            with mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://user:pw@proxy.example:3128"}):
+                self.assertIsNone(ka._direct_target(9008))
+                self.assertEqual(ka._open(SimpleNamespace(serial="s"), 9008).how, "adb")
+            adb.reset_mock()
             # the route fails twice in a row: adb's streams, and no new try for a while
             ka._open_direct = mock.Mock(side_effect=ConnectionRefusedError("refused"))
             with mock.patch.object(mod._time, "sleep"):
