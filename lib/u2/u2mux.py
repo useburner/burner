@@ -293,6 +293,9 @@ def screen_on(d):
     return info.get("screenOn") if isinstance(info, dict) else None
 
 
+WAKE_SETTLE_S = 3.0  # after waking the screen, before the first read or a launch
+
+
 def server_works(d, words=False):
     """True if the on-device server answers and can read the screen. An
     off screen reads blank whatever the server's state, so it is woken
@@ -300,15 +303,19 @@ def server_works(d, words=False):
     two reads. words: a read with an app and no word on it fails too
     (the server a helper found at 15:35 and at 18:41 on Oct 4 read that
     way for hours, until it was replaced)."""
-    if screen_on(d) is False:  # raises if the server is dead
+    woke = screen_on(d) is False  # raises if the server is dead
+    if woke:
         try:
             d.jsonrpc.wakeUp()
         except Exception as e:
             log("wakeUp failed (%s)" % str(e)[:80])
-        _time.sleep(0.5)
+        # The app's words come back a few seconds after a long sleep:
+        # every wordless server on Oct 4 was judged or launched within
+        # seconds of the screen waking (18:41, 19:22, 20:02).
+        _time.sleep(WAKE_SETTLE_S)
     xml = read_screen(d, timeout=PROBE_TIMEOUT)
     if not real_screen(xml) or (words and mute_read(xml)):
-        _time.sleep(0.5)  # a just-started server's first read is flaky
+        _time.sleep(2.0 if woke else 0.5)  # a just-started server's first read is flaky
         xml = read_screen(d, timeout=PROBE_TIMEOUT)
         if not real_screen(xml):
             return False
@@ -388,10 +395,10 @@ def ensure_server(force=False):
     taken as soon as it reads a real screen, words or not: a fresh one
     that reads no words is the spell rule's job (see _fix_wordless_read),
     mid-session, where relaunches read every label. Two tries, the
-    second for a launch that failed, each after a pause and with the
-    screen woken right before the launch. force (the spell rule): replace
-    the running server without checking it. Returns the connected
-    device."""
+    second for a launch that failed; the screen is woken before each
+    launch and, when it was off, given a few seconds first. force (the
+    spell rule): replace the running server without checking it.
+    Returns the connected device."""
     import adbutils
     import uiautomator2 as u2
     first = "it reads empty or wordless screens"
@@ -409,13 +416,16 @@ def ensure_server(force=False):
             first = err_text(e)
             log("server not responding (%s); restarting it" % first)
     why = "no read"
-    for attempt, settle in ((1, 1.0), (2, 2.0)):
+    for attempt, pause in ((1, 1.0), (2, 2.0)):
         try:
             dev = adbutils.adb.device(TARGET)
             killed = kill_server_on_phone(dev)
             _KEEPALIVE.close()
-            _time.sleep(settle)
-            wake_phone(dev)  # right before the launch: the screen turns off after 10s
+            awake = screen_awake(dev)
+            wake_phone(dev)
+            # A server launched seconds after the screen woke read no
+            # words (Oct 4): a woken screen gets WAKE_SETTLE_S first.
+            _time.sleep(pause if awake else WAKE_SETTLE_S)
             d = u2.connect(TARGET)  # /ping fails now, so this launches one
             apply_fast_config(d)
             if server_works(d):
@@ -428,6 +438,18 @@ def ensure_server(force=False):
         log("restart %d: %s" % (attempt, why))
     raise RuntimeError("the phone's UI server couldn't be restarted: %s (at first: %s)"
                        % (why, first))
+
+
+def screen_awake(dev):
+    """Whether the phone's screen is on, asked over adb (there may be no
+    server to ask): True, False, or None when adb can't say."""
+    try:
+        out = dev.shell("dumpsys power | grep -m1 mWakefulness=", timeout=SHELL_TIMEOUT)
+    except Exception as e:
+        log("couldn't read the screen state (%s)" % err_text(e, 80))
+        return None
+    m = re.search(r"mWakefulness=(\w+)", out or "")
+    return m.group(1) == "Awake" if m else None
 
 
 def wake_phone(dev):

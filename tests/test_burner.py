@@ -3570,7 +3570,10 @@ MUTE_XML = ('<?xml version="1.0"?><hierarchy rotation="0">'
 
 class _FakeDev:
     """An adb device: records shells, answers `ps` with its listings in
-    turn (the last one repeats)."""
+    turn (the last one repeats), and says nothing about the screen
+    unless `awake` is set."""
+    awake = None
+
     def __init__(self, *listings):
         self.listings = list(listings)
         self.shells = []
@@ -3578,6 +3581,8 @@ class _FakeDev:
     def shell(self, cmd, timeout=None):
         self.shells.append(cmd)
         assert timeout, "a phone shell needs a timeout"
+        if cmd.startswith("dumpsys power"):
+            return {True: "mWakefulness=Awake", False: "mWakefulness=Asleep"}.get(self.awake, "")
         if not cmd.startswith("ps"):
             return ""
         return self.listings.pop(0) if len(self.listings) > 1 else self.listings[0]
@@ -3808,7 +3813,7 @@ class EmptyScreenTests(OfflineTestCase):
             d = mod.ensure_server(force=True)
         self.assertEqual(d.reads, [SAMPLE_XML])
         self.assertEqual(adb_dev.shells, ["ps -A -o PID,ARGS", "kill -9 2843 2840 3200",
-                                          "ps -A -o PID,ARGS", "input keyevent 224"])
+                                          "ps -A -o PID,ARGS", "dumpsys power | grep -m1 mWakefulness=", "input keyevent 224"])
         # mid-session a fresh server that reads no words is taken as it reads
         fresh = _FakeServer([MUTE_XML])
         devs = [fresh]
@@ -3877,12 +3882,30 @@ class EmptyScreenTests(OfflineTestCase):
         self.assertEqual(d.calls, ["dumpWindowHierarchy"] * 2)
         # empty twice: it doesn't
         self.assertFalse(mod.server_works(_FakeServer([EMPTY_XML, EMPTY_XML])))
-        # an off screen reads blank whatever the server does: woken first
-        woke = []
+        # an off screen reads blank whatever the server does: woken first,
+        # and given a few seconds for the app's words to come back
+        woke, slept = [], []
         d = _FakeServer([SAMPLE_XML], screen_on=False)
         d.jsonrpc = SimpleNamespace(wakeUp=lambda: woke.append(1))
+        mod._time.sleep = slept.append  # no_sleep's patch is on the same object
         self.assertTrue(mod.server_works(d))
-        self.assertEqual((woke, d.calls), ([1], ["dumpWindowHierarchy"]))
+        self.assertEqual((woke, d.calls, slept), ([1], ["dumpWindowHierarchy"], [3.0]))
+        # wordless right after the wake: a second read, two seconds on
+        d = _FakeServer([MUTE_XML, SAMPLE_XML], screen_on=False)
+        d.jsonrpc = SimpleNamespace(wakeUp=lambda: None)
+        slept.clear()
+        self.assertTrue(mod.server_works(d, words=True))
+        self.assertEqual(slept, [3.0, 2.0])
+        # with the screen on nothing is woken and nothing waits, except
+        # the half second before a second read
+        slept, woke = [], []
+        mod._time.sleep = slept.append
+        d = _FakeServer([SAMPLE_XML])
+        d.jsonrpc = SimpleNamespace(wakeUp=lambda: woke.append(1))
+        self.assertTrue(mod.server_works(d))
+        self.assertEqual((slept, woke), ([], []))
+        self.assertTrue(mod.server_works(_FakeServer([EMPTY_XML, SAMPLE_XML])))
+        self.assertEqual(slept, [0.5])
         # a read with nodes and no word passes, unless words are wanted:
         # then it gets the same second read an empty one gets
         self.assertTrue(mod.server_works(_FakeServer([MUTE_XML])))
@@ -3932,7 +3955,7 @@ class EmptyScreenTests(OfflineTestCase):
             d = mod.ensure_server()
         self.assertEqual(d.reads, [SAMPLE_XML])  # the relaunched device, returned
         self.assertEqual(adb_dev.shells, ["ps -A -o PID,ARGS", "kill -9 2843 2840 3200",
-                                          "ps -A -o PID,ARGS", "input keyevent 224"])
+                                          "ps -A -o PID,ARGS", "dumpsys power | grep -m1 mWakefulness=", "input keyevent 224"])
         self.assertEqual(closed, [1])
         self.assertEqual(len(configured), 2)  # every server it connected to
 
@@ -3963,7 +3986,7 @@ class EmptyScreenTests(OfflineTestCase):
             d = mod.ensure_server()
         self.assertIs(d, fresh)
         self.assertEqual(adb_dev.shells, ["ps -A -o PID,ARGS", "kill -9 2843 2840 3200",
-                                          "ps -A -o PID,ARGS", "input keyevent 224"])
+                                          "ps -A -o PID,ARGS", "dumpsys power | grep -m1 mWakefulness=", "input keyevent 224"])
 
     def test_helper_restart_steps_in_order_and_a_wake_that_fails(self):
         mod = _u2mux()
@@ -3980,8 +4003,17 @@ class EmptyScreenTests(OfflineTestCase):
         fake_adbutils = SimpleNamespace(adb=SimpleNamespace(device=lambda target: None))
         with mock.patch.dict(sys.modules, {"uiautomator2": fake_u2, "adbutils": fake_adbutils}):
             mod.ensure_server(force=True)
-        # kill, drop the old streams, pause, wake right before the launch
-        self.assertEqual(events, ["kill", "close", "sleep 1", "wake", "launch"])
+        # kill, drop the old streams, wake, let the app come back (the
+        # screen state is unknown here: taken as off), launch
+        self.assertEqual(events, ["kill", "close", "wake", "sleep 3", "launch"])
+        # a screen that is on gets the short pause only
+        events.clear()
+        fake_adbutils = SimpleNamespace(adb=SimpleNamespace(device=lambda target: awake_dev))
+        awake_dev = _FakeDev(PS_LISTING)
+        awake_dev.awake = True
+        with mock.patch.dict(sys.modules, {"uiautomator2": fake_u2, "adbutils": fake_adbutils}):
+            mod.ensure_server(force=True)
+        self.assertEqual(events, ["kill", "close", "wake", "sleep 1", "launch"])
         # a wake over adb that fails is logged and the restart goes on
         mod.wake_phone, mod.kill_server_on_phone = real_wake, real_kill
         logged = []
@@ -4034,7 +4066,7 @@ class EmptyScreenTests(OfflineTestCase):
                 mod.ensure_server()
         self.assertIn("couldn't be restarted: no server process was running", str(cm.exception))
         self.assertIn("(at first: it reads empty or wordless screens)", str(cm.exception))
-        self.assertEqual(adb_dev.shells, ["ps -A -o PID,ARGS", "input keyevent 224"] * 2)
+        self.assertEqual(adb_dev.shells, ["ps -A -o PID,ARGS", "dumpsys power | grep -m1 mWakefulness=", "input keyevent 224"] * 2)
 
     def test_helper_connect_stamps_the_restart_even_when_it_fails(self):
         mod = _u2mux()
