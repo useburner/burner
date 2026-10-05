@@ -1015,8 +1015,11 @@ class U2Daemon:
             # read, not the assistant's. (A web page's rows report their
             # old place for a moment after a scroll, espn.com Oct 4: the
             # tap at a row's old place hit the link below it.) When the
-            # row has moved since the assistant's read it may still be
-            # moving: one more read, and the newest place is tapped. The
+            # row isn't known to be still, because it moved since the
+            # assistant's read or that read didn't have it whole, it is
+            # read until two reads agree on its place, three at most (a
+            # bar that slides in after a scroll pushes the rows down for
+            # a moment: the tap meant for Box Score opened Standings). The
             # label must be on the read exactly once and whole; anything
             # else is "not sent": the caller reads the screen and taps by
             # coordinates instead.
@@ -1037,15 +1040,19 @@ class U2Daemon:
                 old = label_target(before, label)
             except RuntimeError:
                 old = None
-            if old is not None and old != center:
-                log("%r moved since the last read (%s -> %s); reading again"
-                    % (label, old, center))
+            reads = 1
+            while old != center and reads < 3:
+                log("%r %s; reading again" % (
+                    label, "moved (%s -> %s)" % (old, center) if old
+                    else "wasn't whole on the last read"))
+                old = center
                 try:
                     with _t("tap read (again)"):
                         xml = self._dump(fresh=True)
                     center = label_target(xml, label)
                 except Exception as e:
                     raise RuntimeError("act not sent: %s" % err_text(e, 100))
+                reads += 1
             spec["tap"] = list(center)
         calls = act_calls(spec)
         acted = [i for i, (m, _) in enumerate(calls) if m in ACTION_METHODS]

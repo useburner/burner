@@ -3584,13 +3584,26 @@ class LabelTapTests(OfflineTestCase):
         self.assertEqual(sent[0][1], ("click", [250, 450]))
         self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])  # one fresh read, which agreed
         # the row moved since the assistant's read (a web page's rows report
-        # their old place for a moment after a scroll): it may still be
-        # moving, so one more read, and the newest place is tapped
+        # their old place for a moment after a scroll): it is read until
+        # two reads agree on its place, three at most
         moved = SAMPLE_XML.replace("[100,400][400,500]", "[100,440][400,540]")
         moved2 = SAMPLE_XML.replace("[100,400][400,500]", "[100,460][400,560]")
-        dm.d = _FakeServer([moved, moved2], screen_on=True)
+        dm.d = _FakeServer([moved, moved2, moved2], screen_on=True)
         dm.cmd_act(json.dumps({"tap_label": "OK"}))
         self.assertEqual(sent[-1][1], ("click", [250, 510]))
+        self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"] * 3)
+        # still moving after three reads: the newest place is tapped
+        moved3 = SAMPLE_XML.replace("[100,400][400,500]", "[100,480][400,580]")
+        dm.d = _FakeServer([moved, moved2, moved3], screen_on=True)
+        dm.cmd_act(json.dumps({"tap_label": "OK"}))
+        self.assertEqual(sent[-1][1], ("click", [250, 530]))
+        self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"] * 3)
+        # the assistant's read didn't have the row whole (cut off at an
+        # edge, then nudged): two reads that agree, then the tap
+        dm._last_xml = CLIPPED_XML
+        dm.d = _FakeServer([SAMPLE_XML, SAMPLE_XML], screen_on=True)
+        dm.cmd_act(json.dumps({"tap_label": "OK"}))
+        self.assertEqual(sent[-1][1], ("click", [250, 450]))
         self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"] * 2)
         # the read before the tap fails: nothing was sent, and it says so
         dm.d = _FakeServer([], screen_on=True)
