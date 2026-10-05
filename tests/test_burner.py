@@ -3831,6 +3831,162 @@ COVERED_XML = WHOLE_XML.replace(
     '      <node text="" content-desc="Box Score"')
 
 
+def _cdp():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "cdp_under_test", os.path.join(ROOT, "lib", "u2", "cdp.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+CHROME_XML = CLIPPED_XML  # Chrome in front, its WebView 283px down a 2400px screen
+
+WEB_SCREEN = {"title": "NFL on ESPN", "url": "https://www.espn.com/nfl/", "ready": "complete",
+              "dpr": 2.0, "vw": 540, "vh": 1027,
+              "rows": [{"text": "Box Score", "desc": "", "kind": "link", "click": True,
+                        "l": 276.5, "t": 90, "w": 243, "h": 28.5},
+                       {"text": "", "desc": "", "kind": "field", "value": "", "placeholder": "Search",
+                        "focused": True, "l": 20, "t": 10, "w": 400, "h": 30},
+                       {"text": "Standings", "desc": "", "kind": "text", "click": False,
+                        "l": 0, "t": 2000, "w": 100, "h": 20}]}
+
+
+class WebPathTests(OfflineTestCase):
+    def test_websocket_frames_round_trip(self):
+        cdp = _cdp()
+        for text in ("x", "a" * 200, "b" * 70000):
+            f = cdp.frame(text)
+            self.assertEqual(f[0], 0x81)
+            n = f[1] & 0x7F
+            if n < 126:
+                mask, body = f[2:6], f[6:]
+            elif n == 126:
+                self.assertEqual(int.from_bytes(f[2:4], "big"), len(text))
+                mask, body = f[4:8], f[8:]
+            else:
+                self.assertEqual(int.from_bytes(f[2:10], "big"), len(text))
+                mask, body = f[10:14], f[14:]
+            self.assertEqual(cdp.xor_mask(body, mask).decode(), text)
+        self.assertTrue(cdp.is_chrome("com.android.chrome"))
+        self.assertFalse(cdp.is_chrome("com.example"))
+
+    def test_page_read_becomes_a_screen_read(self):
+        cdp = _cdp()
+        xml = cdp.page_xml(WEB_SCREEN, 283, 2400)
+        root = ET.fromstring(xml)
+        nodes = pc.walk(root)
+        lines, _ = pc.screen_lines(nodes, 1080, 2400)
+        # the address bar, the link at its device-pixel place (CSS x2,
+        # 283px down), the field; the row below the viewport is left out
+        self.assertEqual(lines, ["https://www.espn.com/nfl/ (click) [EditText] (442,213)",
+                                 "[NFL on ESPN] [WebView] (540,1310)",
+                                 "Box Score (click) (796,491)",
+                                 "[Search] (click,focused) [EditText] (440,333)"])
+        self.assertEqual(pc.dump_package(root), "com.android.chrome")
+        pc._update_screen_from_dump(root)
+        self.assertEqual(pc.screen_dims(), (1080, 2400))  # the nav bar keeps the screen whole
+        plan = pc.plan_tap(nodes, 1080, 2400, text="Box Score")
+        self.assertEqual((plan["action"], plan["xy"]), ("tap", (796, 491)))
+        mod = _u2mux()
+        self.assertEqual(mod.webview_top(xml), 283)
+        self.assertEqual(mod.screen_of(xml), (1080, 2400, "com.android.chrome"))
+        self.assertTrue(mod.has_words(xml))
+
+    def _fake_cdp(self, mod, calls):
+        import types
+        real = mod._cdp()
+
+        def tap(page, label, index=None, idle_ms=1200):
+            calls.append(("tap", label, index, idle_ms))
+            return {"found": label != "Nope", "count": 2 if label == "Twice" else 1,
+                    "label": label, "screen": WEB_SCREEN}
+
+        def scroll(page, direction="down", times=1, fraction=0.6, idle_ms=500):
+            calls.append(("scroll", direction, times, idle_ms))
+            return {"moved": 1200, "screen": WEB_SCREEN}
+        fake = types.SimpleNamespace(
+            is_chrome=real.is_chrome, page_xml=real.page_xml, NotSent=real.NotSent,
+            front_page=lambda dev, current=None: "page",
+            read=lambda page, cap=160: calls.append(("read",)) or WEB_SCREEN,
+            tap=tap, scroll=scroll)
+        mod._CDP = fake
+        self.addCleanup(setattr, mod, "_CDP", None)
+        return fake
+
+    def test_helper_reads_the_page_when_chrome_is_in_front(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        self._fake_cdp(mod, calls)
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([SAMPLE_XML])
+        dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()
+        # com.example in front: the screen reader, not the page
+        self.assertEqual(dm._dump(fresh=True), SAMPLE_XML)
+        self.assertEqual(calls, [])
+        # Chrome in front: the page, as a screen read
+        dm._last_xml = CHROME_XML
+        xml = dm._dump(fresh=True)
+        self.assertEqual(calls, [("read",)])
+        self.assertIn('text="Box Score"', xml)
+        self.assertEqual(mod.screen_of(xml), (1080, 2400, "com.android.chrome"))
+        self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])  # only the first read
+        # the next read builds on the page read (its WebView top, its screen)
+        self.assertIn('bounds="[0,283][1080,2337]"', dm._dump(fresh=True))
+
+    def test_helper_taps_and_scrolls_through_the_page(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        self._fake_cdp(mod, calls)
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        dm._batch = lambda calls, timeout=45.0: self.fail("a page tap must not touch the screen reader")
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        xml = dm.cmd_act(json.dumps({"tap_label": "Box Score", "idle": 900})).decode()
+        self.assertEqual(calls[-1], ("tap", "Box Score", None, 900))
+        self.assertIn('text="Box Score"', xml)
+        self.assertEqual(dm._last_xml, xml)
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"tap_label": "Nope"}))
+        self.assertEqual(str(cm.exception), "act not sent: not on the page")
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"tap_label": "Twice"}))
+        self.assertEqual(str(cm.exception), "act not sent: 2 rows read 'Twice'")
+        xml = dm.cmd_act(json.dumps({"scroll": "down", "times": 2, "idle": 500})).decode()
+        self.assertEqual(calls[-1], ("scroll", "down", 2, 500))
+        self.assertIn("WebView", xml)
+        # not a page: the scroll is not sent, the CLI swipes
+        dm._last_xml = SAMPLE_XML
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"scroll": "down"}))
+        self.assertEqual(str(cm.exception), "act not sent: not a page")
+
+    def test_scroll_asks_the_page_when_chrome_is_in_front(self):
+        self.allow("wake")
+        self.allow("u2_invalidate")
+        for name in ("_screen_wh", "_screen_pkg", "_screen_kbd"):
+            self.addCleanup(setattr, pc, name, getattr(pc, name))
+        calls = []
+        page = _cdp().page_xml(WEB_SCREEN, 283, 2400)
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append((cmd, json.loads(arg) if arg.startswith("{") else arg))
+            return "1080 2400 com.android.chrome" if cmd == "screen" else page
+        self.allow("u2sock", side_effect=u2)
+        sc = self.allow("scrcpy_send", return_value=True)
+        self.allow("ui_dump", return_value=ET.fromstring(page))
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to=None, quiet=False))
+        self.assertEqual(rc, 0, err.getvalue())
+        sc.assert_not_called()  # no finger swipe on a page
+        self.assertEqual([c[0] for c in calls], ["screen", "act"])
+        self.assertEqual(calls[1][1]["scroll"], "down")
+        self.assertIn("scrolled down x1", out.getvalue())
+        self.assertIn("Box Score (click) (796,491)", out.getvalue())
+
+
 class RepeatedRowsTests(OfflineTestCase):
     def test_rows_read_again_are_printed_once(self):
         block = ('<node text="Flames" class="android.widget.TextView" package="com.android.chrome"'

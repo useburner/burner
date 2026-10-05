@@ -3730,16 +3730,58 @@ def _settled_dump():
     return read_after_root(idle_ms=IDLE_SCROLL_MS)[0]
 
 
+# Apps whose pages scroll and read themselves through the UI helper (see
+# lib/u2/cdp.py): a finger swipe in them leaves the screen reader's
+# positions behind for seconds (espn.com, Oct 4).
+WEB_APPS = ("com.android.chrome", "com.chrome.beta", "com.chrome.dev",
+            "com.chrome.canary", "org.chromium.chrome")
+
+
+def _web_scroll(direction, times=1, quiet=False):
+    """A page in Chrome scrolled by the page itself, through the UI
+    helper: the exit code once printed; None when the helper says it is
+    not a page (the caller swipes then)."""
+    status, root, note = act_and_read({"scroll": direction, "times": times},
+                                      idle_ms=IDLE_SCROLL_MS)
+    if status == "unsent":
+        return None
+    if status != "ok":
+        return print_act(status, root, note, "scroll")
+    if direction in ("top", "bottom"):
+        print("at the {}".format(direction))
+    else:
+        print("scrolled {} x{}".format(direction, times))
+    if not quiet:
+        print_screen(root, note=note)
+    return 0
+
+
+def _scroll_step(direction, pkg):
+    """One scroll and the screen after it: by the page itself in Chrome,
+    else a swipe and a settled read. None when the screen can't be read."""
+    if pkg in WEB_APPS:
+        status, root, note = act_and_read({"scroll": direction}, idle_ms=IDLE_SCROLL_MS)
+        if status == "ok":
+            return root
+        if status != "unsent":
+            return None
+    _swipe_once(direction)
+    return _settled_dump()
+
+
 def _scroll_to_end(direction, max_scrolls=15, quiet=False):
     """Scroll the current app until the screen stops changing. Stays in the
     app: swipes start mid-screen, never from an edge (which would open the
     notification shade or app drawer)."""
+    if live_screen_dims() and _screen_pkg in WEB_APPS:
+        rc = _web_scroll("top" if direction == "up" else "bottom", quiet=quiet)
+        if rc is not None:
+            return rc
     root = ui_dump()
     pkg = dump_package(root)
     before = visible_lines(walk(root))
     for n in range(1, max_scrolls + 1):
-        _swipe_once(direction)
-        root = _settled_dump()
+        root = _scroll_step(direction, pkg)
         if root is None:
             print("scrolled {} x{}; couldn't read the screen".format(direction, n))
             return 0
@@ -3786,6 +3828,10 @@ def _scroll_plain(direction, times, quiet=False):
     if dims is None or not _screen_pkg:
         return _scroll_plain_adb(direction, times, quiet=quiet)
     pkg = _screen_pkg
+    if pkg in WEB_APPS:
+        rc = _web_scroll(direction, times, quiet=quiet)
+        if rc is not None:
+            return rc
     for i in range(times):
         if not _scrcpy_swipe(direction):
             return _scroll_plain_adb(direction, times - i, quiet=quiet)
@@ -3861,8 +3907,7 @@ def cmd_scroll(args):
         if i == times:
             break
         # Looking for text needs a fresh read after each swipe.
-        _swipe_once(args.direction)
-        root = _settled_dump()
+        root = _scroll_step(args.direction, pkg)
         if root is None:
             print("scrolled {} x{}; couldn't read the screen to look for {}"
                   .format(args.direction, i + 1, args.to), file=sys.stderr)

@@ -482,6 +482,28 @@ DUMP_TTL = 2.0  # seconds a cached hierarchy dump stays valid
 # Commands that change the screen: never replayed after an error.
 NO_RETRY = {"tap", "click_text", "set_text", "act"}
 
+_CDP = None
+
+
+def _cdp():
+    """The DevTools client (cdp.py next to this file), loaded once."""
+    global _CDP
+    if _CDP is None:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cdp.py")
+        spec = importlib.util.spec_from_file_location("burner_cdp", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _CDP = mod
+    return _CDP
+
+
+def webview_top(xml):
+    """The top edge (screen pixels) of the first WebView on a read, or 0:
+    the page's rows are placed below it. Pure."""
+    m = re.search(r'class="[^"]*WebView"[^>]*bounds="\[(-?\d+),(-?\d+)\]', xml or "")
+    return int(m.group(2)) if m else 0
+
 
 def batch_results(replies, n):
     """One entry per call from a JSON-RPC batch reply: the result, or an
@@ -696,18 +718,77 @@ class U2Daemon:
             return c[1]
         return None
 
+    def _page(self):
+        """The visible page in Chrome, when Chrome is the app in front on
+        the newest read and the page can be reached (cdp.front_page);
+        else None: a native screen, or Chrome out of reach, and the
+        screen reader's path applies."""
+        last = getattr(self, "_last_xml", "")
+        info = screen_of(last) if last else None
+        if not info or not _cdp().is_chrome(info[2]):
+            return None
+        try:
+            with _t("web page"):
+                self._web = _cdp().front_page(getattr(self.d, "_dev", None),
+                                              getattr(self, "_web", None))
+        except Exception as e:
+            self._web = None
+            log("the page in Chrome is out of reach (%s)" % err_text(e, 100))
+            return None
+        return self._web
+
+    def _page_xml(self, screen):
+        """A page read as a screen read (cdp.page_xml), placed under the
+        newest read's WebView and above its navigation bar."""
+        last = getattr(self, "_last_xml", "")
+        info = screen_of(last) if last else None
+        return _cdp().page_xml(screen, webview_top(last), info[1] if info else 0)
+
+    def _page_read(self):
+        """The page in Chrome as a screen read, or None (see _page). The
+        screen reader's tree lags a finger scroll on a heavy page by
+        seconds and comes back empty for a while (espn.com, Oct 4); the
+        page itself has the current layout."""
+        page = self._page()
+        if page is None:
+            return None
+        try:
+            with _t("web read"):
+                screen = _cdp().read(page)
+        except Exception as e:
+            self._web = None
+            log("reading the page failed (%s); reading the screen" % err_text(e, 100))
+            return None
+        return self._page_xml(screen)
+
+    def _remember(self, xml):
+        """A read just taken after an action: cached when it has words
+        (a blank or wordless read is never reused), the newest read
+        either way."""
+        words = has_words(xml)
+        with self._cache_lock:
+            self._gen += 1
+            if words:
+                self._cache = (_time.monotonic(), xml)
+        if words:
+            self._mute_since, self._wordless_seen = None, False
+        self._last_xml, self._last_xml_t = xml, _time.monotonic()
+
     def _dump(self, fresh=False, replace=True):
         """Hierarchy XML; served from cache if < DUMP_TTL old unless fresh.
         replace=False: a wordless read is kept without replacing the
-        server (a `wait` close to its deadline)."""
+        server (a `wait` close to its deadline). A page in Chrome is read
+        from the page itself (see _page_read)."""
         xml = None if fresh else self._fresh_cache()
         if xml is not None:
             log("dump cache hit")
             return xml
         with self._lock:
             gen, t0 = self._gen, _time.monotonic()
-            with _t("dump rpc"):
-                xml = read_screen(self.d)
+            xml = self._page_read()
+            if xml is None:
+                with _t("dump rpc"):
+                    xml = read_screen(self.d)
             if blank_screen(xml):
                 xml, _ = self._fix_blank_read(xml, "blank read")
             elif mute_read(xml):
@@ -1053,6 +1134,49 @@ class U2Daemon:
         returned and cached. Never replayed after an error: the action may
         have happened. "act failed after sending: ..." means just that."""
         spec = json.loads(arg) if arg.strip() else {}
+        if "scroll" in spec:
+            # A page in Chrome scrolls itself (cdp.scroll): a finger swipe
+            # leaves the screen reader's positions behind for seconds.
+            # Elsewhere the CLI swipes.
+            page = self._page()
+            if page is None:
+                raise RuntimeError("act not sent: not a page")
+            with self._lock:
+                self.invalidate()
+                try:
+                    with _t("web scroll"):
+                        r = _cdp().scroll(page, spec.get("scroll", "down"),
+                                          int(spec.get("times", 1)),
+                                          idle_ms=int(spec.get("idle", 500)))
+                except Exception as e:
+                    self._web = None
+                    raise RuntimeError("act failed after sending: %s" % err_text(e, 120))
+                xml = self._page_xml(r["screen"])
+                self._remember(xml)
+            return xml.encode()
+        if "tap_label" in spec and self._page() is not None:
+            # A page in Chrome: the element with these words is found,
+            # scrolled into view and touched by the page itself (cdp.tap),
+            # which has the current layout.
+            label = spec["tap_label"]
+            with self._lock:
+                self.invalidate()
+                try:
+                    with _t("web tap"):
+                        r = _cdp().tap(self._web, label, spec.get("index"),
+                                       int(spec.get("idle", 2000)))
+                except _cdp().NotSent as e:
+                    raise RuntimeError("act not sent: the page couldn't be asked (%s)" % e)
+                except Exception as e:
+                    self._web = None
+                    raise RuntimeError("act failed after sending: %s" % err_text(e, 120))
+                if not r.get("found"):
+                    raise RuntimeError("act not sent: not on the page")
+                if r.get("count", 1) != 1:
+                    raise RuntimeError("act not sent: %d rows read %r" % (r["count"], label))
+                xml = self._page_xml(r["screen"])
+                self._remember(xml)
+            return xml.encode()
         if "tap_label" in spec:
             # Tap the row with this label where it is now: on a fresh
             # read, not the assistant's. (A web page's rows report their
@@ -1128,14 +1252,12 @@ class U2Daemon:
                 if woke and acted:
                     raise RuntimeError("act failed after sending: the screen was off, so "
                                        "it was probably dropped; the screen is on now")
-            words = has_words(xml)
-            with self._cache_lock:
-                self._gen += 1
-                if words:
-                    self._cache = (_time.monotonic(), xml)
-            if words:
-                self._mute_since, self._wordless_seen = None, False
-            self._last_xml, self._last_xml_t = xml, _time.monotonic()
+            # The action landed in Chrome: the page itself says what it
+            # shows now (the screen reader's tree may lag it).
+            page_xml = self._page_read()
+            if page_xml is not None:
+                xml = page_xml
+            self._remember(xml)
         return xml.encode()
 
     def cmd_health(self, _):
