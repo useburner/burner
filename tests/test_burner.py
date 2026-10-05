@@ -6675,6 +6675,10 @@ class PhoneAsksTests(OfflineTestCase):
         self.assertNotIn("didn't come to the front", err.getvalue())
 
     def test_an_opaque_web_view_is_said(self):
+        # the window's flags, asked only for an opaque screen: plain here
+        adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(
+            returncode=0, stdout="  Window #11 Window{14b5236 u0 com.espn.score_center/x}:\n"
+            "    fl=LAYOUT_IN_SCREEN LAYOUT_INSET_DECOR HARDWARE_ACCELERATED\n", stderr=""))
         # ESPN's login screen, Oct 5: a WebView with no rows under it, and
         # nothing else of the app readable (the status bar aside)
         opaque = """<hierarchy rotation="0">
@@ -6707,7 +6711,43 @@ class PhoneAsksTests(OfflineTestCase):
         with self.cap() as (out, err):
             pc.cmd_state(self.parse(["state", "--json"]))
         self.assertEqual(json.loads(out.getvalue())["opaque"]["name"], "ONEID UI MOBILE")
+        self.assertFalse(json.loads(out.getvalue())["opaque"]["secure"])
         self.assertIn("web view with nothing readable", pc._wait_hint())
+        self.assertEqual(adb.call_count, 3)  # once per screen said opaque, never otherwise
+        self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
+        with self.cap() as (out, err):
+            pc.cmd_state(self.parse(["state"]))
+        self.assertEqual(adb.call_count, 3)
+
+    def test_a_shielded_web_view_is_said_as_such(self):
+        # ESPN's sign-in (Disney's OneID lightbox), Oct 5: FLAG_SECURE on the
+        # window (a black picture) and its words kept from the screen reader
+        dump = ("  Window #11 Window{14b5236 u0 com.espn.score_center/com.disney.id.android.lightbox.LightboxActivity}:\n"
+                "    mAttrs={(0,0)(fillxfill) ty=BASE_APPLICATION fmt=TRANSLUCENT\n"
+                "    fl=LAYOUT_IN_SCREEN SECURE LAYOUT_INSET_DECOR SPLIT_TOUCH HARDWARE_ACCELERATED\n"
+                "  Window #12 Window{29cf67d u0 com.espn.score_center/com.espn.onboarding.EspnOnboardingActivity}:\n"
+                "    fl=LAYOUT_IN_SCREEN LAYOUT_INSET_DECOR SPLIT_TOUCH HARDWARE_ACCELERATED\n")
+        self.assertTrue(pc.window_is_secure(dump, "com.espn.score_center"))  # the first window listed: in front
+        self.assertFalse(pc.window_is_secure("  Window #12 Window{29cf67d u0 com.espn.score_center/x}:" + chr(10)
+                                             + "    fl=LAYOUT_IN_SCREEN" + chr(10), "com.espn.score_center"))
+        self.assertIsNone(pc.window_is_secure(dump, "com.example"))
+        self.assertIsNone(pc.window_is_secure("", "com.example"))
+        self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout=dump, stderr=""))
+        opaque = """<hierarchy rotation="0">
+  <node text="" class="android.widget.FrameLayout" package="com.espn.score_center" bounds="[0,0][1080,2400]" clickable="false" enabled="true">
+    <node text="" content-desc="ONEID UI MOBILE" class="android.webkit.WebView" package="com.espn.score_center" bounds="[0,0][1080,2337]" clickable="false" enabled="true"/>
+  </node>
+</hierarchy>"""
+        with self.cap() as (out, err):
+            pc.print_screen(ET.fromstring(opaque))
+        self.assertIn('  opaque: a web view "ONEID UI MOBILE" fills the screen with nothing readable, in a window '
+                      'the app shields (a picture of it is black too): nothing on the phone can see or drive this part. '
+                      'The user does it by hand on the phone, or the same on the site in Chrome may do', out.getvalue())
+        self.allow("ui_dump", return_value=ET.fromstring(opaque))
+        with self.cap() as (out, err):
+            pc.cmd_state(self.parse(["state", "--json"]))
+        self.assertTrue(json.loads(out.getvalue())["opaque"]["secure"])
+        self.assertEqual(pc._wait_hint(), "the screen is a web view the app shields (nothing readable, and a picture of it is black)")
 
     def test_the_helper_hands_out_its_newest_read_without_a_round_trip(self):
         mod = _u2mux()

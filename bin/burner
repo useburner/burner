@@ -1542,9 +1542,47 @@ def opaque_webview(nodes, w, h):
     return None
 
 
+def window_is_secure(dump, pkg):
+    """Whether the window of `pkg` has FLAG_SECURE, from the text of
+    `dumpsys window windows` (its "Window #" block, "fl=... SECURE ...");
+    None when no window of that package is listed. Pure."""
+    for block in re.split(r"(?m)^\s*Window #\d+ ", dump or "")[1:]:
+        if pkg and pkg in block.split("\n", 1)[0]:
+            m = re.search(r"\bfl=([^\n]*)", block)
+            return bool(m) and "SECURE" in m.group(1).split()
+    return None
+
+
+def secure_window(pkg):
+    """Whether the app's window in front shields its content (FLAG_SECURE:
+    a picture of it is black, and such an app keeps the words from the
+    screen reader too; ESPN's sign-in, Disney's OneID lightbox, Oct 5).
+    One adb call, only for an opaque screen. None when the phone can't
+    be asked."""
+    try:
+        r = adb_or_ensure("shell", "dumpsys window windows | grep -E 'Window #|fl='", timeout=15)
+    except Exception:
+        return None
+    return window_is_secure(r.stdout or "", pkg)
+
+
+def opaque_screen(nodes, app):
+    """The opaque web view on the screen (see opaque_webview), with
+    whether its window is shielded ("secure"), or None."""
+    opaque = opaque_webview(nodes, *screen_dims())
+    if opaque:
+        opaque["secure"] = bool(secure_window(app))
+    return opaque
+
+
 def opaque_line(opaque):
     """The `opaque:` line of a printed screen."""
     name = ' "%s"' % opaque["name"] if opaque.get("name") else ""
+    if opaque.get("secure"):
+        return ("opaque: a web view%s fills the screen with nothing readable, in a window the app "
+                "shields (a picture of it is black too): nothing on the phone can see or drive this "
+                "part. The user does it by hand on the phone, or the same on the site in Chrome may do"
+                % name)
     return ("opaque: a web view%s fills the screen with nothing readable (the app's own web "
             "page): look at a picture (burner shot --out .), tap by --xy, and typed text goes "
             "to the focused box" % name)
@@ -1601,7 +1639,7 @@ def print_screen(root, cap=SCREEN_CAP, note=""):
     asked = system_prompt(nodes, *screen_dims())
     if asked:
         print("  " + asked_line(asked))
-    opaque = opaque_webview(nodes, *screen_dims())
+    opaque = opaque_screen(nodes, app)
     if opaque:
         print("  " + opaque_line(opaque))
     shown, hidden = lines[:cap], lines[cap:]
@@ -2728,7 +2766,10 @@ def _wait_hint():
         asked = system_prompt(nodes, *screen_dims())
         if asked:
             return "the phone asks: {} (options: {})".format(asked["text"], " / ".join(asked["options"]))
-        if opaque_webview(nodes, *screen_dims()):
+        opaque = opaque_screen(nodes, dump_package(root))
+        if opaque and opaque.get("secure"):
+            return "the screen is a web view the app shields (nothing readable, and a picture of it is black)"
+        if opaque:
             return "the screen is a web view with nothing readable (look at a picture: burner shot --out .)"
         return progress_hint(nodes)
     except Exception as e:
@@ -3310,7 +3351,7 @@ def cmd_state(args):
         asked = system_prompt(nodes, *screen_dims())
         if asked:
             out["asked"] = asked
-        opaque = opaque_webview(nodes, *screen_dims())
+        opaque = opaque_screen(nodes, app)
         if opaque:
             out["opaque"] = opaque
         print(json.dumps(out))

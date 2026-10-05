@@ -73,7 +73,11 @@ Every step you take costs a round trip, so the fewer steps, the faster.
    own web page (a login page inside the app) hides its words from the
    screen reader. Don't wait for words that will never come: take a picture
    (`burner shot --out .`, in your own folder, and look at it), tap by
-   `--xy`, and `burner type` goes to the focused box.
+   `--xy`, and `burner type` goes to the focused box. When the line says
+   the window is **shielded** (a secure window: the picture is black as
+   well, as with ESPN's sign-in), nothing on the phone can see or drive
+   that part: tell the user to do it by hand on the phone, or do the same
+   on the site in Chrome, which can be read.
 
 ## Common requests
 
