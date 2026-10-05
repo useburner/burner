@@ -502,21 +502,58 @@ def batch_results(replies, n):
     return out
 
 
+SLIVER_PX = 16  # words shorter or narrower than this are cut off at an edge
+
+
+def same_control(a, b):
+    """True when two rows read with the same label are one control drawn
+    twice (Play Store's Open: a View described "Open" over a TextView
+    reading "Open"; a web link's area over its words): one's centre lies
+    inside the other's rectangle. Pure."""
+    (ax1, ay1, ax2, ay2), (bx1, by1, bx2, by2) = a["rect"], b["rect"]
+    (acx, acy), (bcx, bcy) = a["center"], b["center"]
+    return ((bx1 <= acx <= bx2 and by1 <= acy <= by2)
+            or (ax1 <= bcx <= ax2 and ay1 <= bcy <= ay2))
+
+
+def cut_off(n):
+    """True for a row whose words are a sliver on the read, under
+    SLIVER_PX tall or wide: the row is cut off at the screen's edge or
+    under a bar. (espn.com, Oct 4: a "Box Score" link scrolled to the top
+    edge read 2px tall; the tap at its centre landed on the link below.)
+    Pure."""
+    x1, y1, x2, y2 = n["rect"]
+    return (y2 - y1) < SLIVER_PX or (x2 - x1) < SLIVER_PX
+
+
 def label_target(xml, label):
-    """The centre (x, y) of the one node on this read whose text or
+    """The centre (x, y) of the one control on this read whose text or
     description is `label` (case-insensitive exact; "A || B" tries each).
-    A tap by coordinates injects a touch and looks nothing up: the
-    server's click by selector threw a NullPointerException on a web node
-    in Chrome (espn.com, Oct 4). Raises RuntimeError when there is no
-    such node or more than one."""
+    A control drawn twice (see same_control) is one control, tapped at
+    the centre of its first row. A tap by coordinates injects a touch
+    and looks nothing up: the server's click by selector threw a
+    NullPointerException on a web node in Chrome (espn.com, Oct 4).
+    Raises RuntimeError when there is no such control, more than one, or
+    its words are cut off at an edge (see cut_off)."""
     nodes = list(iter_nodes(xml or ""))
     for alt in [p.strip() for p in label.split("||") if p.strip()]:
         low = alt.lower()
         hits = [n for n in nodes if low in (n["text"].lower(), n["desc"].lower())]
-        if len(hits) == 1:
-            return tuple(hits[0]["center"])
-        if len(hits) > 1:
-            raise RuntimeError("%d rows read %r" % (len(hits), alt))
+        if not hits:
+            continue
+        controls = []  # the hits, one list per control
+        for n in hits:
+            for c in controls:
+                if same_control(c[0], n):
+                    c.append(n)
+                    break
+            else:
+                controls.append([n])
+        if len(controls) > 1:
+            raise RuntimeError("%d rows read %r" % (len(controls), alt))
+        if any(cut_off(n) for n in controls[0]):
+            raise RuntimeError("%r is cut off at the screen's edge" % alt)
+        return tuple(controls[0][0]["center"])
     raise RuntimeError("not on the last read")
 
 
@@ -885,15 +922,24 @@ class U2Daemon:
 
     IME_HINTS = ("inputmethod", "keyboard", "honeyboard", "swiftkey", ".ime.", "latinime")
 
+    SCREEN_FROM_READ_S = 20.0  # a read this young still says what the screen is
+
     def cmd_screen(self, _):
         """"w h pkg [kbd]": the screen at its current rotation and the app
-        in front, from one small deviceInfo RPC (a full dump costs ~0.8s),
-        plus "kbd" when the newest read showed a keyboard (a swipe must
-        then start above it: on the keys, Gboard glide-types)."""
-        with self._lock:
-            i = self.d.jsonrpc.deviceInfo()
-        out = "{} {} {}".format(i["displayWidth"], i["displayHeight"],
-                                i.get("currentPackageName") or "").strip()
+        in front. From the newest read while it is under
+        SCREEN_FROM_READ_S old (no round trip: a scroll right after a read
+        paid 0.4s for this on a busy web page, Oct 4), else from one small
+        deviceInfo RPC (a full dump costs ~0.8s). Plus "kbd" when the
+        newest read showed a keyboard (a swipe must then start above it:
+        on the keys, Gboard glide-types)."""
+        info = None
+        if _time.monotonic() - self._last_xml_t < self.SCREEN_FROM_READ_S:
+            info = screen_of(self._last_xml)
+        if info is None:
+            with self._lock:
+                i = self.d.jsonrpc.deviceInfo()
+            info = (i["displayWidth"], i["displayHeight"], i.get("currentPackageName") or "")
+        out = "{} {} {}".format(*info).strip()
         if keyboard_in(self._last_xml):
             out += " kbd"
         return out.encode()
@@ -1071,8 +1117,38 @@ def iter_nodes(xml):
             continue
         yield {"text": n.get("text") or "", "desc": n.get("content-desc") or "",
                "bounds": n.get("bounds"), "center": [(x1 + x2) // 2, (y1 + y2) // 2],
+               "rect": (x1, y1, x2, y2),
                "enabled": n.get("enabled") != "false",
                "clickable": n.get("clickable") == "true"}
+
+
+def screen_of(xml):
+    """(w, h, pkg) from a read: the screen size at its rotation (the far
+    corner of the nodes that touch the left or top edge; the nav bar's
+    window counts, so an app window that stops above it doesn't shrink
+    the screen) and the app in front (the package with most nodes, the
+    system UI and a keyboard aside). None when no node touches an edge
+    (a lone dialog): the read doesn't say how big the screen is. Pure."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(xml or "")
+    except ET.ParseError:
+        return None
+    w = h = 0
+    counts = {}
+    for n in root.iter("node"):
+        m = _BOUNDS_RE.match(n.get("bounds", ""))
+        if not m:
+            continue
+        x1, y1, x2, y2 = map(int, m.groups())
+        if x1 == 0 or y1 == 0:
+            w, h = max(w, x2), max(h, y2)
+        pkg = n.get("package", "")
+        if pkg and pkg != SYSTEM_UI and not any(k in pkg for k in U2Daemon.IME_HINTS):
+            counts[pkg] = counts.get(pkg, 0) + 1
+    if w < 300 or h < 300:
+        return None
+    return w, h, (max(counts, key=counts.get) if counts else "")
 
 
 def keyboard_in(xml):

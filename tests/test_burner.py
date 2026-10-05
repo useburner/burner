@@ -603,6 +603,40 @@ class JsonOutputTests(OfflineTestCase):
         slept.assert_any_call(0.7)  # the pause before the second read
         ud.assert_called_with(fresh=True)  # the second read bypasses the 2s cache
 
+    def test_plan_tap_refuses_a_row_cut_off_at_the_edge(self):
+        plan = pc.plan_tap(pc.walk(ET.fromstring(CLIPPED_XML)), 1080, 2400, text="Box Score")
+        self.assertEqual((plan["action"], plan["edge"]), ("clipped", "top"))
+        whole = pc.plan_tap(pc.walk(ET.fromstring(WHOLE_XML)), 1080, 2400, text="Box Score")
+        self.assertEqual((whole["action"], whole["xy"]), ("tap", (796, 491)))
+        # one control drawn twice is one row, not an ambiguity
+        pair = pc.plan_tap(pc.walk(ET.fromstring(PAIR_XML)), 1080, 2400, text="Open")
+        self.assertEqual((pair["action"], pair["xy"]), ("tap", (540, 1050)))
+
+    def test_tap_nudges_a_row_cut_off_at_the_edge_into_view(self):
+        self._tap_mocks(CLIPPED_XML)
+        swipe = self.allow("_scrcpy_swipe", return_value=True)
+        self.allow("read_after_root", return_value=(ET.fromstring(WHOLE_XML), ""))
+        tc = self.allow("tap_center")
+        args = self.parse(["tap", "Box Score", "--json", "--no-evidence"])
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_tap(args)
+        self.assertEqual(rc, 0, "stdout=%r stderr=%r" % (out.getvalue(), err.getvalue()))
+        # content down (the top edge cut the row off), then the whole row
+        swipe.assert_called_once_with("up", length=pc.NUDGE_PX)
+        tc.assert_called_once_with(796, 491)
+
+    def test_tap_says_when_a_cut_off_row_cannot_be_nudged(self):
+        self._tap_mocks(CLIPPED_XML)
+        self.allow("_scrcpy_swipe", return_value=False)  # no scrcpy helper
+        tc = self.allow("tap_center")
+        args = self.parse(["tap", "Box Score", "--json", "--no-evidence"])
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_tap(args)
+        self.assertEqual(rc, 1)
+        tc.assert_not_called()
+        self.assertIn("cut off at the top edge", err.getvalue())
+        self.assertIn("scroll up a little", err.getvalue())
+
     def test_json_tap_xy_refused_by_real_overlay(self):
         self._tap_mocks(OVERLAY_XML)
         args = self.parse(["tap", "--xy", "0.5,0.5", "--json"])
@@ -2229,6 +2263,27 @@ class FastPathTests(OfflineTestCase):
         self.assertIn("scroll left com.example", err.getvalue())
         self.assertIn("screen: com.android.launcher", out.getvalue())
 
+    def test_plain_scroll_reads_after_a_short_quiet_wait(self):
+        self.allow("wake")
+        self.allow("u2_invalidate")
+        for name in ("_screen_wh", "_screen_pkg", "_screen_kbd"):
+            self.addCleanup(setattr, pc, name, getattr(pc, name))  # the real screen call sets them
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append((cmd, arg))
+            return "1080 2400 com.example" if cmd == "screen" else SAMPLE_XML
+        self.allow("u2sock", side_effect=u2)
+        self.allow("scrcpy_send", return_value=True)
+        self.allow("adb_or_ensure")
+        self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to=None,
+                                               quiet=False))
+        self.assertEqual(rc, 0)
+        acts = [json.loads(a) for c, a in calls if c == "act"]
+        self.assertEqual([a["idle"] for a in acts], [pc.IDLE_SCROLL_MS])
+
     def test_plain_scroll_via_scrcpy_prints_the_screen(self):
         self.allow("wake")
         self.allow("u2_invalidate")
@@ -3472,6 +3527,14 @@ class LabelTapTests(OfflineTestCase):
             mod.label_target(AMBI_XML, "OK")  # two rows read OK
         with self.assertRaises(RuntimeError):
             mod.label_target(SAMPLE_XML, "Nope")
+        # one control drawn twice is one row: the View described Open over
+        # the words Open, tapped at the View's centre
+        self.assertEqual(mod.label_target(PAIR_XML, "open"), (540, 1050))
+        # a row whose words are a sliver is cut off at an edge: not a tap
+        with self.assertRaises(RuntimeError) as cm:
+            mod.label_target(CLIPPED_XML, "Box Score")
+        self.assertIn("cut off", str(cm.exception))
+        self.assertEqual(mod.label_target(WHOLE_XML, "Box Score"), (796, 491))
         # a tap by label is a click by coordinates: a touch, no lookup on
         # the phone (the selector click threw on a web node, Oct 4)
         dm = mod.U2Daemon.__new__(mod.U2Daemon)
@@ -3620,6 +3683,49 @@ class _FakeServer:
     def jsonrpc_call(self, method, params, timeout=10):
         self.calls.append(method)
         return self.reads.pop(0)
+
+
+PAIR_XML = """<hierarchy rotation="0">
+  <node text="" class="android.widget.FrameLayout" package="com.android.vending" bounds="[0,0][1080,2400]" clickable="false" enabled="true">
+    <node text="" content-desc="Open" class="android.view.View" package="com.android.vending" bounds="[0,1000][1080,1100]" clickable="true" enabled="true">
+      <node text="Open" class="android.widget.TextView" package="com.android.vending" bounds="[400,1030][680,1070]" clickable="false" enabled="true"/>
+    </node>
+  </node>
+</hierarchy>"""
+
+# espn.com in Chrome, Oct 4: a "Box Score" link scrolled to the top edge of
+# the page (its words read 2px tall), the "Where to watch" link under it.
+CLIPPED_XML = """<hierarchy rotation="0">
+  <node text="" class="android.widget.FrameLayout" package="com.android.chrome" bounds="[0,0][1080,2400]" clickable="false" enabled="true">
+    <node text="" class="android.webkit.WebView" package="com.android.chrome" bounds="[0,283][1080,2400]" clickable="false" enabled="true">
+      <node text="" content-desc="Box Score" class="android.view.View" package="com.android.chrome" bounds="[553,283][1039,306]" clickable="true" enabled="true">
+        <node text="Box Score" class="android.widget.TextView" package="com.android.chrome" bounds="[729,283][863,285]" clickable="false" enabled="true"/>
+      </node>
+      <node text="" content-desc="Where to watch" class="android.view.View" package="com.android.chrome" bounds="[553,306][1039,350]" clickable="true" enabled="true">
+        <node text="Where to watch" class="android.widget.TextView" package="com.android.chrome" bounds="[729,310][863,346]" clickable="false" enabled="true"/>
+      </node>
+    </node>
+  </node>
+</hierarchy>"""
+
+# The same page nudged 180px down: the whole "Box Score" row, centre (796,491).
+WHOLE_XML = (CLIPPED_XML.replace("[553,283][1039,306]", "[553,463][1039,520]")
+             .replace("[729,283][863,285]", "[729,470][863,510]")
+             .replace("[553,306][1039,350]", "[553,520][1039,564]")
+             .replace("[729,310][863,346]", "[729,524][863,560]"))
+
+
+class RepeatedRowsTests(OfflineTestCase):
+    def test_rows_read_again_are_printed_once(self):
+        block = ('<node text="Flames" class="android.widget.TextView" package="com.android.chrome"'
+                 ' bounds="[100,2200][460,2290]" clickable="false" enabled="true" />'
+                 '<node text="LIVE" class="android.widget.TextView" package="com.android.chrome"'
+                 ' bounds="[470,2190][520,2240]" clickable="false" enabled="true" />')
+        xml = ('<hierarchy rotation="0"><node text="" class="android.widget.FrameLayout"'
+               ' package="com.android.chrome" bounds="[0,0][1080,2400]" clickable="false" enabled="true">'
+               + block * 20 + '</node></hierarchy>')
+        lines, _ = pc.screen_lines(pc.walk(ET.fromstring(xml)), 1080, 2400)
+        self.assertEqual(lines, ["Flames (280,2245)", "LIVE (495,2215)"])
 
 
 class EmptyScreenTests(OfflineTestCase):
@@ -4208,6 +4314,27 @@ class EmptyScreenTests(OfflineTestCase):
         dm._mute_since, dm._wordless_seen = None, False
         dm.connect = lambda force=False: self.fail("unexpected server restart")
         return dm
+
+    def test_helper_screen_info_from_the_newest_read(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        self.assertEqual(mod.screen_of(SAMPLE_XML), (1080, 2400, "com.example"))
+        dialog = ('<hierarchy rotation="0"><node package="com.android.settings"'
+                  ' bounds="[84,900][1356,1700]"/></hierarchy>')
+        self.assertIsNone(mod.screen_of(dialog))  # no edge node: no size
+        self.assertIsNone(mod.screen_of(""))
+        dm = self._daemon(mod)
+        dm.d = _FakeServer([])  # no deviceInfo: asking the phone fails the test
+        dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()
+        self.assertEqual(dm.cmd_screen(""), b"1080 2400 com.example")
+        # an older read: the phone is asked
+        dm._last_xml_t = mod._time.monotonic() - 100
+        dm.d.jsonrpc.deviceInfo = lambda: {"displayWidth": 1440, "displayHeight": 3120,
+                                           "currentPackageName": "com.other"}
+        self.assertEqual(dm.cmd_screen(""), b"1440 3120 com.other")
+        # a young read with only a dialog on it says nothing about the size
+        dm._last_xml, dm._last_xml_t = dialog, mod._time.monotonic()
+        self.assertEqual(dm.cmd_screen(""), b"1440 3120 com.other")
 
     def test_helper_fix_blank_read_wakes_an_off_screen(self):
         mod = _u2mux()
