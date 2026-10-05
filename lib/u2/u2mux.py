@@ -526,6 +526,44 @@ def cut_off(n):
     return (y2 - y1) < SLIVER_PX or (x2 - x1) < SLIVER_PX
 
 
+def union_rect(rows):
+    """The smallest rectangle around these rows' rectangles. Pure."""
+    return (min(r["rect"][0] for r in rows), min(r["rect"][1] for r in rows),
+            max(r["rect"][2] for r in rows), max(r["rect"][3] for r in rows))
+
+
+def contains(outer, inner):
+    """True when rectangle `outer` holds all of rectangle `inner`. Pure."""
+    return (outer[0] <= inner[0] and outer[1] <= inner[1]
+            and outer[2] >= inner[2] and outer[3] >= inner[3])
+
+
+def row_over(nodes, control, center):
+    """The row drawn over `center`, the tap point of `control` (its rows),
+    or None: a row with words of its own, not one of the control's rows,
+    whose rectangle holds the point but neither holds the whole control
+    (a card described with its game's names holds its own Box Score link
+    and is no cover) nor sits inside it (a button's own words). For a
+    control on a web page only: there, document order says nothing about
+    what is on top, and a sticky bar sits over the content it precedes
+    (espn.com, Oct 4: the tap meant for Box Score opened Standings). On a
+    native screen later is on top, and the CLI's own check applies. Pure."""
+    if not control[0].get("web"):
+        return None
+    cx, cy = center
+    whole = union_rect(control)
+    for n in nodes:
+        if any(n is c for c in control) or not (n["text"] or n["desc"]):
+            continue
+        x1, y1, x2, y2 = n["rect"]
+        if not (x1 <= cx <= x2 and y1 <= cy <= y2):
+            continue
+        if contains(n["rect"], whole) or contains(whole, n["rect"]):
+            continue
+        return n
+    return None
+
+
 def label_target(xml, label):
     """The centre (x, y) of the one control on this read whose text or
     description is `label` (case-insensitive exact; "A || B" tries each).
@@ -533,8 +571,9 @@ def label_target(xml, label):
     the centre of its first row. A tap by coordinates injects a touch
     and looks nothing up: the server's click by selector threw a
     NullPointerException on a web node in Chrome (espn.com, Oct 4).
-    Raises RuntimeError when there is no such control, more than one, or
-    its words are cut off at an edge (see cut_off)."""
+    Raises RuntimeError when there is no such control, more than one,
+    its words are cut off at an edge (see cut_off), or another row sits
+    over it (see row_over)."""
     nodes = list(iter_nodes(xml or ""))
     for alt in [p.strip() for p in label.split("||") if p.strip()]:
         low = alt.lower()
@@ -553,7 +592,11 @@ def label_target(xml, label):
             raise RuntimeError("%d rows read %r" % (len(controls), alt))
         if any(cut_off(n) for n in controls[0]):
             raise RuntimeError("%r is cut off at the screen's edge" % alt)
-        return tuple(controls[0][0]["center"])
+        center = tuple(controls[0][0]["center"])
+        over = row_over(nodes, controls[0], center)
+        if over is not None:
+            raise RuntimeError("%r is under %r" % (alt, (over["text"] or over["desc"])[:40]))
+        return center
     raise RuntimeError("not on the last read")
 
 
@@ -1136,21 +1179,26 @@ _BOUNDS_RE = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
 
 
 def iter_nodes(xml):
-    """Yield {text, desc, bounds, center, enabled, clickable} for every
-    node with non-empty on-screen bounds, in document order."""
+    """Yield {text, desc, bounds, center, rect, enabled, clickable, web}
+    for every node with non-empty on-screen bounds, in document order;
+    web: the node is inside a WebView (a browser's page, an app's web
+    content)."""
     import xml.etree.ElementTree as ET
-    for n in ET.fromstring(xml).iter("node"):
+
+    def rec(n, web):
+        web = web or "webview" in (n.get("class") or "").lower()
         m = _BOUNDS_RE.match(n.get("bounds", ""))
-        if not m:
-            continue
-        x1, y1, x2, y2 = map(int, m.groups())
-        if x2 <= x1 or y2 <= y1:
-            continue
-        yield {"text": n.get("text") or "", "desc": n.get("content-desc") or "",
-               "bounds": n.get("bounds"), "center": [(x1 + x2) // 2, (y1 + y2) // 2],
-               "rect": (x1, y1, x2, y2),
-               "enabled": n.get("enabled") != "false",
-               "clickable": n.get("clickable") == "true"}
+        if m:
+            x1, y1, x2, y2 = map(int, m.groups())
+            if x2 > x1 and y2 > y1:
+                yield {"text": n.get("text") or "", "desc": n.get("content-desc") or "",
+                       "bounds": n.get("bounds"), "center": [(x1 + x2) // 2, (y1 + y2) // 2],
+                       "rect": (x1, y1, x2, y2),
+                       "enabled": n.get("enabled") != "false",
+                       "clickable": n.get("clickable") == "true", "web": web}
+        for c in n:
+            yield from rec(c, web)
+    yield from rec(ET.fromstring(xml), False)
 
 
 def screen_of(xml):

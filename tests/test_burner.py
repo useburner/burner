@@ -606,6 +606,13 @@ class JsonOutputTests(OfflineTestCase):
     def test_plan_tap_refuses_a_row_cut_off_at_the_edge(self):
         plan = pc.plan_tap(pc.walk(ET.fromstring(CLIPPED_XML)), 1080, 2400, text="Box Score")
         self.assertEqual((plan["action"], plan["edge"]), ("clipped", "top"))
+        # a row under another row (a sticky bar's link earlier in the tree)
+        plan = pc.plan_tap(pc.walk(ET.fromstring(COVERED_XML)), 1080, 2400, text="Box Score")
+        self.assertEqual((plan["action"], plan["edge"], plan["cover"]["text"]),
+                         ("covered", "top", "Standings"))
+        native = COVERED_XML.replace("android.webkit.WebView", "android.widget.FrameLayout")
+        plan = pc.plan_tap(pc.walk(ET.fromstring(native)), 1080, 2400, text="Box Score")
+        self.assertEqual(plan["action"], "tap")  # later is on top on a native screen
         whole = pc.plan_tap(pc.walk(ET.fromstring(WHOLE_XML)), 1080, 2400, text="Box Score")
         self.assertEqual((whole["action"], whole["xy"]), ("tap", (796, 491)))
         # one control drawn twice is one row, not an ambiguity
@@ -622,8 +629,33 @@ class JsonOutputTests(OfflineTestCase):
             rc = pc.cmd_tap(args)
         self.assertEqual(rc, 0, "stdout=%r stderr=%r" % (out.getvalue(), err.getvalue()))
         # content down (the top edge cut the row off), then the whole row
-        swipe.assert_called_once_with("up", length=pc.NUDGE_PX)
+        swipe.assert_called_once_with("up", length=pc.nudge_px(2400))
         tc.assert_called_once_with(796, 491)
+
+    def test_tap_nudges_a_covered_row_from_under_the_bar(self):
+        self._tap_mocks(COVERED_XML)
+        swipe = self.allow("_scrcpy_swipe", return_value=True)
+        self.allow("read_after_root", return_value=(ET.fromstring(WHOLE_XML), ""))
+        tc = self.allow("tap_center")
+        args = self.parse(["tap", "Box Score", "--json", "--no-evidence"])
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_tap(args)
+        self.assertEqual(rc, 0, "stdout=%r stderr=%r" % (out.getvalue(), err.getvalue()))
+        swipe.assert_called_once_with("up", length=pc.nudge_px(2400))
+        tc.assert_called_once_with(796, 491)
+
+    def test_tap_gives_up_on_a_row_that_stays_covered(self):
+        self._tap_mocks(COVERED_XML)
+        swipe = self.allow("_scrcpy_swipe", return_value=True)
+        self.allow("read_after_root", return_value=(ET.fromstring(COVERED_XML), ""))
+        tc = self.allow("tap_center")
+        args = self.parse(["tap", "Box Score", "--json", "--no-evidence"])
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_tap(args)
+        self.assertEqual(rc, 1)
+        self.assertEqual(swipe.call_count, pc.NUDGE_ROUNDS)
+        tc.assert_not_called()
+        self.assertIn('"Box Score" is under "Standings"', err.getvalue())
 
     def test_tap_says_when_a_cut_off_row_cannot_be_nudged(self):
         self._tap_mocks(CLIPPED_XML)
@@ -3540,7 +3572,7 @@ class LabelTapTests(OfflineTestCase):
         with self.cap() as (out, err):
             rc = pc.cmd_tap(self.parse(["tap", "Box Score"]))
         self.assertEqual(rc, 0, "stdout=%r stderr=%r" % (out.getvalue(), err.getvalue()))
-        swipe.assert_called_once_with("up", length=pc.NUDGE_PX)  # content down
+        swipe.assert_called_once_with("up", length=pc.nudge_px(2400))  # content down
         self.assertEqual([("tap_label" in a) for a in acts], [True, True])
         tc.assert_not_called()
         self.assertIn("tapped Box Score (label)", out.getvalue())
@@ -3562,6 +3594,22 @@ class LabelTapTests(OfflineTestCase):
             mod.label_target(CLIPPED_XML, "Box Score")
         self.assertIn("cut off", str(cm.exception))
         self.assertEqual(mod.label_target(WHOLE_XML, "Box Score"), (796, 491))
+        # a row with another row over it (a sticky bar's link) is not a tap
+        with self.assertRaises(RuntimeError) as cm:
+            mod.label_target(COVERED_XML, "Box Score")
+        self.assertEqual(str(cm.exception), "'Box Score' is under 'Standings'")
+        # on a native screen later is on top: the same rows outside a
+        # WebView are a sheet over a page, and the earlier row is no cover
+        native = COVERED_XML.replace("android.webkit.WebView", "android.widget.FrameLayout")
+        self.assertEqual(mod.label_target(native, "Box Score"), (796, 491))
+        # the card around a link holds all of it: no cover; the link's
+        # own words sit inside it: no cover
+        card = WHOLE_XML.replace(
+            '<node text="" class="android.webkit.WebView"',
+            '<node text="" content-desc="Dolphins 10 Vikings 15 Final" class="android.view.View"'
+            ' package="com.android.chrome" bounds="[0,283][1080,2400]" clickable="true" enabled="true"/>'
+            '<node text="" class="android.webkit.WebView"')
+        self.assertEqual(mod.label_target(card, "Box Score"), (796, 491))
         # a tap by label reads the screen afresh and taps the row where it
         # is now, by coordinates: a touch, no lookup on the phone (the
         # selector click threw on a web node, Oct 4)
@@ -3771,6 +3819,16 @@ WHOLE_XML = (CLIPPED_XML.replace("[553,283][1039,306]", "[553,463][1039,520]")
              .replace("[729,283][863,285]", "[729,470][863,510]")
              .replace("[553,306][1039,350]", "[553,520][1039,564]")
              .replace("[729,310][863,346]", "[729,524][863,560]"))
+
+# The same page with the sticky bar's Standings link over the Box Score
+# row (earlier in the tree: document order says nothing about what is on
+# top on a web page). Its rectangle holds the row's centre (796,491) and
+# neither holds nor sits inside the row.
+COVERED_XML = WHOLE_XML.replace(
+    '<node text="" content-desc="Box Score"',
+    '<node text="Standings" class="android.view.View" package="com.android.chrome"'
+    ' bounds="[640,440][960,500]" clickable="true" enabled="true"/>\n'
+    '      <node text="" content-desc="Box Score"')
 
 
 class RepeatedRowsTests(OfflineTestCase):

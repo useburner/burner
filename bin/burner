@@ -1951,6 +1951,46 @@ def dedupe_same_control(hits):
 SLIVER_PX = 16  # words shorter or narrower than this are cut off at an edge
 
 
+def _contains(outer, inner):
+    """True when rectangle `outer` holds all of rectangle `inner`. Pure."""
+    return (outer[0] <= inner[0] and outer[1] <= inner[1]
+            and outer[2] >= inner[2] and outer[3] >= inner[3])
+
+
+def row_over(nodes, node, hits, pt):
+    """The row drawn over `pt`, the tap point of `node`, or None: a row
+    with words of its own, not the same control drawn twice (see
+    _one_control), whose rectangle holds the point but neither holds the
+    whole control (a card described with its game's names holds its own
+    Box Score link and is no cover) nor sits inside it (a button's own
+    words). For a row inside a WebView only: unlike is_point_covered this
+    ignores document order, which says nothing about what is on top on a
+    web page: a sticky bar sits over the content it precedes (espn.com,
+    Oct 4: the tap meant for Box Score opened Standings). On a native
+    screen later is on top (a sheet's Not now over the page's Buy now),
+    and is_point_covered applies. Pure."""
+    if not any("webview" in (p.attrib.get("class") or "").lower()
+               for p in node.get("parents", ())):
+        return None
+    rows = [n for n in hits if n is node or _one_control(node, n)]
+    rects = [r for r in (_bounds_rect(n.get("bounds")) for n in rows) if r]
+    if not rects:
+        return None
+    whole = (min(r[0] for r in rects), min(r[1] for r in rects),
+             max(r[2] for r in rects), max(r[3] for r in rects))
+    x, y = pt
+    for n in nodes:
+        if any(n is r for r in rows) or not _row_words(n):
+            continue
+        r = _bounds_rect(n.get("bounds"))
+        if not r or not (r[0] <= x <= r[2] and r[1] <= y <= r[3]):
+            continue
+        if _contains(r, whole) or _contains(whole, r):
+            continue
+        return n
+    return None
+
+
 def cut_off_edge(node, hits, h):
     """"top" or "bottom" when the row's words, its own or those of the
     same control drawn twice among hits, are a sliver on the read (under
@@ -1977,6 +2017,7 @@ def plan_tap(nodes, w, h, text=None, xy=None, fuzzy=False, index=None,
       refused    xy, cover (the node that would steal the tap)
       ambiguous  used (the selector that matched), hits, fuzzy
       clipped    node, edge ("top"/"bottom"): its words are cut off there
+      covered    node, cover (the row over it), edge (where the cover is)
       nomatch / nobounds
     Pure function: no adb. tests/test_fixtures.py replays saved screens
     through it, so a wrong refusal can be fixed and proven offline."""
@@ -2018,6 +2059,11 @@ def plan_tap(nodes, w, h, text=None, xy=None, fuzzy=False, index=None,
         return {"action": "nobounds"}
     moved = False
     if check:
+        over = row_over(nodes, node, hits, pt)
+        if over is not None:
+            oc = over.get("center") or (None, None)
+            edge = "top" if oc[1] is not None and oc[1] < pt[1] else "bottom"
+            return {"action": "covered", "node": node, "cover": over, "edge": edge}
         cover = is_point_covered(nodes, pt[0], pt[1], node)
         if cover is not None:
             alt = find_uncovered_point(node, nodes)
@@ -2137,7 +2183,10 @@ def cmd_tap(args):
             nodes = walk(root)
             plan = plan_tap(nodes, w, h, text=args.text, fuzzy=args.fuzzy,
                             index=args.index, check=not args.no_occlusion_check)
-    if plan["action"] == "clipped" and _nudge(plan["edge"]):
+    rounds = 0
+    while (plan["action"] in ("clipped", "covered") and rounds < NUDGE_ROUNDS
+           and _nudge(plan["edge"], h)):
+        rounds += 1
         if plain:
             # The row where it is now, by label: the helper reads afresh
             # and taps in one round trip (the read right after the swipe
@@ -2152,17 +2201,19 @@ def cmd_tap(args):
                 rc = _tap_ok(args, args.text, None, via="label")
                 return print_act(status, after, note, "tap") or rc
         again, _ = read_after_root(prev_root=root, idle_ms=IDLE_ACT_MS)
-        if again is not None:
-            root = again
-            _update_screen_from_dump(root)
-            nodes = walk(root)
-            plan = plan_tap(nodes, w, h, text=args.text, fuzzy=args.fuzzy,
-                            index=args.index, check=not args.no_occlusion_check)
-    if plan["action"] == "clipped":
-        return _tap_fail(args, '"{}" is cut off at the {} edge of the screen; '
-                         'scroll {} a little and tap again'.format(
-                             args.text, plan["edge"],
-                             "up" if plan["edge"] == "top" else "down"))
+        if again is None:
+            break
+        root = again
+        _update_screen_from_dump(root)
+        nodes = walk(root)
+        plan = plan_tap(nodes, w, h, text=args.text, fuzzy=args.fuzzy,
+                        index=args.index, check=not args.no_occlusion_check)
+    if plan["action"] in ("clipped", "covered"):
+        what = ('is cut off at the {} edge of the screen'.format(plan["edge"])
+                if plan["action"] == "clipped"
+                else 'is under "{}"'.format(_row_words(plan["cover"])[:40]))
+        return _tap_fail(args, '"{}" {}; scroll {} a little and tap again'.format(
+            args.text, what, "up" if plan["edge"] == "top" else "down"))
     if plan["action"] == "nomatch":
         return _tap_fail(args, 'no match for "{}"'.format(args.text))
     if plan["action"] == "ambiguous":
@@ -2208,21 +2259,31 @@ def _tap_then_read(args, label, xy, root):
     return print_act(status, after, note, "tap") or rc
 
 
-NUDGE_PX = 180  # a nudge moves the content this far: a cut-off row becomes whole,
-                # and a page near its top isn't pulled far enough to refresh
+NUDGE_FRACTION = 0.25  # a nudge moves the content a quarter of the screen: a
+                       # cut-off row comes clear of the edge and of the sticky
+                       # bar that slides in after a scroll (espn.com, Oct 4)
+NUDGE_ROUNDS = 3       # nudges before a tap gives up on a row
 
 
-def _nudge(edge):
-    """The content nudged NUDGE_PX away from the edge that cuts a row off
-    (down, for the top edge), the way a person scrolls a touch before
-    tapping a row at the edge. False when the swipe can't be sent."""
+def nudge_px(h):
+    """How far a nudge moves the content on a screen `h` tall. Pure."""
+    return int(h * NUDGE_FRACTION)
+
+
+def _nudge(edge, h):
+    """The content nudged away from the edge that cuts a row off or the
+    bar that covers it (down, for the top), the way a person scrolls a
+    touch before tapping a row at the edge. Chrome pulls a page to a
+    refresh only when the drag starts with the page at its top, which a
+    page with a row cut off at the top is not. False when the swipe
+    can't be sent."""
     direction = "up" if edge == "top" else "down"  # as `burner scroll`
     try:
-        sent = _scrcpy_swipe(direction, length=NUDGE_PX)
+        sent = _scrcpy_swipe(direction, length=nudge_px(h))
     except Exception:
         sent = False
     if sent:
-        _trace("nudged {} {}px: the row was cut off".format(direction, NUDGE_PX))
+        _trace("nudged {} {}px: the row was cut off or covered".format(direction, nudge_px(h)))
     return sent
 
 
