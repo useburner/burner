@@ -2085,11 +2085,16 @@ def cmd_tap(args):
         # the label a moment later: one more read before giving up (Oct 4,
         # espn.com in Chrome: two taps failed on labels the next read had).
         time.sleep(0.7)
-        root = ui_dump(fresh=True)
-        _update_screen_from_dump(root)
-        nodes = walk(root)
-        plan = plan_tap(nodes, w, h, text=args.text, fuzzy=args.fuzzy,
-                        index=args.index, check=not args.no_occlusion_check)
+        try:
+            again = ui_dump(fresh=True)
+        except Exception:
+            again = None  # a failed re-read keeps the first read's "no match"
+        if again is not None:
+            root = again
+            _update_screen_from_dump(root)
+            nodes = walk(root)
+            plan = plan_tap(nodes, w, h, text=args.text, fuzzy=args.fuzzy,
+                            index=args.index, check=not args.no_occlusion_check)
     if plan["action"] == "nomatch":
         return _tap_fail(args, 'no match for "{}"'.format(args.text))
     if plan["action"] == "ambiguous":

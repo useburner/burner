@@ -587,12 +587,12 @@ class JsonOutputTests(OfflineTestCase):
         self.assertFalse(data["ok"])
         self.assertIn("error", data)
         self.assertIn('no match for "Nope"', err.getvalue())
-        self.assertGreaterEqual(pc.ui_dump.call_count, 2)  # one more read before giving up
+        pc.ui_dump.assert_any_call(fresh=True)  # the extra read skips the helper's cache
 
     def test_tap_reads_once_more_when_the_label_is_still_drawing(self):
         self._tap_mocks(TAP_XML)
         blank = ET.fromstring(TAP_XML.replace("Not now", ""))
-        self.allow("ui_dump", side_effect=[blank, ET.fromstring(TAP_XML)])
+        ud = self.allow("ui_dump", side_effect=[blank, ET.fromstring(TAP_XML)])
         tc = self.allow("tap_center")
         args = self.parse(["tap", "Not now", "--json", "--no-evidence"])
         with mock.patch.object(pc.time, "sleep") as slept, self.cap() as (out, err):
@@ -601,6 +601,7 @@ class JsonOutputTests(OfflineTestCase):
         self.assertEqual(json.loads(out.getvalue())["tapped"]["text"], "Not now")
         tc.assert_called_once_with(200, 300)
         slept.assert_any_call(0.7)  # the pause before the second read
+        ud.assert_called_with(fresh=True)  # the second read bypasses the 2s cache
 
     def test_json_tap_xy_refused_by_real_overlay(self):
         self._tap_mocks(OVERLAY_XML)
@@ -3968,7 +3969,18 @@ class EmptyScreenTests(OfflineTestCase):
         self.no_sleep(mod)
         dm = self._daemon(mod)
         dm.d = _FakeServer([SAMPLE_XML], screen_on=True)
-        dm.d.jsonrpc.click = lambda sel: (_ for _ in ()).throw(RuntimeError("java.lang.NullPointerException"))
+        clicks = []
+
+        class RPCUnknownError(Exception):  # three args and no __str__, as uiautomator2's
+            pass
+
+        def click(sel):
+            clicks.append(sel)
+            raise RPCUnknownError("Unknown RPC error: -32001 java.lang.NullPointerException",
+                                  {"textMatches": "x"}, "\tat a.b.C.d(C.java:29)\n" * 40)
+        dm.d.jsonrpc.click = click
+        logged = []
+        mod.log = lambda *a: logged.append(" ".join(str(x) for x in a))
         import types
         fake = types.ModuleType("uiautomator2._selector")
         fake.Selector = lambda **kw: kw
@@ -3980,6 +3992,9 @@ class EmptyScreenTests(OfflineTestCase):
                                            "uiautomator2.exceptions": exc}):
             out = json.loads(dm.cmd_click_text("OK"))
         self.assertEqual((out["x"], out["y"]), (250, 450))  # tier 3: the node's centre
+        self.assertEqual(len(clicks), 1)
+        line = [x for x in logged if x.startswith("click_text selector failed")][0]
+        self.assertIn("NullPointerException", line)  # the head of the error, not its stack
 
     def test_helper_read_screen_asks_for_a_depth(self):
         mod = _u2mux()

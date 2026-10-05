@@ -799,7 +799,10 @@ class U2Daemon:
                     # The server looks the node up again for a selector
                     # click and threw NullPointerException on a web node
                     # (Chrome, Oct 4): tier 3 taps by coordinates instead.
-                    log("click_text selector failed (%s); tapping by coordinates" % err_text(e, 80))
+                    # The head of the message names the error; the tail of
+                    # a server error is its Java stack.
+                    log("click_text selector failed (%s: %s); tapping by coordinates"
+                        % (type(e).__name__, " ".join(str(e).split())[:120]))
                     ok = False
                 if ok:
                     self.invalidate()
