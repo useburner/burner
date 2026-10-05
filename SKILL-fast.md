@@ -143,7 +143,11 @@ Details that save a step:
   as 2026-10-05, times as 14:30, colors as #ff0000, sliders and numbers as a
   number). A dropdown shows its current option: tap it and its options print
   as rows under it, then `burner tap "Option"` picks one. A file field can't
-  be filled.
+  be filled. `burner type --field "Label" "value"` does the tap and the
+  typing in one go. A field whose row shows a format hint (`[MM/DD/YYYY]`)
+  is a text field with the page's own widget: type in that format, not an
+  ISO date, and check the row afterwards (it prints the value the field
+  kept).
 - A recipe file has one step per line in `burner do` format, `#` comments,
   and `$VAR` from the environment: `PLAY_PACKAGE=com.example.app burner recipe play-install`.
 - `burner update` keeps `config.env`, the pairing and your own recipes.
