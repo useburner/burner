@@ -293,21 +293,31 @@ def screen_on(d):
     return info.get("screenOn") if isinstance(info, dict) else None
 
 
-def server_works(d):
+def server_works(d, words=False):
     """True if the on-device server answers and can read the screen. An
     off screen reads blank whatever the server's state, so it is woken
     first; a just-started server's first read can be empty, so it gets
-    two reads."""
+    two reads. words: a read with an app and no word on it fails too
+    (the server a helper found at 15:35 and at 18:41 on Oct 4 read that
+    way for hours, until it was replaced)."""
     if screen_on(d) is False:  # raises if the server is dead
         try:
             d.jsonrpc.wakeUp()
         except Exception as e:
             log("wakeUp failed (%s)" % str(e)[:80])
         _time.sleep(0.5)
-    if real_screen(read_screen(d, timeout=PROBE_TIMEOUT)):
-        return True
-    _time.sleep(0.5)
-    return real_screen(read_screen(d, timeout=PROBE_TIMEOUT))
+    xml = read_screen(d, timeout=PROBE_TIMEOUT)
+    if not real_screen(xml) or (words and mute_read(xml)):
+        _time.sleep(0.5)  # a just-started server's first read is flaky
+        xml = read_screen(d, timeout=PROBE_TIMEOUT)
+        if not real_screen(xml):
+            return False
+    if mute_read(xml):
+        packages = sorted(set(re.findall(r'package="([^"]*)"', xml)))
+        log("the server reads no words (%d nodes in %s)"
+            % (xml.count("<node"), ", ".join(packages)))
+        return not words
+    return True
 
 
 # The server's process on the phone: app_process running the u2 jar, and
@@ -373,22 +383,23 @@ def apply_fast_config(d):
 def ensure_server(force=False):
     """The on-device uiautomator2 server, listening and able to read the
     screen; restarted (killed on the phone, started fresh) when it can't.
-    force: replace the running server without checking it (a server that
-    reads wordless pages passes every check). Returns the connected
-    device."""
+    force: replace the running server without checking it (its reads
+    held no words). A fresh server is taken once it reads a real screen,
+    words or not: a fresh one that reads no words is the spell rule's
+    job (see _fix_wordless_read). Returns the connected device."""
     import adbutils
     import uiautomator2 as u2
     if force:
         first = "its reads held no words"
         log("replacing the server: %s" % first)
     else:
-        first = "it reads empty screens"
+        first = "it reads empty or wordless screens"
         try:
             d = u2.connect(TARGET)  # starts a dead server (and pushes a new jar)
             apply_fast_config(d)
-            if server_works(d):
+            if server_works(d, words=True):
                 return d
-            log("server answers but reads empty screens; restarting it")
+            log("server answers but reads empty or wordless screens; restarting it")
         except Exception as e:
             first = err_text(e)
             log("server not responding (%s); restarting it" % first)
@@ -672,8 +683,13 @@ class U2Daemon:
         _time.sleep(0.4)
 
     def _reconnect(self):
+        """`burner ensure`: the server is checked, and replaced when it
+        can't read, or reads no words while the screen is in a wordless
+        spell no fresh server has confirmed (what the guide sends an
+        assistant here for)."""
+        unconfirmed_spell = self._mute_since is not None and not self._wordless_seen
         try:
-            if server_works(self.d):
+            if server_works(self.d, words=unconfirmed_spell):
                 return True
             raise RuntimeError("server can't read the screen")
         except Exception:

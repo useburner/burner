@@ -3800,7 +3800,7 @@ class EmptyScreenTests(OfflineTestCase):
         fake_u2 = SimpleNamespace(connect=lambda target: devs.pop(0))
         adb_dev = _FakeDev(PS_LISTING, "PID ARGS\n1 init\n")
         fake_adbutils = SimpleNamespace(adb=SimpleNamespace(device=lambda target: adb_dev))
-        mod.server_works = lambda d: True  # the running server passes every check
+        mod.server_works = lambda d, words=False: True  # the running server passes every check
         mod._KEEPALIVE = SimpleNamespace(close=lambda: None)
         mod.apply_fast_config = lambda d: None
         with mock.patch.dict(sys.modules, {"uiautomator2": fake_u2, "adbutils": fake_adbutils}):
@@ -3856,6 +3856,15 @@ class EmptyScreenTests(OfflineTestCase):
         d.jsonrpc = SimpleNamespace(wakeUp=lambda: woke.append(1))
         self.assertTrue(mod.server_works(d))
         self.assertEqual((woke, d.calls), ([1], ["dumpWindowHierarchy"]))
+        # a read with nodes and no word passes, unless words are wanted:
+        # then it gets the same second read an empty one gets
+        self.assertTrue(mod.server_works(_FakeServer([MUTE_XML])))
+        self.assertFalse(mod.server_works(_FakeServer([MUTE_XML, MUTE_XML]), words=True))
+        self.assertTrue(mod.server_works(_FakeServer([MUTE_XML, SAMPLE_XML]), words=True))
+        self.assertFalse(mod.server_works(_FakeServer([EMPTY_XML, MUTE_XML]), words=True))
+        self.assertTrue(mod.server_works(_FakeServer([SAMPLE_XML]), words=True))
+        # the system UI's bare window (a screen waking up) is not wordless
+        self.assertTrue(mod.server_works(_FakeServer([SHADE_XML]), words=True))
 
     def test_helper_restart_allowed(self):
         mod = _u2mux()
@@ -3888,7 +3897,7 @@ class EmptyScreenTests(OfflineTestCase):
         adb_dev = _FakeDev(PS_LISTING, "PID ARGS\n1 init\n")  # gone after the kill
         fake_adbutils = SimpleNamespace(adb=SimpleNamespace(device=lambda target: adb_dev))
         works = iter([False, True])
-        mod.server_works = lambda d: next(works)
+        mod.server_works = lambda d, words=False: next(works)
         closed, configured = [], []
         mod._KEEPALIVE = SimpleNamespace(close=lambda: closed.append(1))
         mod.apply_fast_config = lambda d: configured.append(d)
@@ -3900,19 +3909,67 @@ class EmptyScreenTests(OfflineTestCase):
         self.assertEqual(closed, [1])
         self.assertEqual(len(configured), 2)  # every server it connected to
 
+    def test_helper_ensure_server_replaces_a_server_that_reads_no_words(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        # the running server reads two nodes and no word, twice: replaced at once
+        fresh = _FakeServer([SAMPLE_XML])
+        devs = [_FakeServer([MUTE_XML, MUTE_XML]), fresh]
+        fake_u2 = SimpleNamespace(connect=lambda target: devs.pop(0))
+        adb_dev = _FakeDev(PS_LISTING, "PID ARGS\n1 init\n")
+        fake_adbutils = SimpleNamespace(adb=SimpleNamespace(device=lambda target: adb_dev))
+        mod._KEEPALIVE = SimpleNamespace(close=lambda: None)
+        mod.apply_fast_config = lambda d: None
+        with mock.patch.dict(sys.modules, {"uiautomator2": fake_u2, "adbutils": fake_adbutils}):
+            d = mod.ensure_server()
+        self.assertIs(d, fresh)
+        self.assertEqual(adb_dev.shells.count("kill -9 2843 2840 3200"), 1)
+        # a screen that really has no words: one kill, and the fresh server
+        # is taken as it reads (a fresh one that reads no words is the
+        # spell rule's job)
+        fresh = _FakeServer([MUTE_XML])
+        devs = [_FakeServer([MUTE_XML, MUTE_XML]), fresh]
+        fake_u2 = SimpleNamespace(connect=lambda target: devs.pop(0))
+        adb_dev = _FakeDev(PS_LISTING, "PID ARGS\n1 init\n")
+        fake_adbutils = SimpleNamespace(adb=SimpleNamespace(device=lambda target: adb_dev))
+        with mock.patch.dict(sys.modules, {"uiautomator2": fake_u2, "adbutils": fake_adbutils}):
+            d = mod.ensure_server()
+        self.assertIs(d, fresh)
+        self.assertEqual(adb_dev.shells.count("kill -9 2843 2840 3200"), 1)
+
+    def test_helper_ensure_wants_words_only_in_an_unconfirmed_wordless_spell(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        asked = []
+        mod.server_works = lambda d, words=False: asked.append(words) or True
+        dm = self._daemon(mod)
+        dm.d = _FakeServer([])
+        self.assertTrue(dm._reconnect())
+        dm._mute_since = 1.0
+        self.assertTrue(dm._reconnect())
+        dm._wordless_seen = True
+        self.assertTrue(dm._reconnect())
+        self.assertEqual(asked, [False, True, False])
+        # a server that fails the check is replaced
+        mod.server_works = lambda d, words=False: False
+        reconnects = []
+        dm.connect = lambda force=False: reconnects.append(force)
+        self.assertTrue(dm._reconnect())
+        self.assertEqual(reconnects, [False])
+
     def test_helper_ensure_server_gives_up_after_two_restarts(self):
         mod = _u2mux()
         self.no_sleep(mod)
         fake_u2 = SimpleNamespace(connect=lambda target: _FakeServer([]))
         adb_dev = _FakeDev("PID ARGS\n1 init\n")
         fake_adbutils = SimpleNamespace(adb=SimpleNamespace(device=lambda target: adb_dev))
-        mod.server_works = lambda d: False
+        mod.server_works = lambda d, words=False: False
         mod._KEEPALIVE = SimpleNamespace(close=lambda: None)
         with mock.patch.dict(sys.modules, {"uiautomator2": fake_u2, "adbutils": fake_adbutils}):
             with self.assertRaises(RuntimeError) as cm:
                 mod.ensure_server()
         self.assertIn("couldn't be restarted: no server process was running", str(cm.exception))
-        self.assertIn("(at first: it reads empty screens)", str(cm.exception))
+        self.assertIn("(at first: it reads empty or wordless screens)", str(cm.exception))
         self.assertEqual(adb_dev.shells, ["ps -A -o PID,ARGS"] * 2)
 
     def test_helper_connect_stamps_the_restart_even_when_it_fails(self):
