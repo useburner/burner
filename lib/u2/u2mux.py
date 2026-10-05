@@ -75,6 +75,11 @@ class _NotThere(Exception):
     """A tap by words found no control on the phone: nothing was tapped."""
 
 
+class StreamUnavailable(OSError):
+    """No stream to the phone's UI server could be opened: nothing was
+    sent on it."""
+
+
 import contextlib
 import time as _time
 
@@ -202,7 +207,11 @@ class KeepAliveHTTP:
                 if not reused:
                     if ent:
                         ent[0].close()
-                    ent = self._conns[key] = [self._open(dev, port), 0]
+                    try:
+                        fresh = self._open(dev, port)
+                    except Exception as e:
+                        raise StreamUnavailable(err_text(e, 100))
+                    ent = self._conns[key] = [fresh, 0]
                 conn = ent[0]
                 conn.sock.settimeout(timeout)
                 try:
@@ -1487,6 +1496,10 @@ class U2Daemon:
             with _t("act batch" + (" (by words)" if "tap_selector" in spec else "")):
                 try:
                     results = self._batch(calls, timeout=timeout)
+                except StreamUnavailable as e:
+                    # no stream to the server could be opened: nothing went
+                    # out, and the caller acts its own way
+                    raise RuntimeError("act not sent: the UI server couldn't be reached (%s)" % e)
                 except Exception as e:
                     raise RuntimeError("act failed after sending: %s" % str(e)[:120])
             if acted and isinstance(results[acted[0]], Exception):

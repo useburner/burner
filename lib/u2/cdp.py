@@ -444,12 +444,20 @@ READ_JS = r"""
   const ACTIVE = 'a[href],button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=switch],[role=option],[onclick]';
   const FIELD = 'input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button]):not([type=image]),textarea,[contenteditable=true]';
   const CHECK = 'input[type=checkbox],input[type=radio],[role=checkbox],[role=switch],[role=radio]';
+  // a run of text (words with a part in bold, a highlight, a span) is one
+  // row: an element whose descendants are all inline text elements and
+  // none of them a control
+  const INLINE = new Set(['B', 'STRONG', 'I', 'EM', 'SPAN', 'BDI', 'BDO', 'U', 'S', 'SMALL', 'SUB', 'SUP', 'MARK', 'ABBR', 'CODE', 'TIME', 'CITE', 'Q', 'VAR', 'KBD', 'SAMP', 'FONT', 'BR', 'WBR']);
+  const run = el => { const kids = el.getElementsByTagName('*'); if (!kids.length || kids.length > 40) return null;
+    for (const k of kids) if (!INLINE.has(k.tagName) || k.matches(ACTIVE) || k.hasAttribute('aria-label') || k.hasAttribute('title')) return null;
+    return squash(el.textContent); };
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, { acceptNode: el =>
     el.matches('script,style,noscript,svg,template,iframe') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT });
   for (let el = walker.nextNode(); el && out.length < cap; el = walker.nextNode()) {
     if (used.some(a => a.contains(el))) continue;
     const field = el.matches(FIELD), check = el.matches(CHECK), active = el.matches(ACTIVE), sel = el.tagName === 'SELECT';
     let text = own(el), desc = attr(el), fromText = false;
+    if (text && !field && !sel) { const r = run(el); if (r && r !== text) { text = r; fromText = true; } }
     if (sel) { const o = el.options[el.selectedIndex]; text = squash(o ? o.text : ''); desc = desc || labelOf(el); }
     else if (field || check) desc = desc || labelOf(el);
     if (!sel && !text && !desc && active && !field) { const t = squash(el.innerText); if (t && t.length <= 80) { text = t; fromText = true; } }
@@ -513,14 +521,23 @@ FIND_JS = r"""
     : (el.checkVisibility ? el.checkVisibility({visibilityProperty: true, opacityProperty: true}) : true);
   const box = el => el.getBoundingClientRect();
   const inView = r => r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < vh && r.right > 0 && r.left < vw;
+  // a run of text (words with a part in bold, a highlight, a span) is one
+  // candidate with its whole text as its name: "Pixel 7" inside "Pixel 7a"
+  // (a search's highlight of the typed words) is not a "Pixel 7"
+  const INLINE = new Set(['B', 'STRONG', 'I', 'EM', 'SPAN', 'BDI', 'BDO', 'U', 'S', 'SMALL', 'SUB', 'SUP', 'MARK', 'ABBR', 'CODE', 'TIME', 'CITE', 'Q', 'VAR', 'KBD', 'SAMP', 'FONT', 'BR', 'WBR']);
+  const inlinePart = el => INLINE.has(el.tagName) && !el.matches(ACTIVE) && !el.hasAttribute('aria-label') && !el.hasAttribute('title');
+  const runOf = el => { while (el.parentElement && el.parentElement !== document.body && inlinePart(el)) el = el.parentElement; return el; };
+  const runText = el => { const kids = el.getElementsByTagName('*'); if (!kids.length || kids.length > 40) return own(el);
+    for (const k of kids) if (!inlinePart(k)) return own(el);
+    return squash(el.textContent); };
   const cands = new Set();
   const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  for (let t = tw.nextNode(); t; t = tw.nextNode()) { const p = t.parentElement; if (p && squash(t.nodeValue) && !skip(p) && p.tagName !== 'OPTION') cands.add(p); }
+  for (let t = tw.nextNode(); t; t = tw.nextNode()) { const p = t.parentElement; if (p && squash(t.nodeValue) && !skip(p) && p.tagName !== 'OPTION') cands.add(runOf(p)); }
   for (const el of document.body.querySelectorAll('[aria-label],[alt],[title],[placeholder],input,' + ACTIVE)) if (!skip(el)) cands.add(el);
   if (focusedSelect) for (const o of focusedSelect.options) cands.add(o);
   const names = el => {
     if (el.tagName === 'OPTION') return [squash(el.text).toLowerCase()].filter(Boolean);
-    const n = [own(el), attr(el)];
+    const n = [runText(el), attr(el)];
     if (el.tagName === 'SELECT') { const o = el.options[el.selectedIndex]; n.push(squash(o ? o.text : '')); n.push(labelOf(el)); }
     else if (el.matches('input,textarea')) n.push(labelOf(el));
     else if (el.matches(ACTIVE)) { const t = squash(el.innerText); if (t && t.length <= 80) n.push(t); }

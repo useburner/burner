@@ -4507,6 +4507,24 @@ class WebPathTests(OfflineTestCase):
         with self.assertRaises(mod.U2NotFound):
             dm.cmd_wait_for(json.dumps({"text": "Top Stories", "timeout": 0.3}))
 
+    def test_an_act_whose_stream_would_not_open_is_not_sent(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()
+        dm._batch = mock.Mock(side_effect=mod.StreamUnavailable("Unable to connect to uiautomator2 server: closed"))
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"tap": [540, 505], "idle": 1200}))
+        self.assertEqual(str(cm.exception), "act not sent: the UI server couldn't be reached "
+                         "(Unable to connect to uiautomator2 server: closed)")
+        # the stream opener's failure is that error
+        ka = mod.KeepAliveHTTP()
+        ka._open = mock.Mock(side_effect=OSError("closed"))
+        core = mock.Mock(HTTPResponse=object, HTTPError=Exception)
+        with mock.patch.dict(sys.modules, {"uiautomator2": mock.Mock(core=core), "uiautomator2.core": core}),                 self.assertRaises(mod.StreamUnavailable):
+            ka.request(SimpleNamespace(serial="s"), 9008, "GET", "/ping")
+
     def test_a_read_that_says_hidden_ends_the_proof(self):
         mod = _u2mux()
         EmptyScreenTests.no_sleep(self, mod)
