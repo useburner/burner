@@ -4137,6 +4137,23 @@ def cmd_settings(args):
 
 
 def cmd_open(args):
+    if (args.url.startswith(("http://", "https://"))
+            and (not args.package or args.package in WEB_APPS)
+            and not getattr(args, "quiet", False)):
+        # Chrome in front: its current tab loads the link, through the
+        # page (one round trip; a launch opens a new tab every time and
+        # pays 1.5s to contact it). Anything else launches the link below.
+        status, root, note = act_and_read({"open": args.url}, idle_ms=IDLE_LAUNCH_MS,
+                                          rereads=1)
+        if status == "ok":
+            print("opened {}".format(args.url))
+            print_screen(root, note=note)
+            return 0
+        if status != "unsent":
+            print("burner: opening the link in the page failed ({}); run burner state"
+                  .format(status[len("failed "):][:100] if status.startswith("failed ")
+                          else status), file=sys.stderr)
+            return 1
     # The phone's shell re-splits what adb sends: an unquoted link with
     # `&` was cut there (`market://search?q=x&c=apps com.android.vending`
     # became `market://search?q=x`, and the package was lost).

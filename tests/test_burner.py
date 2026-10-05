@@ -3265,13 +3265,19 @@ class LaunchReadBudgetTests(OfflineTestCase):
         self.allow("u2_invalidate")
         calls = []
         EMPTY = '<hierarchy rotation="0"></hierarchy>'
-        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30:
-                   calls.append((cmd, arg)) or (EMPTY if cmd == "act" else "100"))
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append((cmd, arg))
+            if cmd == "act" and "open" in arg:
+                pc._u2_status = "err act not sent: not a page"  # no Chrome in front
+                return None
+            return EMPTY if cmd == "act" else "100"
+        self.allow("u2sock", side_effect=u2)
         dump = self.allow("ui_dump", return_value=ET.fromstring(EMPTY))
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_open(self.parse(["open", "https://example.com"]))
         self.assertEqual(rc, 0)
-        self.assertEqual(calls[0], ("act", '{"idle": 1000}'))
+        self.assertEqual(calls[1], ("act", '{"idle": 1000}'))
         self.assertEqual(dump.call_count, 1)  # one re-read of a thin screen
         self.assertIn("(may still be loading)", out.getvalue())
 
@@ -3464,12 +3470,16 @@ class OneRoundTripTests(OfflineTestCase):
 
         def u2(cmd, arg="", timeout=30):
             calls.append((cmd, json.loads(arg)))
+            if "open" in calls[-1][1]:
+                pc._u2_status = "err act not sent: not a page"  # no Chrome in front
+                return None
             return SAMPLE_XML
         self.allow("u2sock", side_effect=u2)
         with self.cap() as (out, err):
             rc = pc.cmd_open(self.parse(["open", "https://example.com"]))
         self.assertEqual(rc, 0)
-        self.assertEqual(calls, [("act", {"idle": 1000})])
+        self.assertEqual(calls, [("act", {"open": "https://example.com", "idle": 1000}),
+                                 ("act", {"idle": 1000})])
         self.assertIn("screen: com.example", out.getvalue())
 
     def test_helper_batch_results_and_act_calls(self):
@@ -4000,6 +4010,52 @@ class WebPathTests(OfflineTestCase):
         dm._last_xml = SAMPLE_XML
         with self.assertRaises(RuntimeError) as cm:
             dm.cmd_act(json.dumps({"scroll": "down"}))
+        self.assertEqual(str(cm.exception), "act not sent: not a page")
+
+    def test_open_loads_the_link_in_the_page_when_chrome_is_in_front(self):
+        page = _cdp().page_xml(WEB_SCREEN, 283, 2400)
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append((cmd, json.loads(arg)))
+            return page
+        self.allow("u2sock", side_effect=u2)
+        adb = self.allow("adb_or_ensure")
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_open(self.parse(["open", "https://www.espn.com/nfl/"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        adb.assert_not_called()  # no launch, no new tab
+        self.assertEqual(calls, [("act", {"open": "https://www.espn.com/nfl/", "idle": 1000})])
+        self.assertIn("opened https://www.espn.com/nfl/", out.getvalue())
+        self.assertIn("Box Score (click) (796,491)", out.getvalue())
+        # a link that isn't a web page, or a quiet open, is launched as before
+        adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
+        self.allow("u2_invalidate")
+        calls.clear()
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            pc.cmd_open(self.parse(["open", "--quiet", "market://details?id=x", "com.android.vending"]))
+        self.assertEqual(adb.call_count, 1)
+        self.assertFalse(any(isinstance(c[1], dict) and "open" in c[1] for c in calls))
+
+    def test_helper_opens_a_link_in_the_page(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = self._fake_cdp(mod, calls)
+
+        def navigate(page, url, idle_ms=1000):
+            calls.append(("open", url, idle_ms))
+            return {"screen": WEB_SCREEN, "ready": "interactive"}
+        fake.navigate = navigate
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        xml = dm.cmd_act(json.dumps({"open": "https://www.espn.com/nfl/", "idle": 1000})).decode()
+        self.assertEqual(calls[-1], ("open", "https://www.espn.com/nfl/", 1000))
+        self.assertIn('text="Box Score"', xml)
+        dm._last_xml = SAMPLE_XML  # not Chrome: launched by the CLI instead
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"open": "https://example.com"}))
         self.assertEqual(str(cm.exception), "act not sent: not a page")
 
     def test_scroll_asks_the_page_when_chrome_is_in_front(self):

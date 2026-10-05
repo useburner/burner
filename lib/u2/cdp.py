@@ -508,7 +508,7 @@ QUIET_CAP_S = 0.5  # a wait for a quiet DOM, at most: a live page never stops ch
 LOAD_CAP_S = 2.5   # a wait for a page that is loading, at most
 
 
-def settle(page, idle_ms=1200, poll_s=0.15, quiet_s=0.3, url=None):
+def settle(page, idle_ms=1200, poll_s=0.15, quiet_s=0.3, url=None, loading=False):
     """Wait for the page after a touch or a scroll. A navigation (the url
     differs from `url`, the one before the touch) or a document not yet
     parsed (readyState "loading") is waited out: until the page is
@@ -519,7 +519,7 @@ def settle(page, idle_ms=1200, poll_s=0.15, quiet_s=0.3, url=None):
     its rows can be read any time. Returns the last probe."""
     t0 = time.monotonic()
     last, since = None, t0
-    probe, loading = {}, False
+    probe = {}
     while True:
         try:
             probe = page.eval(SETTLE_JS, timeout=5.0) or {}
@@ -579,6 +579,19 @@ def tap(page, label, index=None, idle_ms=1200):
     probe = settle(page, idle_ms, url=hit.get("url"))
     return {"found": True, "count": 1, "label": hit.get("label"), "how": how,
             "screen": read(page), "ready": probe.get("ready")}
+
+
+def navigate(page, url, idle_ms=1000):
+    """Load `url` in this page (Chrome's current tab), wait for it to be
+    parsed and quiet (LOAD_CAP_S at most), read. Raises NotSent when the
+    page can't be asked to load it."""
+    try:
+        before = page.eval("location.href", timeout=5.0)
+        page.call("Page.navigate", 10.0, url=url)
+    except Exception as e:
+        raise NotSent(str(e)[:120])
+    probe = settle(page, idle_ms, url=before if before != url else None, loading=True)
+    return {"screen": read(page), "ready": probe.get("ready")}
 
 
 def scroll(page, direction="down", times=1, fraction=0.6, idle_ms=500):

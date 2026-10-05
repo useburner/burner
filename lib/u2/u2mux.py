@@ -1139,6 +1139,27 @@ class U2Daemon:
         returned and cached. Never replayed after an error: the action may
         have happened. "act failed after sending: ..." means just that."""
         spec = json.loads(arg) if arg.strip() else {}
+        if "open" in spec:
+            # A link opened in the page in Chrome (cdp.navigate): its
+            # current tab loads it. No tab for every link, no first
+            # contact with a new one. Elsewhere the CLI launches the link.
+            page = self._page()
+            if page is None:
+                raise RuntimeError("act not sent: not a page")
+            with self._lock:
+                self.invalidate()
+                try:
+                    with _t("web open"):
+                        r = _cdp().navigate(page, spec["open"], int(spec.get("idle", 1000)))
+                except _cdp().NotSent as e:
+                    self._web = None
+                    raise RuntimeError("act not sent: the page couldn't be asked (%s)" % e)
+                except Exception as e:
+                    self._web = None
+                    raise RuntimeError("act failed after sending: %s" % err_text(e, 120))
+                xml = self._page_xml(r["screen"])
+                self._remember(xml)
+            return xml.encode()
         if "scroll" in spec:
             # A page in Chrome scrolls itself (cdp.scroll): a finger swipe
             # leaves the screen reader's positions behind for seconds.
