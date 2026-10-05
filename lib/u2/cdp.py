@@ -399,7 +399,10 @@ READ_JS = r"""
   const squash = s => (s || '').replace(/\s+/g, ' ').trim();
   const own = el => { let t = ''; for (const c of el.childNodes) if (c.nodeType === 3) t += c.nodeValue; return squash(t); };
   const attr = el => squash(el.getAttribute('aria-label') || el.getAttribute('alt') || el.getAttribute('title'));
-  const labelOf = el => { try { const l = el.labels && el.labels[0]; return l ? squash(l.innerText) : ''; } catch (e) { return ''; } };
+  const labelOf = el => { try { const l = el.labels && el.labels[0]; if (!l) return '';
+    // the label's own words: a wrapping label's innerText carries the control's text too
+    let t = ''; for (const c of l.childNodes) { if (c.nodeType === 3) t += c.nodeValue + ' '; else if (c.nodeType === 1 && !c.matches('input,select,textarea,button')) t += c.textContent + ' '; }
+    return squash(t); } catch (e) { return ''; } };
   const ACTIVE = 'a[href],button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=switch],[role=option],[onclick]';
   const FIELD = 'input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button]):not([type=image]),textarea,[contenteditable=true]';
   const CHECK = 'input[type=checkbox],input[type=radio],[role=checkbox],[role=switch],[role=radio]';
@@ -462,7 +465,10 @@ FIND_JS = r"""
   const ACTIVE = 'a[href],button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=switch],[role=option],[onclick]';
   const vw = innerWidth, vh = innerHeight;
   const skip = el => !!el.closest('script,style,noscript,svg,template');
-  const labelOf = el => { try { const l = el.labels && el.labels[0]; return l ? squash(l.innerText) : ''; } catch (e) { return ''; } };
+  const labelOf = el => { try { const l = el.labels && el.labels[0]; if (!l) return '';
+    // the label's own words: a wrapping label's innerText carries the control's text too
+    let t = ''; for (const c of l.childNodes) { if (c.nodeType === 3) t += c.nodeValue + ' '; else if (c.nodeType === 1 && !c.matches('input,select,textarea,button')) t += c.textContent + ' '; }
+    return squash(t); } catch (e) { return ''; } };
   const focusedSelect = document.activeElement && document.activeElement.tagName === 'SELECT' ? document.activeElement : null;
   const visible = el => el.tagName === 'OPTION' ? (!!focusedSelect && el.closest('select') === focusedSelect)
     : (el.checkVisibility ? el.checkVisibility({visibilityProperty: true, opacityProperty: true}) : true);
@@ -490,7 +496,8 @@ FIND_JS = r"""
   if (!hits.length) return {found: false};
   let controls = hits.filter(el => !hits.some(o => o !== el && el.contains(o)));
   // a label beside the control it labels is that control
-  controls = controls.filter(el => !(el.tagName === 'LABEL' && el.control && controls.includes(el.control)));
+  // a label found by its words stands for the control it labels
+  controls = controls.map(el => (el.tagName === 'LABEL' && el.control) ? el.control : el).filter((el, i, a) => a.indexOf(el) === i);
   const seen = controls.filter(el => inView(box(el)));
   if (seen.length) controls = seen;
   const pick = (index === null || index === undefined) ? null : index;

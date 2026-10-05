@@ -3887,6 +3887,21 @@ WEB_SCREEN = {"title": "NFL on ESPN", "url": "https://www.espn.com/nfl/", "ready
                         "l": 0, "t": 2000, "w": 100, "h": 20}]}
 
 
+class _FakePage:
+    """A page session without Chrome: no events, never loading."""
+    loading = False
+    visible_at = 0.0
+
+    def listen(self, seconds):
+        pass
+
+    def wait_parsed(self, cap_s):
+        return True
+
+    def close(self):
+        pass
+
+
 class WebPathTests(OfflineTestCase):
     def test_websocket_frames_round_trip(self):
         cdp = _cdp()
@@ -4068,7 +4083,7 @@ class WebPathTests(OfflineTestCase):
             return {"moved": 1200, "screen": WEB_SCREEN}
         fake = types.SimpleNamespace(
             is_chrome=real.is_chrome, page_xml=real.page_xml, NotSent=real.NotSent,
-            front_page=lambda dev, current=None: "page", visible=lambda page, timeout=1.5: True,
+            front_page=lambda dev, current=None: _FakePage(), visible=lambda page, timeout=1.5: True,
             QUICK_PROBE_S=0.7,
             read=lambda page, cap=160: calls.append(("read",)) or WEB_SCREEN,
             tap=tap, scroll=scroll)

@@ -1027,15 +1027,27 @@ class U2Daemon:
             # A page in Chrome is asked for the words (cdp.find): the
             # whole document, as the screen reader's tree held rows
             # below the fold too; a read of the page when they are there.
+            fails = 0
             while True:
                 polls += 1
+                # A navigation under way (a tap that submitted a form) is
+                # waited out first: a page mid-navigation answers a
+                # question only once the new document is up.
+                page.listen(0.05)
+                if page.loading:
+                    page.wait_parsed(min(2.0, max(0.1, deadline - _time.monotonic())))
                 try:
                     with _t("web find"):
                         n = _cdp().find(page, text, webview_top(self._last_xml))
                 except Exception as e:
-                    self._web = None
-                    log("the page couldn't be asked (%s); the screen reader" % err_text(e, 100))
-                    break
+                    fails += 1
+                    if fails > 1:
+                        self._web = None
+                        log("the page couldn't be asked (%s); the screen reader" % err_text(e, 100))
+                        break
+                    page.loading = True  # likely mid-navigation: once more after it
+                    page.wait_parsed(min(2.0, max(0.1, deadline - _time.monotonic())))
+                    continue
                 waited = int((_time.monotonic() - t0) * 1000)
                 if absent and not n.get("found"):
                     return json.dumps({"gone": True, "waited_ms": waited, "polls": polls}).encode()
