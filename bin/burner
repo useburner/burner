@@ -2614,14 +2614,17 @@ def progress_hint(nodes):
     progress line: rows with a percentage or a word of doing (Installing,
     43%, Loading…), two at most, else the first two rows with words.
     Pure."""
-    texts = []
+    texts, title = [], ""
     for n in nodes:
         t = (n["text"] or n["desc"] or "").strip()
+        if t and "webview" in (n.get("class") or "").lower():
+            title = title or t[:60]  # a web page's title: what the screen is, to a person
+            continue
         if t and len(t) <= 60 and t not in texts:
             texts.append(t)
     busy = [t for t in texts if re.search(r"\d{1,3}\s?%", t) or t.endswith(("…", "..."))
             or any(w in t.lower() for w in BUSY_WORDS)]
-    rows = (busy or texts)[:2]
+    rows = busy[:2] or ([title] if title else texts[:2])
     if not rows:
         return "the screen shows no words"
     return "the screen shows: " + ", ".join(rows)
@@ -2730,7 +2733,15 @@ def _wait_over(args, started, total, sliced):
         _wait_note(args, started)
         return _wait_still(args, so_far, total)
     _wait_forget()
-    return _wait_fail(args, 'timeout waiting for "{}"'.format(args.text))
+    return _wait_fail(args, _wait_timeout_msg(args))
+
+
+def _wait_timeout_msg(args, suffix=""):
+    """The timeout's words: for --absent, that the words are still
+    showing (not "timeout waiting for", which reads as the opposite)."""
+    if args.absent:
+        return 'timeout: "{}" is still showing{}'.format(args.text, suffix)
+    return 'timeout waiting for "{}"{}'.format(args.text, suffix)
 
 
 def _wait_fail(args, msg):
@@ -2799,8 +2810,8 @@ def cmd_wait(args):
     left = total - (time.time() - started)
     if left <= 0:
         _wait_forget()
-        return _wait_fail(args, 'timeout waiting for "{}" ({}s in all)'.format(
-            args.text, int(round(time.time() - started))))
+        return _wait_fail(args, _wait_timeout_msg(args, " ({}s in all)".format(
+            int(round(time.time() - started)))))
     sliced = total > WAIT_SLICE_S
     end = time.monotonic() + (min(left, WAIT_SLICE_S) if sliced else left)
     helper = True
@@ -3415,9 +3426,7 @@ def cmd_start(args):
         print("launched {}".format(args.package))
         front = launch_read(quiet, expect=args.package)
         if front and front != args.package:
-            print("{} didn't come to the front; {} is still open. Try "
-                  "`burner press BACK` or `burner press HOME`, then start it "
-                  "again.".format(args.package, front), file=sys.stderr)
+            print(_launch_failed(args.package, front), file=sys.stderr)
             return 1
         return 0
     # Another app (the Play Store's transparent screen, a dialog host) can
@@ -3428,9 +3437,7 @@ def cmd_start(args):
         if front is None or front == args.package:
             break
         if attempt == 1:
-            print("{} didn't come to the front; {} is still open. Try "
-                  "`burner press BACK` or `burner press HOME`, then start it "
-                  "again.".format(args.package, front), file=sys.stderr)
+            print(_launch_failed(args.package, front), file=sys.stderr)
             u2_invalidate()
             return 1
     u2_invalidate()
@@ -3442,6 +3449,24 @@ def cmd_start(args):
     print("launched {}".format(args.package))
     launch_read(quiet)
     return 0
+
+
+def _launch_failed(pkg, front):
+    """Why a launch left another app in front: the package isn't
+    installed (a wrong name: `burner apps` finds the right one; the old
+    advice was BACK and another try, which can't help), else the app
+    that kept the front. One adb call, only here."""
+    try:
+        r = adb_or_ensure("shell", "pm", "path", pkg, timeout=15)
+        installed = "package:" in (r.stdout or "")
+    except Exception:
+        installed = True  # unknown: the usual advice
+    if not installed:
+        word = pkg.rsplit(".", 1)[-1]
+        return ("{} isn't installed on the phone. `burner apps {}` lists the packages "
+                "with that word; `burner recipe play-install` installs one.".format(pkg, word))
+    return ("{} didn't come to the front; {} is still open. Try `burner press BACK` "
+            "or `burner press HOME`, then start it again.".format(pkg, front))
 
 
 def launch_read(quiet, expect=None):

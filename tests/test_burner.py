@@ -2440,13 +2440,14 @@ class FastPathTests(OfflineTestCase):
         other = SimpleNamespace(
             stdout="  mFocusedApp=ActivityRecord{1 u0 com.android.vending/.X t3}\n",
             stderr="", returncode=0)
-        adb = self.allow("adb_or_ensure", return_value=other)
+        installed = SimpleNamespace(stdout="package:/data/app/x/base.apk\n", stderr="", returncode=0)
+        adb = self.allow("adb_or_ensure", side_effect=lambda *a, **k: installed if a[1:3] == ("pm", "path") else other)
         self.allow("u2_invalidate")
         with self.cap() as (out, err):
             rc = pc.cmd_start(SimpleNamespace(package="com.example"))
         self.assertEqual(rc, 1)
-        self.assertEqual(adb.call_count, 2)
-        self.assertIn("KEYCODE_HOME", adb.call_args[0][1])
+        self.assertEqual(adb.call_count, 3)  # two launches, then the verdict's `pm path`
+        self.assertIn("KEYCODE_HOME", adb.call_args_list[1][0][1])
         self.assertIn("com.android.vending is still open", err.getvalue())
 
 
@@ -4030,6 +4031,8 @@ class StartAndSettingsTests(OfflineTestCase):
         self.allow("scrcpy_send", return_value=True)
         self.allow("u2_invalidate")
         self.allow("nav_record")
+        # the verdict's one adb call: the package is installed
+        self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout="package:/data/app/x/base.apk\n", stderr=""))
         reads = self.allow("u2sock", return_value=SAMPLE_XML)
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_start(self.parse(["start", "com.other"]))
@@ -4038,6 +4041,14 @@ class StartAndSettingsTests(OfflineTestCase):
                       err.getvalue())
         # read again while the window may still be coming, then the verdict
         self.assertEqual(reads.call_count, 1 + pc.LAUNCH_REREADS)
+        # a package that isn't installed is said (the old advice, BACK and
+        # another try, can't help)
+        self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=1, stdout="", stderr=""))
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_start(self.parse(["start", "com.espn.scores"]))
+        self.assertEqual(rc, 1)
+        self.assertIn("com.espn.scores isn't installed on the phone. `burner apps scores`", err.getvalue())
+        self.assertNotIn("press BACK", err.getvalue())
 
     def test_start_waits_for_the_window_to_come_up(self):
         # a start from the home screen: the first read still shows the
@@ -6333,6 +6344,11 @@ class SlicedWaitTests(OfflineTestCase):
                          "the screen shows: Hello, Search")
         self.assertEqual(pc.progress_hint([_wnode(text="Please wait...")]), "the screen shows: Please wait...")
         self.assertEqual(pc.progress_hint([]), "the screen shows no words")
+        # a web page: its title, not its first menu words (unless something is under way)
+        page = [_wnode(text="Menu", clickable=True), _wnode(text="ESPN", clickable=True),
+                _wnode(desc="NFL on ESPN - Scores, Stats and Highlights", cls="android.webkit.WebView")]
+        self.assertEqual(pc.progress_hint(page), "the screen shows: NFL on ESPN - Scores, Stats and Highlights")
+        self.assertEqual(pc.progress_hint(page + [_wnode(text="Loading…")]), "the screen shows: Loading…")
 
     def test_a_long_wait_comes_back_every_slice_and_continues(self):
         clock, path, calls = self._clock(), self._waiting_file(), []
@@ -6381,6 +6397,11 @@ class SlicedWaitTests(OfflineTestCase):
         self.assertEqual(calls, [10, 10])  # the 20s left, then the timeout
         self.assertIn('timeout waiting for "Open"', err.getvalue())
         self.assertFalse(os.path.exists(path))
+        # --absent that runs out: the words are still showing
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_wait(self.parse(["wait", "Open", "--absent", "--no-evidence"]))
+        self.assertEqual(rc, 1)
+        self.assertIn('timeout: "Open" is still showing', err.getvalue())
         # a slice long forgotten (the assistant came back much later) starts afresh
         with mock.patch.object(pc.time, "sleep"), self.cap():
             pc.cmd_wait(self.parse(["wait", "Open", "--timeout", "600", "--no-evidence"]))
