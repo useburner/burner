@@ -54,6 +54,10 @@ class U2NotFound(Exception):
     pass
 
 
+class _NotThere(Exception):
+    """A tap by words found no control on the phone: nothing was tapped."""
+
+
 import contextlib
 import time as _time
 
@@ -385,7 +389,11 @@ def apply_fast_config(d):
     server loses this on every restart, so it is applied to each one."""
     try:
         cfg = d.jsonrpc.getConfigurator()
-        cfg.update({"waitForIdleTimeout": 0, "waitForSelectorTimeout": 0})
+        # a tap by words (click by selector) waits for the UI to answer
+        # it, 3s by default when nothing on screen changes: 500ms here,
+        # the batch's own wait and read follow
+        cfg.update({"waitForIdleTimeout": 0, "waitForSelectorTimeout": 0,
+                    "actionAcknowledgmentTimeout": 500})
         d.jsonrpc.setConfigurator(cfg)
     except Exception as e:
         log("configurator tweak failed:", err_text(e))
@@ -590,14 +598,34 @@ def row_over(nodes, control, center):
 
 def label_target(xml, label):
     """The centre (x, y) of the one control on this read whose text or
-    description is `label` (case-insensitive exact; "A || B" tries each).
-    A control drawn twice (see same_control) is one control, tapped at
-    the centre of its first row. A tap by coordinates injects a touch
-    and looks nothing up: the server's click by selector threw a
-    NullPointerException on a web node in Chrome (espn.com, Oct 4).
-    Raises RuntimeError when there is no such control, more than one,
-    its words are cut off at an edge (see cut_off), or another row sits
-    over it (see row_over)."""
+    description is `label` (see label_node)."""
+    node, _ = label_node(xml, label)
+    return tuple(node["center"])
+
+
+def selector_for(node, label):
+    """The phone's own selector for this control: its exact text, else
+    its exact description (whichever carries `label`); the phone finds
+    it at tap time, so a read need not come first. The shape is
+    uiautomator2's Selector (text: mask 1, description: mask 64), built
+    here so that no import is needed. Pure."""
+    if node["text"].lower() == label.lower():
+        key, value, mask = "text", node["text"], 1
+    else:
+        key, value, mask = "description", node["desc"], 64
+    return {"mask": mask, "childOrSibling": [], "childOrSiblingSelector": [], key: value}
+
+
+def label_node(xml, label):
+    """The one control on this read whose text or description is `label`
+    (case-insensitive exact; "A || B" tries each): (its first row, the
+    alternative that matched). A control drawn twice (see same_control)
+    is one control, its first row's centre the tap point. A tap by
+    coordinates injects a touch and looks nothing up: the server's click
+    by selector threw a NullPointerException on a web node in Chrome
+    (espn.com, Oct 4). Raises RuntimeError when there is no such control,
+    more than one, its words are cut off at an edge (see cut_off), or
+    another row sits over it (see row_over)."""
     nodes = list(iter_nodes(xml or ""))
     for alt in [p.strip() for p in label.split("||") if p.strip()]:
         low = alt.lower()
@@ -620,8 +648,12 @@ def label_target(xml, label):
         over = row_over(nodes, controls[0], center)
         if over is not None:
             raise RuntimeError("%r is under %r" % (alt, (over["text"] or over["desc"])[:40]))
-        return center
+        return controls[0][0], alt
     raise RuntimeError("not on the last read")
+
+
+BY_WORDS_S = 20.0  # a read this young still says what the screen is: a tap
+                   # by words on it needs no read first
 
 
 def act_calls(spec):
@@ -637,7 +669,9 @@ def act_calls(spec):
     when it woke the phone. Not before POWER or SLEEP, whose job is the
     opposite. Pure."""
     calls = []
-    if "tap" in spec:
+    if "tap_selector" in spec:
+        calls.append(("click", [spec["tap_selector"]]))  # found by its words at tap time
+    elif "tap" in spec:
         x, y = spec["tap"]
         calls.append(("click", [int(x), int(y)]))
     elif "key" in spec:
@@ -649,6 +683,11 @@ def act_calls(spec):
     if calls:
         if not sleeps_the_screen(spec):
             calls.insert(0, ("wakeUp", []))
+        if spec.get("quiet") and "tap_selector" in spec:
+            # a chained tap by words: the phone waits for the tap's
+            # acknowledgement itself, and the next step finds its control
+            # by words when its turn comes
+            return calls
         calls.append(("dumpWindowHierarchy", [False, DUMP_DEPTH]))
     calls.append(("waitForIdle", [int(spec.get("idle", 2000))]))
     if not spec.get("quiet"):
@@ -1337,21 +1376,39 @@ class U2Daemon:
             if spec.get("index") is not None:
                 # Which of several rows: the caller reads and plans.
                 raise RuntimeError("act not sent: --index needs a read")
-            # Tap the row with this label where it is now: on a fresh
-            # read, not the assistant's. (A web page's rows report their
-            # old place for a moment after a scroll, espn.com Oct 4: the
-            # tap at a row's old place hit the link below it.) When the
-            # row isn't known to be still, because it moved since the
-            # assistant's read or that read didn't have it whole, it is
-            # read until two reads agree on its place, three at most (a
-            # bar that slides in after a scroll pushes the rows down for
-            # a moment: the tap meant for Box Score opened Standings). The
-            # label must be on the read exactly once and whole; anything
-            # else is "not sent": the caller reads the screen and taps by
-            # coordinates instead.
+            # Tap the row with this label. When the newest read (the
+            # screen the assistant was shown, BY_WORDS_S old at most) has
+            # the control once, whole and clear, the phone finds it by
+            # its words at tap time and taps it in the round trip of the
+            # wait and the read: a read first is a round trip of its own
+            # (0.4-0.75s from afar, Oct 5). A control the phone no longer
+            # finds (the screen changed) is tapped where it is now, on a
+            # fresh read, not the assistant's. (A web page's rows report
+            # their old place for a moment after a scroll, espn.com Oct
+            # 4: the tap at a row's old place hit the link below it.)
+            # When the row isn't known to be still, because it moved
+            # since the assistant's read or that read didn't have it
+            # whole, it is read until two reads agree on its place, three
+            # at most (a bar that slides in after a scroll pushes the rows
+            # down for a moment: the tap meant for Box Score opened
+            # Standings). The label must be on the read exactly once and
+            # whole; anything else is "not sent": the caller reads the
+            # screen and taps by coordinates instead.
             spec = dict(spec)
             label = spec.pop("tap_label")
             before = self._last_xml
+            if before and _time.monotonic() - self._last_xml_t < BY_WORDS_S:
+                try:
+                    node, alt = label_node(before, label)
+                    spec["tap_selector"] = selector_for(node, alt)
+                except RuntimeError:
+                    pass
+            if "tap_selector" in spec:
+                try:
+                    return self._act_batch(spec)
+                except _NotThere as e:
+                    spec.pop("tap_selector")
+                    log("%r not found by its words (%s); reading afresh" % (label, e))
             try:
                 with _t("tap read"):
                     xml = self._dump(fresh=True)
@@ -1380,17 +1437,26 @@ class U2Daemon:
                     raise RuntimeError("act not sent: %s" % err_text(e, 100))
                 reads += 1
             spec["tap"] = list(center)
+        return self._act_batch(spec)
+
+    def _act_batch(self, spec):
+        """The act's calls (see act_calls) in one round trip, and what
+        came back: the read after the action, cached, or "ok" for a
+        quiet step. Raises _NotThere when a tap by words found no control
+        (nothing was tapped), RuntimeError otherwise."""
         calls = act_calls(spec)
         acted = [i for i, (m, _) in enumerate(calls) if m in ACTION_METHODS]
         timeout = int(spec.get("idle", 2000)) / 1000.0 + 20
         with self._lock:
             self.invalidate()
-            with _t("act batch"):
+            with _t("act batch" + (" (by words)" if "tap_selector" in spec else "")):
                 try:
                     results = self._batch(calls, timeout=timeout)
                 except Exception as e:
                     raise RuntimeError("act failed after sending: %s" % str(e)[:120])
             if acted and isinstance(results[acted[0]], Exception):
+                if "tap_selector" in spec:
+                    raise _NotThere(err_text(results[acted[0]], 80))
                 raise RuntimeError("act failed after sending: %s" % results[acted[0]])
             if acted and calls[0][0] == "wakeUp" and isinstance(results[0], Exception):
                 # The action went to a screen that may be off: dropped, then.

@@ -299,10 +299,11 @@ class Page:
                 raise RuntimeError("%s: %s" % (method, m["error"].get("message", m["error"])))
             return m.get("result", {})
 
-    def call_many(self, cmds, timeout=10.0):
+    def call_many(self, cmds, timeout=10.0, raise_errors=True):
         """Several commands sent at once, one round trip: their results
         in order. cmds: [(method, params), ...]. Raises on the first
-        command that failed, after all have been answered."""
+        command that failed, after all have been answered; with
+        raise_errors False, a failed command's result is its RuntimeError."""
         ids = []
         self.ws.s.settimeout(timeout)
         for method, params in cmds:
@@ -320,7 +321,11 @@ class Page:
         for i, (method, _) in zip(ids, cmds):
             m = got[i]
             if "error" in m:
-                raise RuntimeError("%s: %s" % (method, m["error"].get("message", m["error"])))
+                err = RuntimeError("%s: %s" % (method, m["error"].get("message", m["error"])))
+                if raise_errors:
+                    raise err
+                out.append(err)
+                continue
             out.append(m.get("result", {}))
         return out
 
@@ -492,6 +497,7 @@ FIND_JS = r"""
     else if (el.matches('input,textarea')) n.push(labelOf(el));
     else if (el.matches(ACTIVE)) { const t = squash(el.innerText); if (t && t.length <= 80) n.push(t); }
     return n.filter(Boolean).map(s => s.toLowerCase()); };
+  window.__burnerTarget = null;
   const alts = label.split('||').map(squash).filter(Boolean);
   let used = '';
   const find = test => { for (const alt of alts) { const want = alt.toLowerCase(); const h = [];
@@ -635,11 +641,13 @@ SETTLE_JS = r"""
   return {ready: document.readyState, mut: window.__burnerMut, url: location.href, vis: document.visibilityState};
 })"""
 
-# A scroll by `dy` CSS pixels: the window, else the tallest element that
-# scrolls (a page laid out inside one scrolling box). "top"/"bottom" go
-# to the ends. Returns how far it moved.
+# A scroll by `fraction` of the viewport's height (down when positive):
+# the window, else the tallest element that scrolls (a page laid out
+# inside one scrolling box). "top"/"bottom" go to the ends. Returns how
+# far it moved.
 SCROLL_JS = r"""
-(function(dy, where){
+(function(fraction, where){
+  const dy = Math.round(innerHeight * fraction);
   const go = (el, isWin) => {
     const at = () => isWin ? scrollY : el.scrollTop;
     const before = at();
@@ -665,6 +673,34 @@ SCROLL_JS = r"""
 
 def _js(fn, *args):
     return "(%s)(%s)" % (fn, ", ".join(json.dumps(a) for a in args))
+
+
+def _evaluate(expression):
+    """A page script as a command for call_many (a promise is awaited)."""
+    return ("Runtime.evaluate", {"expression": expression, "returnByValue": True, "awaitPromise": True})
+
+
+def _later(expression, ms):
+    """`expression` run on the page `ms` later: sent in the round trip of
+    the input before it, the page answers once the input's first effects
+    are in. A round trip to the phone is 0.4-0.75s from afar (Oct 5), the
+    page's own work a few ms: the read rides along."""
+    return "new Promise(r => setTimeout(() => r(%s), %d))" % (expression, ms)
+
+
+def _value(res):
+    """The value of a page script's result from call_many; raises on a
+    script that failed or wasn't answered, as eval does."""
+    if isinstance(res, Exception):
+        raise RuntimeError(str(res))
+    if "exceptionDetails" in res:
+        ex = res["exceptionDetails"]
+        text = ex.get("exception", {}).get("description") or ex.get("text") or "error"
+        raise RuntimeError("page script failed: %s" % text.splitlines()[0][:120])
+    return (res.get("result") or {}).get("value")
+
+
+READ_LATER_MS = 250  # the read in a touch's round trip: this long after it
 
 
 def read(page, cap=600):
@@ -783,19 +819,23 @@ def settle(page, idle_ms=1200, poll_s=0.15, quiet_s=0.3, url=None, loading=False
         time.sleep(poll_s)
 
 
-def touch(page, x, y):
+def touch(page, x, y, then=()):
     """A touch at (x, y) in CSS pixels of the viewport, the way a finger
-    lands (down and up sent together: one round trip); falls back to the
-    element's own click when touch events are refused."""
+    lands (down and up sent together: one round trip), with `then`
+    (commands, a read of the page a moment later) in the same trip.
+    Returns (how, the results of `then`: a RuntimeError for one that
+    failed); falls back to the element's own click when touch events are
+    refused, and then nothing of `then` was asked."""
+    cmds = [("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [{"x": x, "y": y}]}),
+            ("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})] + list(then)
     try:
-        page.call_many([("Input.dispatchTouchEvent",
-                         {"type": "touchStart", "touchPoints": [{"x": x, "y": y}]}),
-                        ("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})],
-                       timeout=5.0)
-        return "touch"
+        res = page.call_many(cmds, timeout=5.0, raise_errors=False)
     except RuntimeError:
+        res = [RuntimeError("no answer")]
+    if any(isinstance(r, Exception) for r in res[:2]):
         page.eval("window.__burnerTarget && window.__burnerTarget.click(); 'clicked'")
-        return "click"
+        return "click", []
+    return "touch", res[2:]
 
 
 def after_touch(page, url=None, idle_ms=1200, listen_s=0.15):
@@ -832,11 +872,14 @@ def find(page, label, top=0):
 
 
 def tap(page, label, index=None, idle_ms=1200):
-    """Find the element by its words, touch it, wait for the page to
-    settle, read: {"found": True, "count": 1, "screen": ...}. {"found":
-    False} when the words aren't on the page (after one more look 0.7s
-    later); {"count": n, "labels": [...]} when several controls carry
-    them. Raises NotSent when the page can't be asked, before any touch."""
+    """Find the element by its words, touch it, read: {"found": True,
+    "count": 1, "screen": ...}. {"found": False} when the words aren't
+    on the page (after one more look 0.7s later); {"count": n, "labels":
+    [...]} when several controls carry them. Two round trips: the find,
+    then the touch with the read READ_LATER_MS after it in the same trip;
+    a touch that starts a load (the page's events say so) is waited out
+    and read afresh. Raises NotSent when the page can't be asked, before
+    any touch."""
     try:
         hit = page.eval(_js(FIND_JS, label, index))
         if not hit or not hit.get("found"):
@@ -854,17 +897,26 @@ def tap(page, label, index=None, idle_ms=1200):
         time.sleep(0.15)
         return {"found": True, "count": 1, "label": hit.get("label"),
                 "how": "chose" if hit.get("chose") else "focus", "screen": read(page)}
-    how = touch_hit(page, hit)
-    probe = after_touch(page, hit.get("url"), idle_ms)
+    how, after = touch_hit(page, hit, then=[_evaluate(_later(_js(READ_JS, 600), READ_LATER_MS))])
+    screen, ready = None, "complete"
+    if after and not page.loading:
+        try:
+            screen = _value(after[0])
+        except RuntimeError:
+            screen = None  # the document went away under the read: a load
+    if screen is None or page.loading:
+        probe = after_touch(page, hit.get("url"), idle_ms)
+        screen, ready = read(page), probe.get("ready")
     return {"found": True, "count": 1, "label": hit.get("label"), "how": how,
-            "screen": read(page), "ready": probe.get("ready")}
+            "screen": screen, "ready": ready}
 
 
-def touch_hit(page, hit):
+def touch_hit(page, hit, then=()):
     """Touch the element FIND_JS found (`hit`, with its place): what
     covers it is closed first, its place taken afresh after a scroll
     into view, a keyboard going or a popup closing, and a cover that
-    stays is bypassed with the element's own click. Returns how."""
+    stays is bypassed with the element's own click. `then` rides in the
+    touch's round trip (see touch). Returns (how, results of `then`)."""
     if hit.get("covered"):
         # something lies over the target (a date field's calendar):
         # Escape closes a widget's popup, as it would for a person
@@ -882,8 +934,8 @@ def touch_hit(page, hit):
     if hit.get("covered"):
         # still covered: the element's own click, past whatever lies over it
         page.eval("window.__burnerTarget && window.__burnerTarget.click(); 'clicked'")
-        return "click"
-    return touch(page, hit["x"], hit["y"])
+        return "click", []
+    return touch(page, hit["x"], hit["y"], then)
 
 
 def navigate(page, url, idle_ms=1000):
@@ -945,6 +997,7 @@ FILL_JS = r"""
 (function(text){
   const el = window.__burnerTarget;
   if (!el) return {ok: false, why: 'no field found'};
+  if (!el.matches('input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=image]):not([type=file]),textarea,select,[contenteditable=true],[role=textbox],[role=searchbox],[role=combobox]')) return {ok: false, why: 'not a field'};
   const squash = s => (s || '').replace(/\s+/g, ' ').trim();
   const fire = () => { el.dispatchEvent(new Event('input', {bubbles: true})); el.dispatchEvent(new Event('change', {bubbles: true})); };
   const setValue = v => { const d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value'); if (d && d.set) d.set.call(el, v); else el.value = v; fire(); };
@@ -986,12 +1039,16 @@ FILLED_JS = r"""
 
 def fill(page, label, text, index=None):
     """`text` into the field with this label (see FIND_JS with fill, and
-    FILL_JS), then a read. {"found": False} when no field has the label;
-    {"count": n} when several do; raises NotSent when the page can't be
-    asked before anything changed, RuntimeError when the field didn't
-    take the text."""
+    FILL_JS), then a read. Two round trips: the find with the fill
+    (the field focused with its content selected, or a value taken
+    outright), then the text, the check (FILLED_JS) and the read.
+    {"found": False} when no field has the label; {"count": n} when
+    several do; raises NotSent when the page can't be asked before
+    anything changed, NotDone when the field didn't take the text."""
     try:
-        hit = page.eval(_js(FIND_JS, label, index, False, True))
+        res = page.call_many([_evaluate(_js(FIND_JS, label, index, False, True)),
+                              _evaluate(_js(FILL_JS, text))], raise_errors=False)
+        hit = _value(res[0])
     except Exception as e:
         raise NotSent(str(e)[:120])
     if not hit or not hit.get("found"):
@@ -1005,7 +1062,7 @@ def fill(page, label, text, index=None):
         # page hides its box): touched, as a person would, and the text
         # goes to the field that opens (TARGET_JS), looked for once more
         # when the page is still drawing it
-        how = touch_hit(page, hit)
+        how = touch_hit(page, hit)[0]
         after_touch(page, hit.get("url"))
         target = page.eval(_js(TARGET_JS, label)) or {}
         if not target.get("ok"):
@@ -1017,31 +1074,42 @@ def fill(page, label, text, index=None):
                 label, hit.get("tag") or "button",
                 "no text field" if not n else "%d text fields, none labelled %r" % (n, label)))
         how = "tap+" + target.get("how", "fill")
-    res = page.eval(_js(FILL_JS, text))
-    if not res.get("ok"):
-        raise NotDone("%r: %s" % (label, res.get("why", "the field didn't take it")))
-    mode = res.get("mode")
+        filled = page.eval(_js(FILL_JS, text)) or {}
+    else:
+        filled = _value(res[1]) or {}
+    if not filled.get("ok"):
+        raise NotDone("%r: %s" % (label, filled.get("why", "the field didn't take it")))
+    mode = filled.get("mode")
+    cmds = []
     if mode == "insert":
-        page.call("Input.insertText", 10.0, text=text)
-        res = page.eval(_js(FILLED_JS, text))
-    elif mode == "set":
-        res = page.eval(_js(FILLED_JS, text))
-    time.sleep(0.2)  # the field's own reaction (a list of suggestions)
+        cmds.append(("Input.insertText", {"text": text}))
+    if mode in ("insert", "set"):
+        cmds.append(_evaluate(_js(FILLED_JS, text)))
+    cmds.append(_evaluate(_later(_js(READ_JS, 600), 200)))  # the field's own reaction (a list of suggestions)
+    res = page.call_many(cmds, timeout=10.0, raise_errors=False)
+    value = filled.get("value")
+    if mode in ("insert", "set"):
+        value = (_value(res[-2]) or {}).get("value")
+    try:
+        screen = _value(res[-1])
+    except RuntimeError:
+        screen = read(page)
     return {"found": True, "count": 1, "label": hit.get("label"), "mode": mode, "how": how,
-            "value": res.get("value"), "screen": read(page)}
+            "value": value, "screen": screen}
 
 
 def type_text(page, text, idle_ms=800):
     """Type `text` into the page's focused field, replacing its content
     (as the screen reader's set_text does): the content selected, the
-    text inserted the way an IME commits it, a wait for the page, a
-    read. Raises NotSent when no field has the focus."""
+    text inserted the way an IME commits it, and the read a moment
+    later, in one round trip. Raises NotSent when no field has the focus
+    (the insert then had nowhere to go)."""
     try:
-        res = page.call_many([("Runtime.evaluate", {"expression": _js(SELECT_JS, text), "returnByValue": True}),
-                              ("Input.insertText", {"text": text})])
+        res = page.call_many([_evaluate(_js(SELECT_JS, text)), ("Input.insertText", {"text": text}),
+                              _evaluate(_later(_js(READ_JS, 600), 250))], raise_errors=False)
+        sel = _value(res[0]) or {}
     except Exception as e:
         raise NotSent(str(e)[:120])
-    sel = (res[0].get("result") or {}).get("value") or {}
     if not sel.get("ok"):
         n = sel.get("fields", 0)
         raise NotSent("no field has the focus on the page" + (
@@ -1049,25 +1117,32 @@ def type_text(page, text, idle_ms=800):
     if sel.get("direct") and str(sel.get("value", "")) != text:
         raise NotDone("the %s field didn't take %r (it holds %r)"
                       % (sel.get("type"), text, sel.get("value")))
-    time.sleep(0.25)  # the field's own reaction (a list of suggestions)
-    return {"screen": read(page), "ready": "complete", "direct": bool(sel.get("direct")),
+    try:
+        screen = _value(res[2])
+    except RuntimeError:
+        screen = read(page)
+    return {"screen": screen, "ready": "complete", "direct": bool(sel.get("direct")),
             "only": bool(sel.get("only"))}
 
 
 def scroll(page, direction="down", times=1, fraction=0.6, idle_ms=500):
     """Scroll like a finger would, `times` times (or to an end: "top",
-    "bottom"), then read once the page settles. Returns the read and how
-    far it moved."""
+    "bottom"), and read once the rows are in place, all in one round
+    trip (a scroll loads nothing). Returns the read and how far it
+    moved."""
     where = direction if direction in ("top", "bottom") else None
-    dy = 0
-    if where is None:
-        h = page.eval("innerHeight") or 800
-        dy = int(h * fraction) * (1 if direction == "down" else -1)
+    step = fraction * (1 if direction == "down" else -1)
+    cmds = [_evaluate(_js(SCROLL_JS, step, where))] * (1 if where else max(1, int(times)))
+    cmds.append(_evaluate(_later(_js(READ_JS, 600), 150)))
+    res = page.call_many(cmds, timeout=10.0, raise_errors=False)
     moved = 0
-    for i in range(1 if where else max(1, int(times))):
-        r = page.eval(_js(SCROLL_JS, dy, where)) or {}
-        moved += r.get("moved") or 0
-        if i < times - 1:
-            time.sleep(0.15)
-    time.sleep(min(0.15, idle_ms / 1000.0))  # a scroll loads nothing: the rows are in place
-    return {"moved": moved, "screen": read(page), "ready": "complete"}
+    for r in res[:-1]:
+        try:
+            moved += (_value(r) or {}).get("moved") or 0
+        except RuntimeError:
+            pass
+    try:
+        screen = _value(res[-1])
+    except RuntimeError:
+        screen = read(page)
+    return {"moved": moved, "screen": screen, "ready": "complete"}

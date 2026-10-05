@@ -3707,21 +3707,47 @@ class LabelTapTests(OfflineTestCase):
             sent.append(calls)
             return [None] * (len(calls) - 1) + [SAMPLE_XML]
         dm._batch = batch
+        # the newest read is young and has the row once, whole and clear:
+        # the phone finds it by its words at tap time, in the one round
+        # trip with the wait and the read (no read first)
         dm.cmd_act(json.dumps({"tap_label": "OK"}))
-        self.assertEqual(sent[0][1], ("click", [250, 450]))
+        self.assertEqual(sent[0][1][0], "click")
+        self.assertEqual(sent[0][1][1][0]["text"], "OK")
+        self.assertEqual([m for m, _ in sent[0]],
+                         ["wakeUp", "click", "dumpWindowHierarchy", "waitForIdle", "dumpWindowHierarchy"])
+        self.assertEqual(dm.d.calls, [])
+        # the phone no longer finds it (the screen changed): nothing was
+        # tapped, the row is read afresh and tapped where it is now
+        def batch_miss(calls, timeout=45.0):
+            sent.append(calls)
+            if isinstance(calls[1][1][0], dict):
+                return [None, RuntimeError("UiObjectNotFoundException")] + [None] * (len(calls) - 3) + [SAMPLE_XML]
+            return [None] * (len(calls) - 1) + [SAMPLE_XML]
+        dm._batch = batch_miss
+        dm.cmd_act(json.dumps({"tap_label": "OK"}))
+        self.assertEqual(sent[-1][1], ("click", [250, 450]))
         self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])  # one fresh read, which agreed
+        dm._batch = batch
+        # an older read: the row is read afresh and tapped where it is now
+        dm._last_xml_t = 0
+        dm.d = _FakeServer([SAMPLE_XML], screen_on=True)
+        dm.cmd_act(json.dumps({"tap_label": "OK"}))
+        self.assertEqual(sent[-1][1], ("click", [250, 450]))
+        self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])
         # the row moved since the assistant's read (a web page's rows report
         # their old place for a moment after a scroll): it is read until
         # two reads agree on its place, three at most
         moved = SAMPLE_XML.replace("[100,400][400,500]", "[100,440][400,540]")
         moved2 = SAMPLE_XML.replace("[100,400][400,500]", "[100,460][400,560]")
         dm.d = _FakeServer([moved, moved2, moved2], screen_on=True)
+        dm._last_xml_t = 0
         dm.cmd_act(json.dumps({"tap_label": "OK"}))
         self.assertEqual(sent[-1][1], ("click", [250, 510]))
         self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"] * 3)
         # still moving after three reads: the newest place is tapped
         moved3 = SAMPLE_XML.replace("[100,400][400,500]", "[100,480][400,580]")
         dm.d = _FakeServer([moved, moved2, moved3], screen_on=True)
+        dm._last_xml_t = 0
         dm.cmd_act(json.dumps({"tap_label": "OK"}))
         self.assertEqual(sent[-1][1], ("click", [250, 530]))
         self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"] * 3)
@@ -3734,6 +3760,7 @@ class LabelTapTests(OfflineTestCase):
         self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"] * 2)
         # the read before the tap fails: nothing was sent, and it says so
         dm.d = _FakeServer([], screen_on=True)
+        dm._last_xml_t = 0
         with self.assertRaises(RuntimeError) as cm:
             dm.cmd_act(json.dumps({"tap_label": "OK"}))
         self.assertTrue(str(cm.exception).startswith("act not sent: the read before it failed"),
@@ -3745,9 +3772,19 @@ class LabelTapTests(OfflineTestCase):
         dm.d = _FakeServer([SAMPLE_XML], screen_on=True)
         sent.clear()
         dm._batch = lambda calls, timeout=45.0: sent.append(calls) or [None] * len(calls)
+        # by words, from the young read: the phone waits for the tap's
+        # acknowledgement itself, so a quiet step is the wake and the tap
         self.assertEqual(dm.cmd_act(json.dumps({"tap_label": "OK", "quiet": True, "idle": 1200})), b"ok")
-        self.assertEqual([m for m, _ in sent[0]], ["wakeUp", "click", "dumpWindowHierarchy", "waitForIdle"])
-        self.assertEqual(sent[0][1], ("click", [250, 450]))
+        self.assertEqual([m for m, _ in sent[0]], ["wakeUp", "click"])
+        self.assertEqual(sent[0][1][1][0]["text"], "OK")
+        self.assertEqual(dm.d.calls, [])
+        self.assertEqual(dm._last_xml, SAMPLE_XML)
+        # from an older read: the fresh read, the tap where the row is
+        # now, the pause and the wait; no screen sent back
+        dm._last_xml_t = 0
+        self.assertEqual(dm.cmd_act(json.dumps({"tap_label": "OK", "quiet": True, "idle": 1200})), b"ok")
+        self.assertEqual([m for m, _ in sent[1]], ["wakeUp", "click", "dumpWindowHierarchy", "waitForIdle"])
+        self.assertEqual(sent[1][1], ("click", [250, 450]))
         self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])
         self.assertEqual(dm._last_xml, SAMPLE_XML)
         self.assertEqual([m for m, _ in mod.act_calls({"key": 66, "quiet": True, "idle": 500})],
@@ -4030,7 +4067,7 @@ class _ScriptedPage(_FakePage):
     def _name(self, expression):
         for name in ("FIND_JS", "TARGET_JS", "FILL_JS", "FILLED_JS", "READ_JS", "PLACE_JS",
                      "SELECT_JS", "SETTLE_JS", "SCROLL_JS"):
-            if expression.startswith("(" + getattr(self.cdp, name)):
+            if ("(" + getattr(self.cdp, name)) in expression:
                 return name
         return expression[:40]
 
@@ -4049,9 +4086,20 @@ class _ScriptedPage(_FakePage):
         self.calls.append((method, params))
         return {}
 
-    def call_many(self, cmds, timeout=10.0):
-        self.calls.append(("many", [c[0] for c in cmds]))
-        return [{"result": {"value": self._answer("SELECT_JS")}}] + [{}] * (len(cmds) - 1)
+    def call_many(self, cmds, timeout=10.0, raise_errors=True):
+        names, out = [], []
+        for method, params in cmds:
+            if method == "Runtime.evaluate":
+                name = self._name(params.get("expression", ""))
+                names.append(name)
+                out.append({"result": {"value": self._answer(name)}})
+            else:
+                names.append(method)
+                out.append({})
+        self.calls.append(("many", names))
+        if self.answers.get("navigates") and "Input.dispatchTouchEvent" in names:
+            self.loading = True  # the touch started a load: its event came back with the batch
+        return out
 
 
 class WebPathTests(OfflineTestCase):
@@ -4430,9 +4478,11 @@ class WebPathTests(OfflineTestCase):
         with mock.patch.object(cdp.time, "sleep"):
             r = cdp.fill(page, "Search", "Pixel 7")
         self.assertEqual((r["found"], r["how"], r["value"]), (True, "tap+focus", "Pixel 7"))
-        self.assertEqual([c[1] if c[0] == "eval" else c[0] for c in page.calls],
-                         ["FIND_JS", "many", "TARGET_JS", "FILL_JS", "Input.insertText", "FILLED_JS", "READ_JS"])
-        self.assertEqual(page.calls[1], ("many", ["Input.dispatchTouchEvent", "Input.dispatchTouchEvent"]))
+        self.assertEqual(page.calls, [
+            ("many", ["FIND_JS", "FILL_JS"]),  # the fill rides with the find: a field takes it there
+            ("many", ["Input.dispatchTouchEvent", "Input.dispatchTouchEvent"]),  # not a field: touched
+            ("eval", "TARGET_JS"), ("eval", "FILL_JS"),
+            ("many", ["Input.insertText", "FILLED_JS", "READ_JS"])])
         # the touch led to a page with the box (no focus): the field with the label
         page = _ScriptedPage(cdp, {
             "FIND_JS": on_button, "TARGET_JS": [{"ok": False, "fields": 0}, {"ok": True, "how": "label", "label": "search wikipedia"}],
@@ -4442,7 +4492,7 @@ class WebPathTests(OfflineTestCase):
             r = cdp.fill(page, "Search", "Pixel 7")
         self.assertEqual(r["how"], "tap+label")
         self.assertEqual([c[1] for c in page.calls if c[0] == "eval"],
-                         ["FIND_JS", "TARGET_JS", "TARGET_JS", "FILL_JS", "FILLED_JS", "READ_JS"])
+                         ["TARGET_JS", "TARGET_JS", "FILL_JS"])
 
     def test_fill_says_when_the_button_opened_no_field(self):
         cdp = _cdp()
@@ -4454,7 +4504,7 @@ class WebPathTests(OfflineTestCase):
             cdp.fill(page, "Search", "Pixel 7")
         self.assertEqual(str(cm.exception),
                          "'Search' is a span, not a field; tapping it opened 2 text fields, none labelled 'Search'")
-        self.assertNotIn("Input.insertText", [c[0] for c in page.calls])
+        self.assertNotIn("Input.insertText", [n for c in page.calls if c[0] == "many" for n in c[1]])
 
     def test_fill_of_a_field_touches_nothing(self):
         cdp = _cdp()
@@ -4464,8 +4514,32 @@ class WebPathTests(OfflineTestCase):
             "READ_JS": WEB_SCREEN})
         with mock.patch.object(cdp.time, "sleep"):
             r = cdp.fill(page, "Email", "a@b.c")
-        self.assertEqual((r["how"], r["value"]), ("fill", "a@b.c"))
-        self.assertNotIn("many", [c[0] for c in page.calls])
+        self.assertEqual((r["how"], r["value"], r["screen"]), ("fill", "a@b.c", WEB_SCREEN))
+        # two round trips: find + fill, then the text, the check and the read
+        self.assertEqual(page.calls, [("many", ["FIND_JS", "FILL_JS"]),
+                                      ("many", ["Input.insertText", "FILLED_JS", "READ_JS"])])
+
+    def test_tap_reads_the_page_in_the_touch_round_trip(self):
+        cdp = _cdp()
+        found = {"found": True, "count": 1, "label": "box score", "x": 300, "y": 400, "url": "u"}
+        page = _ScriptedPage(cdp, {"FIND_JS": found, "READ_JS": WEB_SCREEN})
+        r = cdp.tap(page, "Box Score")
+        self.assertEqual((r["how"], r["ready"], r["screen"]), ("touch", "complete", WEB_SCREEN))
+        self.assertEqual(page.calls, [("eval", "FIND_JS"),
+                                      ("many", ["Input.dispatchTouchEvent", "Input.dispatchTouchEvent", "READ_JS"])])
+        # the touch started a load: the read that rode along is not the
+        # new page; it is waited out and read afresh
+        page = _ScriptedPage(cdp, {"FIND_JS": found, "READ_JS": WEB_SCREEN, "navigates": True})
+        r = cdp.tap(page, "Box Score")
+        self.assertEqual(page.calls[-1], ("eval", "READ_JS"))
+        self.assertEqual(r["screen"], WEB_SCREEN)
+
+    def test_scroll_is_one_round_trip(self):
+        cdp = _cdp()
+        page = _ScriptedPage(cdp, {"SCROLL_JS": {"moved": 1200, "scroller": "page"}, "READ_JS": WEB_SCREEN})
+        r = cdp.scroll(page, "down", times=2)
+        self.assertEqual((r["moved"], r["screen"]), (2400, WEB_SCREEN))
+        self.assertEqual(page.calls, [("many", ["SCROLL_JS", "SCROLL_JS", "READ_JS"])])
 
     def test_type_takes_the_one_field_in_view_when_nothing_has_the_focus(self):
         cdp = _cdp()
@@ -4474,7 +4548,8 @@ class WebPathTests(OfflineTestCase):
         with mock.patch.object(cdp.time, "sleep"):
             r = cdp.type_text(page, "Pixel 7")
         self.assertTrue(r["only"])
-        self.assertEqual(page.calls[0], ("many", ["Runtime.evaluate", "Input.insertText"]))
+        self.assertEqual(r["screen"], WEB_SCREEN)
+        self.assertEqual(page.calls, [("many", ["SELECT_JS", "Input.insertText", "READ_JS"])])
         page = _ScriptedPage(cdp, {"SELECT_JS": {"ok": False, "fields": 2}})
         with self.assertRaises(cdp.NotSent) as cm:
             cdp.type_text(page, "Pixel 7")
