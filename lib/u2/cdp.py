@@ -497,6 +497,22 @@ def _visible_one(found):
     return page
 
 
+def _close_dead(dev, ids, found, urls, hint, keep):
+    """Tabs at the hinted address that refused their probe (a renderer
+    long gone: leftovers of earlier opens of that link), closed through
+    DevTools once the visible page (`keep`) is known, so later scans
+    stop wading through them (six dead tabs at one address answered
+    "refused" first on every cold open, Oct 5). Best effort, a second
+    at most per tab."""
+    for i, p in zip(ids, found):
+        if (i != keep and isinstance(p, ConnectionError) and hint
+                and same_address(urls.get(i, ""), hint)):
+            try:
+                http_get(dev, "/json/close/" + i, timeout=1.0)
+            except Exception:
+                pass
+
+
 def _answer(p):
     if isinstance(p, Page):
         return "hidden"
@@ -545,6 +561,7 @@ def front_page(dev, current=None, first_probe_s=None, hint=None, quick=False):
     found = _probe(dev, ids, None if quick else first_probe_s, slow=() if quick else hinted)
     page = _visible_one(found)
     if page is not None:
+        _close_dead(dev, ids, found, urls, hint, page.target)
         return page
     if (not quick and first_probe_s is None and not isinstance(found[0], Page)
             and not isinstance(found[0], ConnectionError)):
@@ -563,6 +580,7 @@ def front_page(dev, current=None, first_probe_s=None, hint=None, quick=False):
         found2 = _probe(dev, more)
         page = _visible_one(found2)
         if page is not None:
+            _close_dead(dev, ids, found, urls, hint, page.target)
             return page
         ids, found = ids + more, found + found2
     # the first tabs (the current one, the hinted ones) by name, the

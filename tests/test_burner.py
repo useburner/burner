@@ -7143,6 +7143,34 @@ class AirbnbRoundTests(OfflineTestCase):
             page = cdp.front_page(None, hint="airbnb.com/s/Woodbury/ho…")
         self.assertEqual((page.target, len(probes)), ("D", 4))
 
+    def test_dead_tabs_at_the_link_s_address_are_closed_once_the_page_is_found(self):
+        # six dead tabs at one address answered "refused" first on every
+        # cold open (Oct 5): leftovers of earlier opens, closed through DevTools
+        cdp = _cdp()
+        closed = []
+
+        class Tab:
+            def __init__(self, dev, target, probe_s=None):
+                self.target, self.visible_at = target, (1.0 if target == "D" else 0.0)
+                if target in ("B", "C"):
+                    raise ConnectionError("refused")
+
+            def close(self):
+                pass
+        tabs = [{"id": "A", "url": "https://www.airbnb.com/s/homes"}, {"id": "B", "url": "https://www.airbnb.com/s/homes"},
+                {"id": "C", "url": "https://www.espn.com/nfl/"}, {"id": "D", "url": "https://www.airbnb.com/s/homes"}]
+        with mock.patch.object(cdp, "Page", Tab), mock.patch.object(cdp, "pages", lambda dev: tabs), \
+                mock.patch.object(cdp, "http_get", lambda dev, path, timeout=4.0: closed.append(path) or {}):
+            page = cdp.front_page(None, hint="https://www.airbnb.com/s/homes")
+        self.assertEqual(page.target, "D")
+        self.assertEqual(closed, ["/json/close/B"])  # dead and at the address; not C (elsewhere), not A (alive), not D
+        # no hint: nothing closed
+        closed.clear()
+        with mock.patch.object(cdp, "Page", Tab), mock.patch.object(cdp, "pages", lambda dev: tabs), \
+                mock.patch.object(cdp, "http_get", lambda dev, path, timeout=4.0: closed.append(path) or {}):
+            cdp.front_page(None)
+        self.assertEqual(closed, [])
+
     def test_front_page_after_a_launch_is_one_short_round(self):
         # quick: the first tabs and the hinted ones, short bounds, no long
         # second look at the first tab, no sweep of the others
