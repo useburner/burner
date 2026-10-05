@@ -1263,6 +1263,28 @@ class U2Daemon:
                 xml = self._page_xml(r["screen"])
                 self._remember(xml)
             return xml.encode()
+        if "set_text" in spec and spec.get("field") and self._page() is not None:
+            # Text into the page's field with this label, by the page
+            # (cdp.fill): found by its label, the value set on that very
+            # element. One op for `type --field`.
+            with self._lock:
+                self.invalidate()
+                try:
+                    with _t("web fill"):
+                        r = _cdp().fill(self._web, spec["field"], str(spec["set_text"]),
+                                        spec.get("index"))
+                except _cdp().NotSent as e:
+                    raise RuntimeError("act not sent: %s" % e)
+                except Exception as e:
+                    self._web = None
+                    raise RuntimeError("act failed after sending: %s" % err_text(e, 120))
+                if not r.get("found"):
+                    raise RuntimeError("act not sent: no field labelled %r on the page" % spec["field"])
+                if r.get("count", 1) != 1:
+                    raise RuntimeError("act not sent: %d fields read %r" % (r["count"], spec["field"]))
+                xml = self._page_xml(r["screen"])
+                self._remember(xml)
+            return xml.encode()
         if "set_text" in spec and self._page() is not None:
             # Text into a page's focused field, by the page (cdp.type_text).
             with self._lock:

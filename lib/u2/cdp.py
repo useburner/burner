@@ -451,7 +451,7 @@ READ_JS = r"""
 # it is scrolled into view). Several controls: their count and words,
 # no choice, unless `index` picks one.
 FIND_JS = r"""
-(function(label, index, query){
+(function(label, index, query, fill){
   const squash = s => (s || '').replace(/\s+/g, ' ').trim();
   const own = el => { let t = ''; for (const c of el.childNodes) if (c.nodeType === 3) t += c.nodeValue; return squash(t); };
   const attr = el => squash(el.getAttribute('aria-label') || el.getAttribute('alt') || el.getAttribute('title') || el.getAttribute('placeholder') || (el.tagName === 'INPUT' ? el.value : ''));
@@ -502,6 +502,14 @@ FIND_JS = r"""
     s.dispatchEvent(new Event('input', {bubbles: true}));
     s.dispatchEvent(new Event('change', {bubbles: true}));
     return {found: true, count: 1, used: used, label: squash(el.text).slice(0, 60), chose: true, url: location.href};
+  }
+  if (fill) {
+    // the field to fill: kept for FILL_JS, never touched (a touch opens a
+    // picker or moves a slider; a text field is focused there)
+    if (!inView(r)) el.scrollIntoView({block: 'center', inline: 'nearest'});
+    window.__burnerTarget = el;
+    return {found: true, count: 1, used: used, label: (names(el)[0] || '').slice(0, 60),
+            tag: el.tagName.toLowerCase(), type: (el.type || '').toLowerCase(), url: location.href};
   }
   if (!query && el.tagName === 'INPUT' && /^(date|time|month|week|datetime-local|color|range)$/.test(el.type)) {
     // focused, not touched (a touch opens Chrome's native picker, which a
@@ -801,6 +809,83 @@ SELECT_JS = r"""
   } catch (e) {}
   return {ok: true, direct: false, type: type};
 })"""
+
+
+# The field FIND kept (window.__burnerTarget) given `text`: a dropdown
+# takes the option with those words; a date, time, color or range field
+# takes it as its value; a checkbox or radio takes on/off; a text field
+# is focused with its content selected, for the text that follows
+# (Input.insertText), unless it can't take the focus.
+FILL_JS = r"""
+(function(text){
+  const el = window.__burnerTarget;
+  if (!el) return {ok: false, why: 'no field found'};
+  const squash = s => (s || '').replace(/\s+/g, ' ').trim();
+  const fire = () => { el.dispatchEvent(new Event('input', {bubbles: true})); el.dispatchEvent(new Event('change', {bubbles: true})); };
+  const setValue = v => { const d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value'); if (d && d.set) d.set.call(el, v); else el.value = v; fire(); };
+  const tag = el.tagName.toLowerCase(), type = (el.type || '').toLowerCase();
+  if (tag === 'select') {
+    const want = squash(text).toLowerCase();
+    const o = Array.from(el.options).find(o => squash(o.text).toLowerCase() === want) || Array.from(el.options).find(o => squash(o.text).toLowerCase().includes(want));
+    if (!o) return {ok: false, why: 'no option ' + JSON.stringify(text)};
+    el.value = o.value; fire();
+    return {ok: true, mode: 'option', value: squash(o.text)};
+  }
+  if (type === 'checkbox' || type === 'radio') {
+    const on = /^(on|yes|true|1|checked|x)$/i.test(squash(text));
+    if (el.checked !== on) { el.click(); }
+    return {ok: true, mode: 'check', value: el.checked ? 'on' : 'off'};
+  }
+  if (/^(date|time|month|week|datetime-local|color|range)$/.test(type)) {
+    setValue(text);
+    return {ok: true, mode: 'value', value: el.value};
+  }
+  if (el.disabled || el.readOnly) return {ok: false, why: 'the field is ' + (el.disabled ? 'disabled' : 'read-only')};
+  try { el.focus(); if (typeof el.select === 'function') el.select(); else { const r = document.createRange(); r.selectNodeContents(el); const s = getSelection(); s.removeAllRanges(); s.addRange(r); } } catch (e) {}
+  return {ok: true, mode: document.activeElement === el ? 'insert' : 'set', value: ''};
+})"""
+
+# After the insert: the field holds the text, or takes it outright.
+FILLED_JS = r"""
+(function(text){
+  const el = window.__burnerTarget;
+  if (!el) return {ok: false};
+  const got = el.isContentEditable ? el.textContent : el.value;
+  if ((got || '') === text) return {ok: true, value: got};
+  const d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
+  if (el.isContentEditable) el.textContent = text; else if (d && d.set) d.set.call(el, text); else el.value = text;
+  el.dispatchEvent(new Event('input', {bubbles: true})); el.dispatchEvent(new Event('change', {bubbles: true}));
+  return {ok: true, value: el.isContentEditable ? el.textContent : el.value, set: true};
+})"""
+
+
+def fill(page, label, text, index=None):
+    """`text` into the field with this label (see FIND_JS with fill, and
+    FILL_JS), then a read. {"found": False} when no field has the label;
+    {"count": n} when several do; raises NotSent when the page can't be
+    asked before anything changed, RuntimeError when the field didn't
+    take the text."""
+    try:
+        hit = page.eval(_js(FIND_JS, label, index, False, True))
+    except Exception as e:
+        raise NotSent(str(e)[:120])
+    if not hit or not hit.get("found"):
+        return {"found": False, "screen": read(page)}
+    if hit.get("count", 1) != 1:
+        hit["screen"] = read(page)
+        return hit
+    res = page.eval(_js(FILL_JS, text))
+    if not res.get("ok"):
+        raise RuntimeError("%r: %s" % (label, res.get("why", "the field didn't take it")))
+    mode = res.get("mode")
+    if mode == "insert":
+        page.call("Input.insertText", 10.0, text=text)
+        res = page.eval(_js(FILLED_JS, text))
+    elif mode == "set":
+        res = page.eval(_js(FILLED_JS, text))
+    time.sleep(0.2)  # the field's own reaction (a list of suggestions)
+    return {"found": True, "count": 1, "label": hit.get("label"), "mode": mode,
+            "value": res.get("value"), "screen": read(page)}
 
 
 def type_text(page, text, idle_ms=800):

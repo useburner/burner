@@ -4225,6 +4225,44 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(dm._last_xml, SAMPLE_XML)  # and that look is the newest read
         self.assertIsNone(dm._web)
 
+    def test_helper_fills_a_field_by_its_label(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = self._fake_cdp(mod, calls)
+
+        def fill(page, label, text, index=None):
+            calls.append(("fill", label, text, index))
+            if label == "Nope":
+                return {"found": False, "screen": WEB_SCREEN}
+            return {"found": True, "count": 1, "label": label, "mode": "value", "value": text,
+                    "screen": WEB_SCREEN}
+        fake.fill = fill
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        dm._batch = lambda calls, timeout=45.0: self.fail("a page fill must not use the screen reader")
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        xml = dm.cmd_act(json.dumps({"set_text": "2026-10-05", "field": "Date picker"})).decode()
+        self.assertEqual(calls[-1], ("fill", "Date picker", "2026-10-05", None))
+        self.assertIn("WebView", xml)
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"set_text": "x", "field": "Nope"}))
+        self.assertEqual(str(cm.exception), "act not sent: no field labelled 'Nope' on the page")
+
+    def test_type_into_a_labelled_field_is_one_helper_op(self):
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append((cmd, json.loads(arg)))
+            return _cdp().page_xml(WEB_SCREEN, 283, 2400)
+        self.allow("u2sock", side_effect=u2)
+        self.allow("nav_record")
+        with self.cap() as (out, err):
+            rc = pc.cmd_type(self.parse(["type", "--field", "Date picker", "2026-10-05"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual(calls, [("act", {"set_text": "2026-10-05", "field": "Date picker", "idle": 1200})])
+        self.assertIn("typed 10 chars into Date picker", out.getvalue())
+
     def test_helper_opens_a_link_in_the_page(self):
         mod = _u2mux()
         EmptyScreenTests.no_sleep(self, mod)

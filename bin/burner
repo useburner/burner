@@ -2545,8 +2545,15 @@ def cmd_type(args):
                                   clear_keys=args.clear_keys)
         read_after(quiet=quiet)
         return rc
-    # --field: focus the field first. One on-phone click by its label where
-    # the UI helper can (no screen read here), else a read and a tap.
+    # --field: on a page in Chrome the UI helper fills the field with this
+    # label in one op (found by its label, the value set on that element:
+    # a color field takes no focus on Android, and typed text went to the
+    # last text field). Elsewhere: focus the field first, then type.
+    if args.field and not args.slow and not quiet:
+        status, root, note = act_and_read({"set_text": args.text, "field": args.field})
+        if status == "ok" or status == "lost" or status.startswith("failed"):
+            print("typed {} chars into {}".format(len(args.text), args.field))
+            return print_act(status, root, note, "typing")
     if args.field:
         got = focus_field(args.field)
         if got == "missing":
