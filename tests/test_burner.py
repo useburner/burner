@@ -3444,33 +3444,33 @@ class LabelTapTests(OfflineTestCase):
             pc.cmd_tap(self.parse(["tap", "OK", "--index", "1"]))
         self.assertNotIn("tap_label", calls[0])
 
-    def test_helper_label_selector(self):
+    def test_helper_label_target(self):
         mod = _u2mux()
-        try:
-            import uiautomator2._selector  # noqa: F401
-        except ImportError:
-            import types
+        # the node's centre, by text or by description, case-insensitive
+        self.assertEqual(mod.label_target(SAMPLE_XML, "ok"), (250, 450))
+        self.assertEqual(mod.label_target(SAMPLE_XML, "Missing || Search"), (500, 650))
+        with self.assertRaises(RuntimeError):
+            mod.label_target(AMBI_XML, "OK")  # two rows read OK
+        with self.assertRaises(RuntimeError):
+            mod.label_target(SAMPLE_XML, "Nope")
+        # a tap by label is a click by coordinates: a touch, no lookup on
+        # the phone (the selector click threw on a web node, Oct 4)
+        dm = mod.U2Daemon.__new__(mod.U2Daemon)
+        import threading
+        dm._lock, dm._cache_lock = threading.RLock(), threading.Lock()
+        dm._gen, dm._cache = 0, None
+        dm._last_restart, dm._restart_error = -1e9, None
+        dm._mute_since, dm._wordless_seen = None, False
+        dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()
+        dm.d = _FakeServer([], screen_on=True)
+        sent = []
 
-            class Selector(dict):
-                def __init__(self, **kw):
-                    super().__init__(kw)
-            fake = types.ModuleType("uiautomator2._selector")
-            fake.Selector = Selector
-            pkg = types.ModuleType("uiautomator2")
-            pkg._selector = fake
-            sys.modules.setdefault("uiautomator2", pkg)
-            sys.modules["uiautomator2._selector"] = fake
-            self.addCleanup(sys.modules.pop, "uiautomator2._selector", None)
-        sel = mod.label_selector(SAMPLE_XML, "ok")
-        self.assertEqual(sel.get("text"), "OK")
-        sel = mod.label_selector(SAMPLE_XML, "Missing || Search")
-        self.assertEqual(sel.get("description"), "Search")
-        with self.assertRaises(RuntimeError):
-            mod.label_selector(AMBI_XML, "OK")  # two rows read OK
-        with self.assertRaises(RuntimeError):
-            mod.label_selector(SAMPLE_XML, "Nope")
-        calls = mod.act_calls({"tap_selector": {"text": "OK"}})
-        self.assertEqual(calls[1], ("click", [{"text": "OK"}]))
+        def batch(calls, timeout=45.0):
+            sent.append(calls)
+            return [None] * (len(calls) - 1) + [SAMPLE_XML]
+        dm._batch = batch
+        dm.cmd_act(json.dumps({"tap_label": "OK"}))
+        self.assertEqual(sent[0][1], ("click", [250, 450]))
 
 
 class StartAndSettingsTests(OfflineTestCase):
@@ -3923,7 +3923,7 @@ class EmptyScreenTests(OfflineTestCase):
 
     def test_helper_act_calls_wake_first(self):
         mod = _u2mux()
-        for spec in ({"tap": [1, 2]}, {"key": 4}, {"tap_selector": {"text": "OK"}}):
+        for spec in ({"tap": [1, 2]}, {"key": 4}, {"tap": [250, 450]}):
             calls = mod.act_calls(spec)
             self.assertEqual(calls[0], ("wakeUp", []), spec)
             self.assertIn(calls[1][0], mod.ACTION_METHODS)
@@ -4138,7 +4138,7 @@ class EmptyScreenTests(OfflineTestCase):
         dm._batch = lambda calls, timeout=45.0: [None, RuntimeError("no such element")] + \
             [SAMPLE_XML] * (len(calls) - 2)
         with self.assertRaises(RuntimeError) as cm:
-            dm.cmd_act(json.dumps({"tap_selector": {"text": "OK"}}))
+            dm.cmd_act(json.dumps({"tap": [250, 450]}))
         self.assertEqual(str(cm.exception), "act failed after sending: no such element")
         # a POWER key's blank read after is expected: no fix, no error, no cache
         dm._batch = lambda calls, timeout=45.0: [None] * (len(calls) - 1) + [SHADE_XML]

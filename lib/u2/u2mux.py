@@ -502,20 +502,19 @@ def batch_results(replies, n):
     return out
 
 
-def label_selector(xml, label):
-    """A uiautomator selector for the one node on this read whose text or
+def label_target(xml, label):
+    """The centre (x, y) of the one node on this read whose text or
     description is `label` (case-insensitive exact; "A || B" tries each).
-    Raises RuntimeError when there is no such node or more than one."""
+    A tap by coordinates injects a touch and looks nothing up: the
+    server's click by selector threw a NullPointerException on a web node
+    in Chrome (espn.com, Oct 4). Raises RuntimeError when there is no
+    such node or more than one."""
     nodes = list(iter_nodes(xml or ""))
     for alt in [p.strip() for p in label.split("||") if p.strip()]:
         low = alt.lower()
         hits = [n for n in nodes if low in (n["text"].lower(), n["desc"].lower())]
         if len(hits) == 1:
-            n = hits[0]
-            from uiautomator2._selector import Selector
-            if n["text"].lower() == low:
-                return dict(Selector(text=n["text"]))
-            return dict(Selector(description=n["desc"]))
+            return tuple(hits[0]["center"])
         if len(hits) > 1:
             raise RuntimeError("%d rows read %r" % (len(hits), alt))
     raise RuntimeError("not on the last read")
@@ -537,8 +536,6 @@ def act_calls(spec):
     if "tap" in spec:
         x, y = spec["tap"]
         calls.append(("click", [int(x), int(y)]))
-    elif "tap_selector" in spec:
-        calls.append(("click", [spec["tap_selector"]]))
     elif "key" in spec:
         calls.append(("pressKeyCode", [int(spec["key"])]))
     elif "set_text" in spec:
@@ -968,7 +965,7 @@ class U2Daemon:
             if _time.monotonic() - self._last_xml_t > 30:
                 raise RuntimeError("act not sent: the last read is too old")
             try:
-                spec["tap_selector"] = label_selector(self._last_xml, label)
+                spec["tap"] = list(label_target(self._last_xml, label))
             except RuntimeError as e:
                 raise RuntimeError("act not sent: %s" % e)
         calls = act_calls(spec)
