@@ -1469,6 +1469,50 @@ def system_prompt(nodes, w, h):
         if not (always or questions or decided or titled):
             continue
         return {"text": message, "options": options[:8], "package": pkg}
+    return app_prompt(nodes, w, h)
+
+
+ASKING_RE = re.compile(r"\b(wants to|would like to|is asking|asks? (for|you)|allow .+ to)\b", re.I)
+
+
+def _decides(words):
+    """True for a button that answers a prompt (Allow this time, Never
+    allow, Block, Not now...)."""
+    low = words.lower()
+    return low in DECISION_WORDS or low.startswith(("allow", "never allow", "don't allow", "block",
+                                                    "deny", "not now", "no thanks", "turn on"))
+
+
+def app_prompt(nodes, w, h):
+    """A question the app in front asks in a dialog of its own (Chrome's
+    "browserleaks.com wants to use your device's location" with Allow
+    while visiting the site / Allow this time / Never allow, Oct 5; an
+    app's own ask for notifications before the system's): a row that
+    asks, inside a dialog-sized box that holds a button answering it.
+    {"text", "options", "package"} or None. A page's own rows (under a
+    WebView that fills the screen) are the page's: not this. Pure."""
+    for n in nodes:
+        words = _row_words(n)
+        if not words or n.get("clickable"):
+            continue
+        if "?" not in words and not ASKING_RE.search(words):
+            continue
+        for box in reversed(n.get("parents", ())):  # the nearest box first
+            r = _bounds_rect(box.attrib.get("bounds"))
+            if not r:
+                continue
+            if r[3] - r[1] >= 0.8 * h:
+                break  # the whole screen (a page under its WebView): no dialog
+            buttons, seen = [], set()
+            for k in box.iter("node"):
+                if k.attrib.get("clickable") != "true":
+                    continue
+                kw = (k.attrib.get("text") or k.attrib.get("content-desc") or "").strip()
+                if kw and kw != words and kw not in seen and len(kw) <= 40:
+                    seen.add(kw)
+                    buttons.append(kw)
+            if any(_decides(b) for b in buttons):
+                return {"text": words[:160], "options": buttons[:8], "package": n.get("package") or ""}
     return None
 
 

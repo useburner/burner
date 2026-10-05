@@ -747,9 +747,10 @@ def window_over(windows_xml, rect, front_pkg):
         return None
     x1, y1, x2, y2 = rect
     area = max(1, (x2 - x1) * (y2 - y1))
+    fronts = {front_pkg} if isinstance(front_pkg, str) else set(front_pkg or ())
     for w in root:  # the windows, each a root under the hierarchy
         pkg = w.get("package") or ""
-        if not pkg or pkg == front_pkg or any(k in pkg.lower() for k in U2Daemon.IME_HINTS):
+        if not pkg or pkg in fronts or any(k in pkg.lower() for k in U2Daemon.IME_HINTS):
             continue
         m = _BOUNDS_RE.match(w.get("bounds", ""))
         if not m:
@@ -768,9 +769,10 @@ class _Look(threading.Thread):
     over the page is seen without a round trip of its own. Started at
     once; `over` has the answer."""
 
-    def __init__(self, dm):
+    def __init__(self, dm, front=None):
         super().__init__(daemon=True)
         self.dm, self.xml, self.error = dm, None, None
+        self.front = front  # the page's app, when the newest read doesn't show it (just launched)
         self.start()
 
     def run(self):
@@ -794,8 +796,10 @@ class _Look(threading.Thread):
             info = screen_of(last) if last else None
             rect = webview_rect(last) or ((0, 0, info[0], info[1]) if info else None)
             if rect is None:
+                rect = (0, 0, 1080, 2400) if self.front else None
+            if rect is None:
                 return None
-            return window_over(self.xml, rect, info[2] if info else "")
+            return window_over(self.xml, rect, self.front or (info[2] if info else ""))
         except Exception as e:
             log("the look at the windows couldn't be read (%s); the page's read stands" % err_text(e, 80))
             return None
@@ -1170,13 +1174,13 @@ class U2Daemon:
                     return self._web
                 except Exception as e:
                     current = None
-                    if i == self.LAUNCH_CONTACT_TRIES - 1 or not isinstance(e, (OSError, ValueError)):
+                    if i == self.LAUNCH_CONTACT_TRIES - 1:
                         self._web = None
                         self._web_retry_at = _time.monotonic() + WEB_BUSY_RETRY_S
                         log("the page in Chrome is out of reach after the launch (%s); the screen reader"
                             % err_text(e, 100))
                         return None
-                    _time.sleep(0.3)  # Chrome still starting: its DevTools side isn't up yet
+                    _time.sleep(0.3)  # Chrome still starting, or its tab not yet visible
         if current is not None and not _cdp().visible(current, _cdp().QUICK_PROBE_S):
             # The page in hand didn't answer at once: it left the front,
             # or it is busy (right after a navigation). One look at the
@@ -1259,7 +1263,10 @@ class U2Daemon:
         page = self._page(assume_chrome)
         if page is None:
             return None
-        look = _Look(self)  # the phone's windows, read meanwhile
+        # the phone's windows, read meanwhile; after a launch the page's
+        # app is Chrome, whatever the newest read showed (the launcher:
+        # its look took Chrome's own window for one over the page, Oct 5)
+        look = _Look(self, front=set(_cdp().CHROME_PACKAGES) if assume_chrome else None)
         try:
             with _t("web read"):
                 screen = _cdp().read(page)

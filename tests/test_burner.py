@@ -4683,6 +4683,7 @@ class WebPathTests(OfflineTestCase):
             return {"moved": 1200, "screen": WEB_SCREEN}
         fake = types.SimpleNamespace(
             is_chrome=real.is_chrome, page_xml=real.page_xml, NotSent=real.NotSent, NotDone=real.NotDone,
+            CHROME_PACKAGES=real.CHROME_PACKAGES, LOAD_PROBE_S=real.LOAD_PROBE_S,
             front_page=lambda dev, current=None: _FakePage(), visible=lambda page, timeout=1.5: True,
             QUICK_PROBE_S=0.7,
             read=lambda page, cap=160: calls.append(("read",)) or WEB_SCREEN,
@@ -6734,6 +6735,74 @@ class CoordinateTapTests(OfflineTestCase):
                 mock.patch.object(cdp, "pages", lambda dev: [{"id": "A"}]):
             with self.assertRaises(RuntimeError):
                 cdp.front_page(None)
+
+    def test_chrome_s_own_site_prompt_is_a_question_for_the_user(self):
+        # browserleaks.com/geo in Chrome, Oct 5: Chrome's own dialog, in its window
+        chrome = """<hierarchy rotation="0">
+  <node text="" class="android.widget.FrameLayout" package="com.android.chrome" bounds="[0,0][1080,2400]" clickable="false" enabled="true">
+    <node text="" content-desc="Web View" class="android.webkit.WebView" package="com.android.chrome" bounds="[0,283][1080,2254]" clickable="false" enabled="true"/>
+    <node text="browserleaks.com/geo" class="android.widget.EditText" package="com.android.chrome" bounds="[200,160][700,260]" clickable="true" enabled="true"/>
+    <node text="" content-desc="browserleaks.com wants to use your device's location" class="android.widget.LinearLayout" package="com.android.chrome" bounds="[27,650][1053,1969]" clickable="false" enabled="true">
+      <node text="browserleaks.com wants to use your device's location" class="android.widget.TextView" package="com.android.chrome" bounds="[195,713][990,828]" clickable="false" enabled="true"/>
+      <node text="Precise" class="android.widget.TextView" package="com.android.chrome" bounds="[337,950][843,1008]" clickable="false" enabled="true"/>
+      <node text="Approximate" class="android.widget.TextView" package="com.android.chrome" bounds="[337,1213][843,1271]" clickable="false" enabled="true"/>
+      <node text="Allow while visiting the site" class="android.widget.Button" package="com.android.chrome" bounds="[90,1459][990,1608]" clickable="true" enabled="true"/>
+      <node text="Allow this time" class="android.widget.Button" package="com.android.chrome" bounds="[90,1608][990,1757]" clickable="true" enabled="true"/>
+      <node text="Never allow" class="android.widget.Button" package="com.android.chrome" bounds="[90,1757][990,1906]" clickable="true" enabled="true"/>
+    </node>
+  </node>
+</hierarchy>"""
+        root = ET.fromstring(chrome)
+        pc._update_screen_from_dump(root)
+        asked = pc.system_prompt(pc.walk(root), 1080, 2400)
+        self.assertEqual(asked["text"], "browserleaks.com wants to use your device's location")
+        self.assertEqual(asked["options"], ["Allow while visiting the site", "Allow this time", "Never allow"])
+        with self.cap() as (out, err):
+            pc.print_screen(root)
+        self.assertIn("asked: browserleaks.com wants to use your device's location | options: Allow while visiting the site / Allow this time / Never allow", out.getvalue())
+        # an app's own ask before the system's, in a dialog of its own
+        own = SAMPLE_XML.replace("</hierarchy>", """  <node text="" class="android.widget.LinearLayout" package="com.example" bounds="[60,800][1020,1500]" clickable="false" enabled="true">
+    <node text="Vinted would like to send you notifications" class="android.widget.TextView" package="com.example" bounds="[100,850][980,950]" clickable="false" enabled="true"/>
+    <node text="Not now" class="android.widget.Button" package="com.example" bounds="[100,1300][500,1420]" clickable="true" enabled="true"/>
+    <node text="Turn on" class="android.widget.Button" package="com.example" bounds="[560,1300][980,1420]" clickable="true" enabled="true"/>
+  </node>
+</hierarchy>""")
+        asked = pc.system_prompt(pc.walk(ET.fromstring(own)), 1080, 2400)
+        self.assertEqual((asked["text"], asked["options"]), ("Vinted would like to send you notifications", ["Not now", "Turn on"]))
+        # a page's own rows that ask (a cookie banner's words under the WebView that fills the screen) are the page's
+        page = _cdp().page_xml(dict(WEB_SCREEN, rows=[{"text": "This site wants to use cookies", "kind": "text", "l": 0, "t": 100, "w": 400, "h": 30},
+                                                     {"text": "Allow", "kind": "button", "click": True, "l": 0, "t": 150, "w": 100, "h": 30}]), 283, 2400)
+        self.assertIsNone(pc.system_prompt(pc.walk(ET.fromstring(page)), 1080, 2400))
+        self.assertIsNone(pc.system_prompt(pc.walk(ET.fromstring(SAMPLE_XML)), 1080, 2400))
+
+    def test_the_look_after_a_launch_knows_the_page_s_app(self):
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = WebPathTests._fake_cdp(self, mod, calls)
+        fake.LOAD_PROBE_S = 6.0
+        fake.CHROME_PACKAGES = ("com.android.chrome",)
+        fake.front_page = lambda dev, current=None, first_probe_s=None: _FakePage()
+        dm = EmptyScreenTests._daemon(self, mod)
+        launcher = SAMPLE_XML.replace("com.example", "com.google.android.apps.nexuslauncher")
+        dm._last_xml, dm._last_xml_t = launcher, mod._time.monotonic()  # the read before: HOME
+        # Chrome's own window fills the screen: not one over the page
+        dm.d = _FakeServer([], windows=BARS_WINDOWS)
+        self.assertIn('text="Box Score"', dm.cmd_dump("page").decode())
+        # the shade over Chrome right after the launch: still said
+        dm.d = _FakeServer([], windows=SHADE_WINDOWS)
+        self.assertEqual(dm.cmd_dump("page"), b"")
+        # a tab not yet visible right after the launch is asked again, then found
+        answers = iter([RuntimeError("no visible page in Chrome's first 3 tabs"), _FakePage()])
+
+        def late(dev, current=None, first_probe_s=None):
+            a = next(answers)
+            if isinstance(a, Exception):
+                raise a
+            return a
+        fake.front_page = late
+        dm.d = _FakeServer([], windows=BARS_WINDOWS)
+        self.assertIn('text="Box Score"', dm.cmd_dump("page").decode())
 
     def test_a_cold_open_asks_the_page_straight_after_the_launch(self):
         # Chrome not in front: the helper can't open the link in a page,
