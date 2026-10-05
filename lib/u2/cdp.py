@@ -227,6 +227,7 @@ class Page:
         self.target = target
         self.ws = WebSocket(open_stream(dev), "/devtools/page/" + target)
         self.n = 0
+        self.visible_at = 0.0  # when a probe last said the page was visible
 
     def call(self, method, timeout=10.0, **params):
         self.n += 1
@@ -265,8 +266,11 @@ def front_page(dev, current=None):
     it). Raises RuntimeError when no page is visible (Chrome isn't in
     front, or shows a native screen)."""
     if current is not None:
+        if time.monotonic() - current.visible_at < 1.5:
+            return current  # a probe just said so: no round trip
         try:
             if current.eval("document.visibilityState", timeout=3.0) == "visible":
+                current.visible_at = time.monotonic()
                 return current
         except Exception:
             pass
@@ -280,6 +284,7 @@ def front_page(dev, current=None):
             continue
         try:
             if p.eval("document.visibilityState", timeout=3.0) == "visible":
+                p.visible_at = time.monotonic()
                 return p
         except Exception:
             pass
@@ -310,8 +315,7 @@ READ_JS = r"""
     if (used.some(a => a.contains(el))) continue;
     const r = el.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0 || r.bottom <= 0 || r.top >= vh || r.right <= 0 || r.left >= vw) continue;
-    const cs = getComputedStyle(el);
-    if (cs.visibility === 'hidden' || cs.display === 'none' || cs.opacity === '0') continue;
+    if (el.checkVisibility ? !el.checkVisibility({visibilityProperty: true, opacityProperty: true}) : false) continue;
     const field = el.matches(FIELD), check = el.matches(CHECK), active = el.matches(ACTIVE);
     let text = own(el), desc = attr(el);
     if (!text && !desc && active && !field) { const t = squash(el.innerText); if (t && t.length <= 80) { text = t; used.push(el); } }
@@ -337,41 +341,48 @@ READ_JS = r"""
 # The element with these words (exact, case-insensitive, whitespace
 # squashed; "A || B" tries each; then as a part of longer words), scrolled
 # into view when it is partly out, and its centre in CSS pixels of the
-# viewport. Nested matches (a link around its words) are one control; the
-# innermost is used. Several controls: their count and words, no choice,
-# unless `index` picks one.
+# viewport. Candidates are the elements with words of their own, with a
+# label attribute, or links and buttons with short text (by textContent:
+# asking every element for its innerText lays the page out over and
+# over). Nested matches (a link around its words) are one control; the
+# innermost is used. The matches in view are the ones that count, as
+# for a reader of the screen; the rest only when none is in view (then
+# it is scrolled into view). Several controls: their count and words,
+# no choice, unless `index` picks one.
 FIND_JS = r"""
 (function(label, index){
   const squash = s => (s || '').replace(/\s+/g, ' ').trim();
   const own = el => { let t = ''; for (const c of el.childNodes) if (c.nodeType === 3) t += c.nodeValue; return squash(t); };
-  const attr = el => squash(el.getAttribute('aria-label') || el.getAttribute('alt') || el.getAttribute('title') || el.getAttribute('placeholder') || el.value);
+  const attr = el => squash(el.getAttribute('aria-label') || el.getAttribute('alt') || el.getAttribute('title') || el.getAttribute('placeholder') || (el.tagName === 'INPUT' ? el.value : ''));
   const ACTIVE = 'a[href],button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=switch],[role=option],[onclick]';
   const vw = innerWidth, vh = innerHeight;
-  const shown = el => { const r = el.getBoundingClientRect(); if (r.width <= 0 || r.height <= 0) return false;
-    const cs = getComputedStyle(el); return cs.visibility !== 'hidden' && cs.display !== 'none'; };
-  const names = el => { const n = [own(el), attr(el)]; if (el.matches(ACTIVE)) { const t = squash(el.innerText); if (t && t.length <= 80) n.push(t); } return n.filter(Boolean).map(s => s.toLowerCase()); };
-  const all = Array.from(document.body.querySelectorAll('*')).filter(el => !el.closest('script,style,noscript,svg,template'));
-  let hits = [], used = '';
+  const skip = el => !!el.closest('script,style,noscript,svg,template');
+  const visible = el => el.checkVisibility ? el.checkVisibility({visibilityProperty: true, opacityProperty: true}) : true;
+  const box = el => el.getBoundingClientRect();
+  const inView = r => r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < vh && r.right > 0 && r.left < vw;
+  const cands = new Set();
+  const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  for (let t = tw.nextNode(); t; t = tw.nextNode()) { const p = t.parentElement; if (p && squash(t.nodeValue) && !skip(p)) cands.add(p); }
+  for (const el of document.body.querySelectorAll('[aria-label],[alt],[title],[placeholder],input,' + ACTIVE)) if (!skip(el)) cands.add(el);
+  const names = el => { const n = [own(el), attr(el)]; if (el.matches(ACTIVE)) { const t = squash(el.textContent); if (t && t.length <= 80) n.push(t); } return n.filter(Boolean).map(s => s.toLowerCase()); };
   const alts = label.split('||').map(squash).filter(Boolean);
-  for (const alt of alts) {
-    const want = alt.toLowerCase();
-    hits = all.filter(el => shown(el) && names(el).includes(want));
-    if (hits.length) { used = alt; break; }
-  }
-  if (!hits.length) for (const alt of alts) {
-    const want = alt.toLowerCase();
-    hits = all.filter(el => shown(el) && names(el).some(n => n.includes(want)));
-    if (hits.length) { used = alt; break; }
-  }
+  let used = '';
+  const find = test => { for (const alt of alts) { const want = alt.toLowerCase(); const h = [];
+    for (const el of cands) if (visible(el) && names(el).some(n => test(n, want))) h.push(el);
+    if (h.length) { used = alt; return h; } } return []; };
+  let hits = find((n, w) => n === w);
+  if (!hits.length) hits = find((n, w) => n.includes(w));
   if (!hits.length) return {found: false};
-  const controls = hits.filter(el => !hits.some(o => o !== el && el.contains(o)));
+  let controls = hits.filter(el => !hits.some(o => o !== el && el.contains(o)));
+  const seen = controls.filter(el => inView(box(el)));
+  if (seen.length) controls = seen;
   const pick = (index === null || index === undefined) ? null : index;
   if (controls.length > 1 && (pick === null || pick >= controls.length)) {
     return {found: true, count: controls.length, used: used, labels: controls.slice(0, 6).map(el => (names(el)[0] || '').slice(0, 60))};
   }
   const el = controls[pick || 0];
-  let r = el.getBoundingClientRect(), moved = false;
-  if (r.top < 0 || r.bottom > vh || r.left < 0 || r.right > vw) { el.scrollIntoView({block: 'center', inline: 'nearest'}); r = el.getBoundingClientRect(); moved = true; }
+  let r = box(el), moved = false;
+  if (!inView(r) || r.top < 0 || r.bottom > vh) { el.scrollIntoView({block: 'center', inline: 'nearest'}); r = box(el); moved = true; }
   window.__burnerTarget = el;
   return {found: true, count: 1, used: used, label: (names(el)[0] || '').slice(0, 60),
           x: r.left + r.width / 2, y: r.top + r.height / 2, moved: moved};
@@ -382,7 +393,7 @@ FIND_JS = r"""
 SETTLE_JS = r"""
 (function(){
   if (!window.__burnerMut) { window.__burnerMut = 1; try { new MutationObserver(() => { window.__burnerMut++; }).observe(document, {childList: true, subtree: true, characterData: true, attributes: true}); } catch (e) {} }
-  return {ready: document.readyState, mut: window.__burnerMut, url: location.href};
+  return {ready: document.readyState, mut: window.__burnerMut, url: location.href, vis: document.visibilityState};
 })"""
 
 # A scroll by `dy` CSS pixels: the window, else the tallest element that
@@ -501,6 +512,8 @@ def settle(page, idle_ms=1200, poll_s=0.15, quiet_s=0.3):
     while True:
         try:
             probe = page.eval(SETTLE_JS, timeout=5.0) or {}
+            if probe.get("vis") == "visible":
+                page.visible_at = time.monotonic()
         except Exception:
             probe = {"ready": "?", "mut": None}
         key = (probe.get("ready"), probe.get("mut"), probe.get("url"))
