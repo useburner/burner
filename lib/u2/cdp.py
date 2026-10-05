@@ -475,6 +475,8 @@ FIND_JS = r"""
   if (!hits.length) hits = find((n, w) => n.includes(w));
   if (!hits.length) return {found: false};
   let controls = hits.filter(el => !hits.some(o => o !== el && el.contains(o)));
+  // a label beside the control it labels is that control
+  controls = controls.filter(el => !(el.tagName === 'LABEL' && el.control && controls.includes(el.control)));
   const seen = controls.filter(el => inView(box(el)));
   if (seen.length) controls = seen;
   const pick = (index === null || index === undefined) ? null : index;
@@ -490,6 +492,13 @@ FIND_JS = r"""
     s.dispatchEvent(new Event('input', {bubbles: true}));
     s.dispatchEvent(new Event('change', {bubbles: true}));
     return {found: true, count: 1, used: used, label: squash(el.text).slice(0, 60), chose: true, url: location.href};
+  }
+  if (!query && el.tagName === 'INPUT' && /^(date|time|month|week|datetime-local|color)$/.test(el.type)) {
+    // focused, not touched (a touch opens Chrome's native picker, which a
+    // page read can't see): `type` sets its value
+    if (!inView(r)) el.scrollIntoView({block: 'center', inline: 'nearest'});
+    el.focus();
+    return {found: true, count: 1, used: used, label: (names(el)[0] || '').slice(0, 60), focused: true, url: location.href};
   }
   if (!query && el.tagName === 'SELECT') {
     // focused, not touched (a touch opens Chrome's native popup, which a
