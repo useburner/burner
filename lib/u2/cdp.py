@@ -505,7 +505,7 @@ def _answer(p):
     return "no answer" if p is None else "no answer (%s)" % type(p).__name__
 
 
-def front_page(dev, current=None, first_probe_s=None, hint=None):
+def front_page(dev, current=None, first_probe_s=None, hint=None, quick=False):
     """The page the user sees: `current` while it is still the visible
     one, else the visible page among Chrome's tabs (a fresh session for
     it). The first SCAN_TABS tabs are probed at once (Chrome lists the
@@ -518,9 +518,13 @@ def front_page(dev, current=None, first_probe_s=None, hint=None):
     busy loading to answer is not hidden), then the next MORE_TABS tabs
     are probed once. With `first_probe_s` (Chrome was just launched with
     a link: its current tab is loading it), the current tab is given
-    that long from the start. Raises RuntimeError, saying what each tab
-    answered, when none is visible (Chrome isn't in front, or shows a
-    native screen)."""
+    that long from the start. With `quick` (Chrome was just launched,
+    and its window is in front: the caller asks again in a moment),
+    one short round over the first tabs and the hinted ones, no long
+    bound and no sweep: probing a Chrome still coming up, eleven
+    sessions a try, kept it from coming up (16-33s cold opens, Oct 5).
+    Raises RuntimeError, saying what each tab answered, when none is
+    visible (Chrome isn't in front, or shows a native screen)."""
     if current is not None:
         if visible(current):
             return current
@@ -538,11 +542,11 @@ def front_page(dev, current=None, first_probe_s=None, hint=None):
                     break
     if not ids:
         raise RuntimeError("no page in Chrome")
-    found = _probe(dev, ids, first_probe_s, slow=hinted)
+    found = _probe(dev, ids, None if quick else first_probe_s, slow=() if quick else hinted)
     page = _visible_one(found)
     if page is not None:
         return page
-    if (first_probe_s is None and not isinstance(found[0], Page)
+    if (not quick and first_probe_s is None and not isinstance(found[0], Page)
             and not isinstance(found[0], ConnectionError)):
         # the current tab didn't answer in time: busy with a load, not hidden
         try:
@@ -554,7 +558,7 @@ def front_page(dev, current=None, first_probe_s=None, hint=None):
                 return p
             p.close()
         found[0] = p
-    more = [t["id"] for t in tabs[SCAN_TABS:SCAN_TABS + MORE_TABS] if t["id"] not in ids]
+    more = [] if quick else [t["id"] for t in tabs[SCAN_TABS:SCAN_TABS + MORE_TABS] if t["id"] not in ids]
     if more:
         found2 = _probe(dev, more)
         page = _visible_one(found2)

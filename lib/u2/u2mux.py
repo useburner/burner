@@ -1154,7 +1154,7 @@ class U2Daemon:
             return c[1]
         return None
 
-    LAUNCH_CONTACT_TRIES = 10  # a Chrome just launched: its DevTools side is asked this often, 0.3s apart
+    LAUNCH_CONTACT_TRIES = 10  # a Chrome just launched: its DevTools side is asked this often, 0.4s apart
     OPENED_FOR_S = 60.0        # a link the CLI launched is the tab scan's hint this long
 
     def _address_hint(self, last, hint=None):
@@ -1178,8 +1178,10 @@ class U2Daemon:
         launched with a link (no read shows it yet): the page is
         contacted at once, its current tab given the longer probe from
         the start, and a Chrome still starting is asked again for a
-        few seconds. hint: the link's address, for the scan (see
-        _address_hint)."""
+        few seconds, and only once its window is in front (one read of
+        the screen first: asking the tabs of a Chrome still coming up
+        kept it from coming up, 16-33s cold opens, Oct 5). hint: the
+        link's address, for the scan (see _address_hint)."""
         last = getattr(self, "_last_xml", "")
         cached = getattr(self, "_front_cache", None)
         if cached is not None and cached[0] is last:
@@ -1200,9 +1202,20 @@ class U2Daemon:
         if assume_chrome:
             for i in range(self.LAUNCH_CONTACT_TRIES):
                 try:
+                    # Chrome's window in front first (its address bar, when
+                    # it is, is the hint): the tabs are asked only then
+                    with _t("dump rpc (launch check)"):
+                        xml = read_screen(self.d)
+                    if has_words(xml):
+                        self._remember(xml)
+                        self._front_cache = (xml, screen_of(xml))
+                    front = (screen_of(xml) or (0, 0, ""))[2]
+                    if not _cdp().is_chrome(front):
+                        raise RuntimeError("%s in front, not Chrome yet" % (front or "nothing readable"))
+                    bar = url_bar_of(xml)
                     with _t("web page (after a launch)"):
                         self._web = _cdp().front_page(getattr(self.d, "_dev", None), current,
-                                                      first_probe_s=_cdp().LOAD_PROBE_S, **hinted)
+                                                      hint=bar or hint or None, quick=True)
                     return self._web
                 except Exception as e:
                     current = None
@@ -1215,7 +1228,7 @@ class U2Daemon:
                     # each try is logged with what the tabs answered: a cold
                     # open took five tries and 15s with no word why (Oct 5)
                     log("the page isn't reachable yet, try %d (%s)" % (i + 1, err_text(e, 300)))
-                    _time.sleep(0.3)  # Chrome still starting, or its tab not yet visible
+                    _time.sleep(0.4)  # Chrome still starting, or its tab not yet visible
         if current is not None and not _cdp().visible(current, _cdp().QUICK_PROBE_S):
             # The page in hand didn't answer at once: it left the front,
             # or it is busy (right after a navigation). One look at the

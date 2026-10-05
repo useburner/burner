@@ -6862,10 +6862,10 @@ class CoordinateTapTests(OfflineTestCase):
         launcher = SAMPLE_XML.replace("com.example", "com.google.android.apps.nexuslauncher")
         dm._last_xml, dm._last_xml_t = launcher, mod._time.monotonic()  # the read before: HOME
         # Chrome's own window fills the screen: not one over the page
-        dm.d = _FakeServer([], windows=BARS_WINDOWS)
+        dm.d = _FakeServer([CHROME_XML], windows=BARS_WINDOWS)
         self.assertIn('text="Box Score"', dm.cmd_dump("page").decode())
         # the shade over Chrome right after the launch: still said
-        dm.d = _FakeServer([], windows=SHADE_WINDOWS)
+        dm.d = _FakeServer([CHROME_XML], windows=SHADE_WINDOWS)
         self.assertEqual(dm.cmd_dump("page"), b"")
         # a tab not yet visible right after the launch is asked again, then found
         answers = iter([RuntimeError("no visible page in Chrome's first 3 tabs"), _FakePage()])
@@ -6876,7 +6876,7 @@ class CoordinateTapTests(OfflineTestCase):
                 raise a
             return a
         fake.front_page = late
-        dm.d = _FakeServer([], windows=BARS_WINDOWS)
+        dm.d = _FakeServer([CHROME_XML] * 2, windows=BARS_WINDOWS)  # a read of the screen per try
         self.assertIn('text="Box Score"', dm.cmd_dump("page").decode())
 
     def test_a_cold_open_asks_the_page_straight_after_the_launch(self):
@@ -6926,32 +6926,44 @@ class CoordinateTapTests(OfflineTestCase):
         fake = WebPathTests._fake_cdp(self, mod, calls)
         fake.LOAD_PROBE_S = 6.0
         fake.front_page = lambda dev, current=None, first_probe_s=None, **kw: (
-            calls.append(("front_page", first_probe_s)) or _FakePage())
+            calls.append(("front_page", kw.get("quick"), kw.get("hint"))) or _FakePage())
         dm = EmptyScreenTests._daemon(self, mod)
-        dm.d = _FakeServer([])  # the screen reader is never asked
+        mod.log = lambda *a: None
+        # one read of the screen first: Chrome's window is in front (asking
+        # the tabs of a Chrome still coming up kept it from coming up)
+        launcher = SAMPLE_XML.replace("com.example", "com.android.launcher3")
+        dm.d = _FakeServer([CHROME_XML])
         dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()  # the newest read: not Chrome
         dm._web_retry_at = mod._time.monotonic() + 100  # a cooldown that a launch overrides
-        xml = dm.cmd_dump("page").decode()
+        xml = dm.cmd_dump("page https://www.espn.com/nfl/").decode()
         self.assertIn('text="Box Score"', xml)
-        self.assertEqual(calls, [("front_page", 6.0), ("read",)])
-        self.assertEqual(dm.d.calls, [])
-        # a Chrome still starting: asked again, then the page
+        self.assertEqual(calls, [("front_page", True, "https://www.espn.com/nfl/"), ("read",)])  # quick: short bounds, no sweep
+        self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])
+        # a Chrome still starting: the launcher in front twice (no tab asked),
+        # then Chrome refusing once, then the page; Chrome's bar is the hint
         calls.clear()
-        answers = iter([OSError("refused"), OSError("refused"), _FakePage()])
+        bar = CHROME_XML.replace('<node text="" class="android.webkit.WebView"',
+                                 '<node text="espn.com/nfl" resource-id="com.android.chrome:id/url_bar" class="android.widget.EditText"'
+                                 ' package="com.android.chrome" bounds="[200,160][700,260]" clickable="true" enabled="true"/>\n'
+                                 '    <node text="" class="android.webkit.WebView"')
+        dm.d = _FakeServer([launcher, launcher, bar, bar])
+        answers = iter([OSError("refused"), _FakePage()])
 
         def starting(dev, current=None, first_probe_s=None, **kw):
             a = next(answers)
-            calls.append(("front_page", first_probe_s))
+            calls.append(("front_page", kw.get("quick"), kw.get("hint")))
             if isinstance(a, Exception):
                 raise a
             return a
         fake.front_page = starting
-        self.assertIn('text="Box Score"', dm.cmd_dump("page").decode())
-        self.assertEqual([c for c in calls if c[0] == "front_page"], [("front_page", 6.0)] * 3)
-        # a native screen of Chrome's: nothing, and no native read here
+        self.assertIn('text="Box Score"', dm.cmd_dump("page https://www.espn.com/nfl/").decode())
+        self.assertEqual([c for c in calls if c[0] == "front_page"], [("front_page", True, "espn.com/nfl")] * 2)
+        self.assertEqual(len(dm.d.calls), 4)  # a read of the screen per try
+        # a native screen of Chrome's: nothing, after the tries
+        dm.d = _FakeServer([CHROME_XML] * dm.LAUNCH_CONTACT_TRIES)
         fake.front_page = mock.Mock(side_effect=RuntimeError("no visible page in Chrome's first 3 tabs"))
         self.assertEqual(dm.cmd_dump("page"), b"")
-        self.assertEqual(dm.d.calls, [])
+        self.assertEqual(fake.front_page.call_count, dm.LAUNCH_CONTACT_TRIES)
 
     def test_the_current_tab_gets_the_long_probe_from_the_start_after_a_launch(self):
         cdp = _cdp()
@@ -7128,6 +7140,30 @@ class AirbnbRoundTests(OfflineTestCase):
             page = cdp.front_page(None, hint="airbnb.com/s/Woodbury/ho…")
         self.assertEqual((page.target, len(probes)), ("D", 4))
 
+    def test_front_page_after_a_launch_is_one_short_round(self):
+        # quick: the first tabs and the hinted ones, short bounds, no long
+        # second look at the first tab, no sweep of the others
+        cdp = _cdp()
+        probes = []
+
+        class Tab:
+            def __init__(self, dev, target, probe_s=None):
+                probes.append((target, probe_s))
+                self.target, self.visible_at = target, 0.0
+                if target == "A":
+                    raise TimeoutError("timed out")  # busy: no answer in a probe's time
+
+            def close(self):
+                pass
+        tabs = [{"id": t, "url": "https://%s.com/" % t.lower()} for t in "ABCDEFGH"]
+        tabs[4]["url"] = "https://www.airbnb.com/s/homes"
+        with mock.patch.object(cdp, "Page", Tab), mock.patch.object(cdp, "pages", lambda dev: tabs):
+            with self.assertRaises(RuntimeError) as cm:
+                cdp.front_page(None, hint="airbnb.com/s/homes", quick=True)
+        self.assertEqual(sorted(probes), [("A", None), ("B", None), ("C", None), ("E", None)])
+        self.assertEqual(str(cm.exception), "no visible page among Chrome's 4 tabs probed: "
+                         "a.com: no answer (TimeoutError); b.com: hidden; c.com: hidden; airbnb.com/s/homes: hidden")
+
     def test_front_page_answers_as_soon_as_a_tab_says_visible(self):
         # a cold open after HOME, Oct 5: the link's tab (hinted, listed
         # fourth) answered within a second; the first tab, frozen, was
@@ -7219,7 +7255,7 @@ class AirbnbRoundTests(OfflineTestCase):
         hints = []
         fake.front_page = lambda dev, current=None, **kw: hints.append(kw.get("hint")) or _FakePage()
         dm = EmptyScreenTests._daemon(self, mod)
-        dm.d = _FakeServer([])
+        dm.d = _FakeServer([CHROME_XML] * 3)  # the launch check's reads
         mod.log = lambda *a: None
         # Chrome not in front: the link is launched by the CLI, and remembered
         dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()
