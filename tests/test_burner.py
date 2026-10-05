@@ -6645,6 +6645,51 @@ class PhoneAsksTests(OfflineTestCase):
 # --------------------------------- 28. a tap by --xy in one round trip
 
 class CoordinateTapTests(OfflineTestCase):
+    def test_the_visible_tab_is_found_in_one_probe_s_time_and_a_busy_one_waited_for(self):
+        cdp = _cdp()
+        probes = []
+
+        class Tab:
+            """A tab's session: the current one (first) is busy loading and
+            answers only when given long enough; the others are frozen."""
+            def __init__(self, dev, target, probe_s=None):
+                probes.append((target, probe_s))
+                self.target, self.visible_at, self.closed = target, 0.0, False
+                if target == "A":
+                    if probe_s is None:
+                        raise TimeoutError("timed out")  # busy: no answer in a probe's time
+                    self.visible_at = 1.0  # answered at last: visible
+                elif target == "B":
+                    raise TimeoutError("timed out")  # frozen in the background
+                # C: answers hidden
+
+            def close(self):
+                self.closed = True
+        with mock.patch.object(cdp, "Page", Tab), \
+                mock.patch.object(cdp, "pages", lambda dev: [{"id": "A"}, {"id": "B"}, {"id": "C"}, {"id": "D"}]):
+            page = cdp.front_page(None)
+        self.assertEqual(page.target, "A")
+        self.assertEqual(probes, [("A", None), ("B", None), ("C", None), ("A", cdp.LOAD_PROBE_S)])  # SCAN_TABS at once, then the current tab again
+        # a hidden current tab with a visible one behind it: the visible one, and the hidden one closed
+        probes.clear()
+
+        class Tab2(Tab):
+            def __init__(self, dev, target, probe_s=None):
+                probes.append((target, probe_s))
+                self.target, self.visible_at, self.closed = target, (1.0 if target == "B" else 0.0), False
+        with mock.patch.object(cdp, "Page", Tab2), \
+                mock.patch.object(cdp, "pages", lambda dev: [{"id": "A"}, {"id": "B"}]):
+            page = cdp.front_page(None)
+        self.assertEqual((page.target, probes), ("B", [("A", None), ("B", None)]))
+        # none visible and the current tab refused (Chrome shows a native screen): no page
+        class Refused(Tab):
+            def __init__(self, dev, target, probe_s=None):
+                raise ConnectionError("refused")
+        with mock.patch.object(cdp, "Page", Refused), \
+                mock.patch.object(cdp, "pages", lambda dev: [{"id": "A"}]):
+            with self.assertRaises(RuntimeError):
+                cdp.front_page(None)
+
     def test_touch_at_maps_the_screen_point_into_the_page(self):
         cdp = _cdp()
 

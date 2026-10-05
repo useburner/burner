@@ -253,7 +253,7 @@ class Page:
 
     lock = threading.RLock()  # a page built without __init__ (the tests) has this one
 
-    def __init__(self, dev, target):
+    def __init__(self, dev, target, probe_s=None):
         self.target = target
         self.ws = WebSocket(open_stream(dev), "/devtools/page/" + target)
         self.n = 0
@@ -262,14 +262,20 @@ class Page:
         self.loading = False
         self.main_frame = None
         self.url = ""
-        # bounded like a visibility probe (PROBE_S, plus the handshake's
-        # trip): a tab frozen in the background never answers the question
-        res = self.call_many([("Page.enable", {}), ("Page.getFrameTree", {}),
-                              _evaluate("document.visibilityState")],
-                             timeout=PROBE_S + 0.6, raise_errors=False)
-        for r in res[:2]:
-            if isinstance(r, Exception):
-                raise r
+        # bounded like a visibility probe (probe_s, PROBE_S by default, plus
+        # the handshake's trip): a tab frozen in the background never
+        # answers the question; a session that fails to open closes its stream
+        try:
+            res = self.call_many([("Page.enable", {}), ("Page.getFrameTree", {}),
+                                  _evaluate("document.visibilityState")],
+                                 timeout=(PROBE_S if probe_s is None else probe_s) + 0.6,
+                                 raise_errors=False)
+            for r in res[:2]:
+                if isinstance(r, Exception):
+                    raise r
+        except BaseException:
+            self.close()
+            raise
         frame = (res[1].get("frameTree") or {}).get("frame") or {}
         self.main_frame, self.url = frame.get("id"), frame.get("url", "")
         try:
@@ -387,6 +393,7 @@ def pages(dev):
 
 PROBE_S = 1.5    # a visibility question to a page: a background tab answers only on the timeout
 SCAN_TABS = 3    # tabs looked at for the visible page (Chrome lists the current one first)
+LOAD_PROBE_S = 6.0  # the current tab, too busy loading to answer the probe, is given this long
 
 
 QUICK_PROBE_S = 0.7  # the page in hand asked whether it is still on screen: a visible
@@ -412,23 +419,47 @@ def front_page(dev, current=None):
     """The page the user sees: `current` while it is still the visible
     one, else the visible page among Chrome's first SCAN_TABS tabs (a
     fresh session for it; Chrome lists the current tab first, and a
-    phone had 107). Raises RuntimeError when none of them is visible
-    (Chrome isn't in front, or shows a native screen)."""
+    phone had 107). The tabs are asked at once, each on its own stream,
+    so the wait is one probe's, not one per tab (three in a row cost 6s
+    while a heavy page loaded, Oct 5); when none answers "visible", the
+    current tab, listed first, is given LOAD_PROBE_S once more: too busy
+    loading to answer is not hidden. Raises RuntimeError when none is
+    visible (Chrome isn't in front, or shows a native screen)."""
     if current is not None:
         if visible(current):
             return current
         current.close()
-    for t in pages(dev)[:SCAN_TABS]:
-        if not t.get("id"):
-            continue
+    ids = [t["id"] for t in pages(dev)[:SCAN_TABS] if t.get("id")]
+    if not ids:
+        raise RuntimeError("no page in Chrome")
+    found = [None] * len(ids)
+
+    def probe(i):
         try:
-            p = Page(dev, t["id"])
-        except Exception:
-            continue
-        if visible(p):
+            found[i] = Page(dev, ids[i])
+        except Exception as e:
+            found[i] = e
+    threads = [threading.Thread(target=probe, args=(i,), daemon=True) for i in range(len(ids))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(PROBE_S + 3.0)
+    page = None
+    for p in found:
+        if isinstance(p, Page):
+            if page is None and p.visible_at > 0:
+                page = p
+            else:
+                p.close()
+    if page is not None:
+        return page
+    if not isinstance(found[0], Page) and not isinstance(found[0], ConnectionError):
+        # the current tab didn't answer in time: busy with a load, not hidden
+        p = Page(dev, ids[0], probe_s=LOAD_PROBE_S)
+        if p.visible_at > 0:
             return p
         p.close()
-    raise RuntimeError("no visible page in Chrome's first %d tabs" % SCAN_TABS)
+    raise RuntimeError("no visible page in Chrome's first %d tabs" % len(ids))
 
 
 # ----------------------------------------------------------- page scripts
