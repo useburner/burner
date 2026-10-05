@@ -7088,6 +7088,39 @@ class AirbnbRoundTests(OfflineTestCase):
             page = cdp.front_page(None, hint="airbnb.com/s/Woodbury/ho…")
         self.assertEqual((page.target, len(probes)), ("D", 4))
 
+    def test_front_page_answers_as_soon_as_a_tab_says_visible(self):
+        # a cold open after HOME, Oct 5: the link's tab (hinted, listed
+        # fourth) answered within a second; the first tab, frozen, was
+        # waited out for its 6s bound before the scan returned
+        cdp = _cdp()
+        import time as _time
+        probes, closed = [], []
+
+        class Tab:
+            def __init__(self, dev, target, probe_s=None):
+                probes.append((target, probe_s))
+                self.target, self.visible_at = target, 0.0
+                if target == "A":
+                    _time.sleep(0.6)  # frozen: answers (hidden) only late
+                elif target == "D":
+                    self.visible_at = 1.0
+
+            def close(self):
+                closed.append(self.target)
+        tabs = [{"id": "A", "url": "https://a.com/"}, {"id": "B", "url": "https://b.com/"},
+                {"id": "C", "url": "https://c.com/"}, {"id": "D", "url": "https://www.airbnb.com/rooms/1"}]
+        t0 = _time.monotonic()
+        with mock.patch.object(cdp, "Page", Tab), mock.patch.object(cdp, "pages", lambda dev: tabs):
+            page = cdp.front_page(None, first_probe_s=6.0, hint="https://www.airbnb.com/rooms/1")
+            took = _time.monotonic() - t0
+            self.assertEqual(page.target, "D")
+            self.assertLess(took, 0.4)  # not the frozen tab's bound
+            # the hinted tab got the long bound with the first one; the rest the short one
+            self.assertEqual(sorted(probes), [("A", 6.0), ("B", None), ("C", None), ("D", 6.0)])
+            self.assertEqual(sorted(closed), ["B", "C"])  # hidden ones closed; A still being asked
+            _time.sleep(0.7)
+            self.assertIn("A", closed)  # answered late: closed by itself
+
     def test_front_page_sweeps_the_next_tabs_when_the_first_are_hidden(self):
         cdp = _cdp()
         probes = []

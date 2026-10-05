@@ -448,25 +448,40 @@ def _short(url):
     return (_address(url) or "(no address)")[:40]
 
 
-def _probe(dev, ids, first_probe_s=None):
+def _probe(dev, ids, first_probe_s=None, slow=()):
     """Each tab asked whether it is the one on screen, all at once (each
     on its own stream, so the wait is one probe's, not one per tab: three
-    in a row cost 6s while a heavy page loaded, Oct 5). By `ids`: a Page
-    (visible_at > 0 when it said visible) or the exception its probe
-    ended in (None: no answer in time)."""
+    in a row cost 6s while a heavy page loaded, Oct 5), and the answer
+    taken as soon as one says visible: the others are still being asked,
+    and close themselves when they answer (a cold open waited out the 6s
+    bound on a frozen first tab while the link's tab had answered within
+    a second, Oct 5). The first tab and those in `slow` get the long
+    bound `first_probe_s` (the tabs loading the link just opened). By
+    `ids`: a Page (visible_at > 0 when it said visible), the exception
+    its probe ended in, or None (no answer yet)."""
     found = [None] * len(ids)
+    lock, done, pending = threading.Lock(), threading.Event(), [len(ids)]
 
     def probe(i):
         try:
-            found[i] = Page(dev, ids[i], probe_s=first_probe_s if i == 0 else None)
+            p = Page(dev, ids[i], probe_s=first_probe_s if (i == 0 or ids[i] in slow) else None)
         except Exception as e:
-            found[i] = e
-    threads = [threading.Thread(target=probe, args=(i,), daemon=True) for i in range(len(ids))]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(max(PROBE_S, first_probe_s or 0) + 3.0)
-    return found
+            p = e
+        with lock:
+            late = done.is_set()
+            if not late:
+                found[i] = p
+                pending[0] -= 1
+                if pending[0] == 0 or (isinstance(p, Page) and p.visible_at > 0):
+                    done.set()
+        if late and isinstance(p, Page):
+            p.close()  # the scan was decided without it
+    for i in range(len(ids)):
+        threading.Thread(target=probe, args=(i,), daemon=True).start()
+    done.wait(max(PROBE_S, first_probe_s or 0) + 3.0)
+    with lock:
+        done.set()
+        return list(found)
 
 
 def _visible_one(found):
@@ -513,15 +528,17 @@ def front_page(dev, current=None, first_probe_s=None, hint=None):
     tabs = [t for t in pages(dev) if t.get("id")]
     urls = {t["id"]: t.get("url", "") for t in tabs}
     ids = [t["id"] for t in tabs[:SCAN_TABS]]
+    hinted = set()
     if hint:
         for t in tabs[SCAN_TABS:]:
             if same_address(t.get("url", ""), hint):
                 ids.append(t["id"])
+                hinted.add(t["id"])
                 if len(ids) >= SCAN_TABS + HINT_TABS:
                     break
     if not ids:
         raise RuntimeError("no page in Chrome")
-    found = _probe(dev, ids, first_probe_s)
+    found = _probe(dev, ids, first_probe_s, slow=hinted)
     page = _visible_one(found)
     if page is not None:
         return page
