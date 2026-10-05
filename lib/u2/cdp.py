@@ -550,9 +550,15 @@ FIND_JS = r"""
   const act = document.activeElement;
   if (act && act !== el && !el.contains(act) && act.matches('input,textarea,[contenteditable=true]')) { act.blur(); blurred = true; }
   const vv = window.visualViewport;
+  // what is under the aimed point: a widget's popup (a date field's
+  // calendar) over the target swallows the touch
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  const top = document.elementFromPoint(cx, cy);
+  const covered = !!(top && top !== el && !el.contains(top) && !top.contains(el));
   return {found: true, count: 1, used: used, label: (names(el)[0] || '').slice(0, 60),
-          x: r.left + r.width / 2 - (vv ? vv.offsetLeft : 0), y: r.top + r.height / 2 - (vv ? vv.offsetTop : 0),
-          moved: moved, blurred: blurred, url: location.href};
+          x: cx - (vv ? vv.offsetLeft : 0), y: cy - (vv ? vv.offsetTop : 0),
+          moved: moved, blurred: blurred, covered: covered,
+          cover: covered ? (top.tagName + ' ' + squash(top.innerText).slice(0, 40)) : '', url: location.href};
 })"""
 
 # The place of the element FIND kept, against the visual viewport (what
@@ -565,7 +571,10 @@ PLACE_JS = r"""
   let r = el.getBoundingClientRect();
   const top = r.top - (vv ? vv.offsetTop : 0), bottom = r.bottom - (vv ? vv.offsetTop : 0);
   if (top < 0 || bottom > vh) { el.scrollIntoView({block: 'center', inline: 'nearest'}); r = el.getBoundingClientRect(); }
-  return {x: r.left + r.width / 2 - (vv ? vv.offsetLeft : 0), y: r.top + r.height / 2 - (vv ? vv.offsetTop : 0)};
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  const over = document.elementFromPoint(cx, cy);
+  const covered = !!(over && over !== el && !el.contains(over) && !over.contains(el));
+  return {x: cx - (vv ? vv.offsetLeft : 0), y: cy - (vv ? vv.offsetTop : 0), covered: covered};
 })"""
 
 # A settle probe: the page's readiness and a count of DOM changes, so a
@@ -795,13 +804,26 @@ def tap(page, label, index=None, idle_ms=1200):
         time.sleep(0.15)
         return {"found": True, "count": 1, "label": hit.get("label"),
                 "how": "chose" if hit.get("chose") else "focus", "screen": read(page)}
-    if hit.get("moved") or hit.get("blurred"):
-        time.sleep(0.35)  # the scroll into view, or the keyboard going
+    if hit.get("covered"):
+        # something lies over the target (a date field's calendar):
+        # Escape closes a widget's popup, as it would for a person
+        page.call_many([("Input.dispatchKeyEvent", {"type": "keyDown", "key": "Escape", "code": "Escape",
+                                                    "windowsVirtualKeyCode": 27}),
+                        ("Input.dispatchKeyEvent", {"type": "keyUp", "key": "Escape", "code": "Escape",
+                                                    "windowsVirtualKeyCode": 27})], timeout=5.0)
+    if hit.get("moved") or hit.get("blurred") or hit.get("covered"):
+        time.sleep(0.35)  # the scroll into view, the keyboard going, a popup closing
         place = page.eval(_js(PLACE_JS)) or {}
         if place.get("x") is not None:
             hit["x"], hit["y"] = place["x"], place["y"]
+        hit["covered"] = bool(place.get("covered"))
     page.loading = False
-    how = touch(page, hit["x"], hit["y"])
+    if hit.get("covered"):
+        # still covered: the element's own click, past whatever lies over it
+        page.eval("window.__burnerTarget && window.__burnerTarget.click(); 'clicked'")
+        how = "click"
+    else:
+        how = touch(page, hit["x"], hit["y"])
     probe = after_touch(page, hit.get("url"), idle_ms)
     return {"found": True, "count": 1, "label": hit.get("label"), "how": how,
             "screen": read(page), "ready": probe.get("ready")}
