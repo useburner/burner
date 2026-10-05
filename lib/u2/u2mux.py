@@ -1212,6 +1212,9 @@ class U2Daemon:
                         log("the page in Chrome is out of reach after the launch (%s); the screen reader"
                             % err_text(e, 300))
                         return None
+                    # each try is logged with what the tabs answered: a cold
+                    # open took five tries and 15s with no word why (Oct 5)
+                    log("the page isn't reachable yet, try %d (%s)" % (i + 1, err_text(e, 300)))
                     _time.sleep(0.3)  # Chrome still starting, or its tab not yet visible
         if current is not None and not _cdp().visible(current, _cdp().QUICK_PROBE_S):
             # The page in hand didn't answer at once: it left the front,
