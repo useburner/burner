@@ -1268,6 +1268,14 @@ AMBI_XML = """<hierarchy rotation="0">
   </node>
 </hierarchy>"""
 
+# a search box holding the typed words beside the suggestion with them
+TYPED_XML = """<hierarchy rotation="0">
+  <node text="" class="android.widget.FrameLayout" package="com.android.chrome" bounds="[0,0][1080,2400]" clickable="false" enabled="true" focused="false" checked="false">
+    <node text="Pixel 7" class="android.widget.EditText" package="com.android.chrome" bounds="[100,300][1000,420]" clickable="true" enabled="true" focused="true" checked="false"/>
+    <node text="Pixel 7" class="android.widget.TextView" package="com.android.chrome" bounds="[100,450][1000,560]" clickable="true" enabled="true" focused="false" checked="false"/>
+  </node>
+</hierarchy>"""
+
 FUZZY_AMBI_XML = """<hierarchy rotation="0">
   <node text="" class="android.widget.FrameLayout" bounds="[0,0][1080,2400]" clickable="false" enabled="true" focused="false" checked="false">
     <node text="Okay" class="android.widget.Button" bounds="[100,400][400,500]" clickable="true" enabled="true" focused="false" checked="false"/>
@@ -1360,6 +1368,17 @@ class AmbiguousTapTests(OfflineTestCase):
         self.assertEqual(rc, 1)
         self.assertIn("ambiguous tap", err)
         self.assertIn("(fuzzy)", err)
+
+    def test_typed_words_in_a_field_are_not_its_label(self):
+        rc, out, err, tc = self._tap(["tap", "Pixel 7"], xml=TYPED_XML)
+        self.assertEqual(rc, 0, err)
+        tc.assert_called_once_with(550, 505)  # the suggestion, not the box holding the words
+        mod = _u2mux()
+        self.assertEqual(mod.label_target(TYPED_XML, "Pixel 7"), (550, 505))
+        node, alt = mod.label_node(TYPED_XML, "pixel 7")
+        self.assertEqual((node["field"], alt), (False, "pixel 7"))
+        only_box = TYPED_XML.replace('text="Pixel 7" class="android.widget.TextView"', 'text="Other" class="android.widget.TextView"')
+        self.assertEqual(mod.label_target(only_box, "Pixel 7"), (550, 360))  # alone, the box is the row
 
     def test_ambiguous_json_shape(self):
         self.allow("wake_async")

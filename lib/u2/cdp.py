@@ -536,7 +536,8 @@ FIND_JS = r"""
   if (seen.length) controls = seen;
   const pick = (index === null || index === undefined) ? null : index;
   if (controls.length > 1 && (pick === null || pick >= controls.length)) {
-    return {found: true, count: controls.length, used: used, labels: controls.slice(0, 6).map(el => (names(el)[0] || '').slice(0, 60))};
+    return {found: true, count: controls.length, used: used, labels: controls.slice(0, 6).map(el => (names(el)[0] || '').slice(0, 60)),
+            tags: controls.slice(0, 6).map(el => el.tagName.toLowerCase() + (el.id ? '#' + el.id : ''))};
   }
   const el = controls[pick || 0];
   let r = box(el), moved = false;

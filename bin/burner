@@ -2070,6 +2070,13 @@ def plan_tap(nodes, w, h, text=None, xy=None, fuzzy=False, index=None,
     if not hits:
         return {"action": "nomatch"}
     controls = dedupe_same_control(hits)
+    if len(controls) > 1:
+        # the words typed into a field are not its label when another row
+        # carries them (a search box holding "Pixel 7" beside that suggestion)
+        typed = [id(c) for c in controls
+                 if "EditText" in (c.get("class") or "") and (c.get("text") or "").lower() == used.lower()]
+        if typed and len(typed) < len(controls):
+            controls = [c for c in controls if id(c) not in typed]
     if len(controls) > 1 and index is None:
         return {"action": "ambiguous", "used": used, "hits": controls,
                 "fuzzy": fuzzy_used}

@@ -641,6 +641,13 @@ def label_node(xml, label):
             else:
                 controls.append([n])
         if len(controls) > 1:
+            # the words typed into a field are not its label when another
+            # row carries them (a search box holding "Pixel 7" beside that
+            # suggestion)
+            typed = [c for c in controls if c[0].get("field") and c[0]["text"].lower() == low]
+            if typed and len(typed) < len(controls):
+                controls = [c for c in controls if c not in typed]
+        if len(controls) > 1:
             raise RuntimeError("%d rows read %r" % (len(controls), alt))
         if any(cut_off(n) for n in controls[0]):
             raise RuntimeError("%r is cut off at the screen's edge" % alt)
@@ -1326,7 +1333,8 @@ class U2Daemon:
                 if not r.get("found"):
                     raise RuntimeError("act not sent: not on the page")
                 if r.get("count", 1) != 1:
-                    raise RuntimeError("act not sent: %d rows read %r" % (r["count"], label))
+                    raise RuntimeError("act not sent: %d rows read %r%s" % (
+                        r["count"], label, " (%s)" % ", ".join(r["tags"]) if r.get("tags") else ""))
                 xml = self._page_xml(r["screen"])
                 self._remember(xml)
             return xml.encode()
@@ -1354,7 +1362,8 @@ class U2Daemon:
                 if not r.get("found"):
                     raise RuntimeError("act not sent: no field labelled %r on the page" % spec["field"])
                 if r.get("count", 1) != 1:
-                    raise RuntimeError("act not sent: %d fields read %r" % (r["count"], spec["field"]))
+                    raise RuntimeError("act not sent: %d fields read %r%s" % (
+                        r["count"], spec["field"], " (%s)" % ", ".join(r["tags"]) if r.get("tags") else ""))
                 xml = self._page_xml(r["screen"])
                 self._remember(xml)
             return xml.encode()
@@ -1537,10 +1546,10 @@ _BOUNDS_RE = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
 
 
 def iter_nodes(xml):
-    """Yield {text, desc, bounds, center, rect, enabled, clickable, web}
-    for every node with non-empty on-screen bounds, in document order;
-    web: the node is inside a WebView (a browser's page, an app's web
-    content)."""
+    """Yield {text, desc, bounds, center, rect, enabled, clickable, web,
+    field} for every node with non-empty on-screen bounds, in document
+    order; web: the node is inside a WebView (a browser's page, an app's
+    web content); field: a text field (its text is what was typed)."""
     import xml.etree.ElementTree as ET
 
     def rec(n, web):
@@ -1553,7 +1562,8 @@ def iter_nodes(xml):
                        "bounds": n.get("bounds"), "center": [(x1 + x2) // 2, (y1 + y2) // 2],
                        "rect": (x1, y1, x2, y2),
                        "enabled": n.get("enabled") != "false",
-                       "clickable": n.get("clickable") == "true", "web": web}
+                       "clickable": n.get("clickable") == "true", "web": web,
+                       "field": "edittext" in (n.get("class") or "").lower()}
         for c in n:
             yield from rec(c, web)
     yield from rec(ET.fromstring(xml), False)
