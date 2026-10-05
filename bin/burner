@@ -655,7 +655,7 @@ U2_NOT_FOUND = "__NOT_FOUND__"
 
 
 U2_PID = os.path.join(ROOT, "run", "u2-mux.pid")
-U2_SRC = os.path.join(ROOT, "lib", "u2", "u2mux.py")
+U2_SRC_DIR = os.path.join(ROOT, "lib", "u2")  # u2mux.py and what it loads (cdp.py)
 U2_STARTING = os.path.join(ROOT, "run", "u2-mux.starting")
 _u2_checked = False
 # How the last u2sock call ended: "ok", "unsent" (never reached the daemon),
@@ -683,16 +683,28 @@ def u2_start_background():
         pass
 
 
+def u2_source_mtime():
+    """The newest change under lib/u2. The helper loads cdp.py (the page
+    scripts) once, so a newer cdp.py needs a restart as much as a newer
+    u2mux.py (an update that changed only the page scripts left the
+    running helper on the old ones, Oct 5)."""
+    newest = 0.0
+    for name in os.listdir(U2_SRC_DIR):
+        if name.endswith(".py"):
+            newest = max(newest, os.path.getmtime(os.path.join(U2_SRC_DIR, name)))
+    return newest
+
+
 def u2_restart_if_stale():
     """A daemon started before `burner update` runs old code and lacks newer
     commands, so every call would quietly take the slow path. Restart it
-    when lib/u2/u2mux.py is newer than its pid file. Once per process."""
+    when anything under lib/u2 is newer than its pid file. Once per process."""
     global _u2_checked
     if _u2_checked:
         return
     _u2_checked = True
     try:
-        src = os.path.getmtime(U2_SRC)
+        src = u2_source_mtime()
         if src <= os.path.getmtime(U2_PID) or src > time.time():
             return
         with open(U2_PID) as f:

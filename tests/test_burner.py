@@ -3754,6 +3754,44 @@ class LabelTapTests(OfflineTestCase):
                          ["wakeUp", "pressKeyCode", "dumpWindowHierarchy", "waitForIdle"])
 
 
+class HelperStalenessTests(OfflineTestCase):
+    def test_helper_restarts_when_any_file_under_lib_u2_is_newer(self):
+        # the helper loads cdp.py once: an update that changed only the
+        # page scripts must restart it too
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        src = os.path.join(tmp.name, "u2")
+        os.makedirs(src)
+        pid = os.path.join(tmp.name, "u2-mux.pid")
+        sock = os.path.join(tmp.name, "u2-mux.sock")
+        with open(pid, "w") as f:
+            f.write("4242")
+        now = pc.time.time()
+        for name, age in (("u2mux.py", 100), ("cdp.py", 100)):
+            with open(os.path.join(src, name), "w") as f:
+                f.write("# source")
+            os.utime(os.path.join(src, name), (now - age, now - age))
+        os.utime(pid, (now - 50, now - 50))
+        self.allow("u2_start_background")
+        ps = SimpleNamespace(stdout="python3 lib/u2/u2mux.py\n")
+        with mock.patch.object(pc, "U2_SRC_DIR", src), mock.patch.object(pc, "U2_PID", pid), \
+                mock.patch.object(pc, "U2_SOCK", sock), mock.patch.object(pc.os, "kill") as kill, \
+                mock.patch.object(pc.subprocess, "run", return_value=ps):
+            pc._u2_checked = False
+            pc.u2_restart_if_stale()
+            kill.assert_not_called()  # both older than the pid file
+            os.utime(os.path.join(src, "cdp.py"), (now - 10, now - 10))
+            with open(pid, "w") as f:
+                f.write("4242")
+            os.utime(pid, (now - 50, now - 50))
+            pc._u2_checked = False
+            pc.u2_restart_if_stale()
+            kill.assert_called_once_with(4242, 15)
+            self.assertFalse(os.path.exists(pid))
+        pc._u2_checked = True
+
+
 class StartAndSettingsTests(OfflineTestCase):
     def test_start_goes_over_scrcpy_and_reads_once(self):
         sc = self.allow("scrcpy_send", return_value=True)

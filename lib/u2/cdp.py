@@ -467,7 +467,6 @@ FIND_JS = r"""
   const squash = s => (s || '').replace(/\s+/g, ' ').trim();
   const own = el => { let t = ''; for (const c of el.childNodes) if (c.nodeType === 3) t += c.nodeValue; return squash(t); };
   const attr = el => squash(el.getAttribute('aria-label') || el.getAttribute('alt') || el.getAttribute('title') || el.getAttribute('placeholder') || (el.tagName === 'INPUT' ? el.value : ''));
-  const byValue = el => el.tagName === 'INPUT' && !!squash(el.value) && !squash(el.getAttribute('aria-label') || el.getAttribute('alt') || el.getAttribute('title') || el.getAttribute('placeholder'));
   const ACTIVE = 'a[href],button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=switch],[role=option],[onclick]';
   const FIELDS = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=image]):not([type=file]),textarea,select,[contenteditable=true],[role=textbox],[role=searchbox],[role=combobox]';
   const vw = innerWidth, vh = innerHeight;
@@ -503,7 +502,10 @@ FIND_JS = r"""
   if (!hits.length) return {found: false};
   // the words typed into a field are not its label when something else
   // carries them (a search box holding "Pixel 7" beside that suggestion)
-  if (hits.length > 1) { const named = hits.filter(el => !byValue(el)); if (named.length) hits = named; }
+  if (hits.length > 1) {
+    const typed = hits.filter(el => el.matches('input,textarea') && squash(el.value).toLowerCase() === used.toLowerCase());
+    if (typed.length && typed.length < hits.length) hits = hits.filter(el => !typed.includes(el));
+  }
   let controls = hits.filter(el => !hits.some(o => o !== el && el.contains(o)));
   // a label beside the control it labels is that control
   // a label found by its words stands for the control it labels
