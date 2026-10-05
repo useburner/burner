@@ -4280,6 +4280,12 @@ def cmd_open(args):
     # when several apps claim the link (e.g. Play Store and Aurora Store).
     if args.package:
         script += " " + _sh_quote(args.package)
+    if args.url.startswith(("http://", "https://")) and (not args.package or args.package in WEB_APPS):
+        # Chrome reuses the tab it opened for this id instead of adding
+        # one per link (a phone had 107 tabs, Oct 5), so the page's
+        # session stays on one tab, with no first contact per open
+        script += " --es com.android.browser.application_id {}".format(
+            _sh_quote(args.package or "com.android.chrome"))
     adb_or_ensure("shell", script)
     u2_invalidate()
     print("opened {}".format(args.url))
