@@ -28,7 +28,10 @@ Every step you take costs a round trip, so the fewer steps, the faster.
    screenshot or a sleep: you already have the result.
 2. **Screenshots only to see pictures** (a photo, a map, a chart):
    `burner shot --out .`, then send the file. For words, the rows are enough.
-3. **Never sleep.** A page still loading: `burner wait "Text" --timeout 30`.
+3. **Never sleep, and don't wait for what is already there.** Every action
+   prints the screen it ends on: when the words you need are on it, act on
+   them. `burner wait "Text" --timeout 30` is for a page still loading, when
+   the printed screen doesn't have them yet (or says `may still be loading`).
 4. **Links skip menus:** `burner open "https://www.vinted.com/catalog?search_text=nike"`
    opens inside the app when it is installed. Deep links too: `burner open market://details?id=com.tinder com.android.vending`.
 5. **Chain steps you are sure of:** `burner do 'start com.tinder; wait "Likes"'`
