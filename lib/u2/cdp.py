@@ -266,8 +266,8 @@ def front_page(dev, current=None):
     it). Raises RuntimeError when no page is visible (Chrome isn't in
     front, or shows a native screen)."""
     if current is not None:
-        if time.monotonic() - current.visible_at < 1.5:
-            return current  # a probe just said so: no round trip
+        if time.monotonic() - current.visible_at < VISIBLE_FOR_S:
+            return current  # a probe said so lately: no round trip
         try:
             if current.eval("document.visibilityState", timeout=3.0) == "visible":
                 current.visible_at = time.monotonic()
@@ -510,7 +510,10 @@ def page_xml(screen, top, screen_h=0, pkg="com.android.chrome"):
 
 
 QUIET_CAP_S = 0.5  # a wait for a quiet DOM, at most: a live page never stops changing
-LOAD_CAP_S = 2.5   # a wait for a page that is loading, at most
+LOAD_CAP_S = 1.8   # a wait for a page that is loading, at most (the caller
+                   # reads again when the screen looks half drawn)
+VISIBLE_FOR_S = 6.0  # a page a probe found visible needs no new check this long: a
+                     # tap that opens another tab leaves this one hidden on its own probe
 
 
 def settle(page, idle_ms=1200, poll_s=0.15, quiet_s=0.3, url=None, loading=False):
