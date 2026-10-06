@@ -1433,6 +1433,7 @@ class U2Daemon:
         return None
 
     LAUNCH_CONTACT_TRIES = 10  # a Chrome just launched: its DevTools side is asked this often, 0.4s apart
+    BLIND_TRIES = 2  # reads with no app in them at all before Chrome's tabs are asked anyway
     OPENED_FOR_S = 60.0        # a link the CLI launched is the tab scan's hint this long
 
     def _address_hint(self, last, hint=None):
@@ -1488,8 +1489,13 @@ class U2Daemon:
                         self._remember(xml)
                         self._front_cache = (xml, screen_of(xml))
                     front = (screen_of(xml) or (0, 0, ""))[2]
-                    if not _cdp().is_chrome(front):
+                    if not _cdp().is_chrome(front) and (front or i < self.BLIND_TRIES):
                         raise RuntimeError("%s in front, not Chrome yet" % (front or "nothing readable"))
+                    # no app in the read at all, a second on: the screen
+                    # reader's tree can lag a window that is drawn by 5-15s
+                    # (Chrome after a launch from the Play Store: two rounds
+                    # of tries, 18.6s for an open, Oct 6); Chrome's tabs
+                    # say whether a page is visible
                     bar = url_bar_of(xml)
                     with _t("web page (after a launch)"):
                         self._web = _cdp().front_page(getattr(self.d, "_dev", None), current,

@@ -7489,6 +7489,32 @@ class CoordinateTapTests(OfflineTestCase):
         self.assertEqual(dm.cmd_dump("page"), b"")
         self.assertEqual(fake.front_page.call_count, dm.LAUNCH_CONTACT_TRIES)
 
+    def test_a_launch_whose_reads_hold_no_app_asks_chrome_s_tabs(self):
+        # Oct 6: Chrome launched from the Play Store was drawn while the
+        # screen reader's tree held no app for about 15s: ten tries twice, 18.6s
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = WebPathTests._fake_cdp(self, mod, calls)
+        fake.LOAD_PROBE_S = 6.0
+        fake.front_page = lambda dev, current=None, first_probe_s=None, **kw: (
+            calls.append(("front_page", kw.get("quick"), kw.get("hint"))) or _FakePage())
+        dm = EmptyScreenTests._daemon(self, mod)
+        mod.log = lambda *a: None
+        link = "https://www.google.com/search?q=weather"
+        dm.d = _FakeServer([BARS_XML] * 3)
+        dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()  # the newest read: not Chrome
+        self.assertIn('text="Box Score"', dm.cmd_dump("page " + link).decode())
+        self.assertEqual([c for c in calls if c[0] == "front_page"], [("front_page", True, link)])
+        self.assertEqual(len(dm.d.calls), 3)  # two reads with no app, then the tabs asked
+        # another app in front: its tabs are never asked (a Chrome still
+        # coming up was kept from coming up by them, Oct 5)
+        calls.clear()
+        launcher = SAMPLE_XML.replace("com.example", "com.android.launcher3")
+        dm.d = _FakeServer([launcher] * dm.LAUNCH_CONTACT_TRIES)
+        self.assertEqual(dm.cmd_dump("page " + link), b"")
+        self.assertEqual([c for c in calls if c[0] == "front_page"], [])
+
     def test_the_current_tab_gets_the_long_probe_from_the_start_after_a_launch(self):
         cdp = _cdp()
         probes = []
