@@ -3949,6 +3949,29 @@ class HelperStalenessTests(OfflineTestCase):
             pc.connect_helper(Sock(), 5)
         self.assertEqual((len(attempts), sl.call_count), (1, 0))
 
+    def test_a_dead_helper_s_socket_is_cleared_and_the_helper_started_again(self):
+        # the helper died and left its socket file (Oct 5): connecting was
+        # refused, nothing restarted it, twenty minutes of 12s scrolls
+        attempts, removed, started = [], [], []
+
+        class Sock:
+            def settimeout(self, t):
+                pass
+
+            def connect(self, path):
+                attempts.append(path)
+                if len(attempts) < 3:
+                    raise ConnectionRefusedError("nobody listens")
+        with mock.patch.object(pc, "helper_starting", return_value=False),                 mock.patch.object(pc, "_helper_waited", False),                 mock.patch.object(pc.os.path, "exists", lambda path: path == pc.U2_SOCK),                 mock.patch.object(pc.os, "remove", lambda path: removed.append(path)),                 mock.patch.object(pc, "u2_start_background", lambda: started.append(1)),                 mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            pc.connect_helper(Sock(), 5)
+        self.assertEqual((len(attempts), started, sorted(removed)), (3, [1], sorted([pc.U2_SOCK, pc.U2_PID])))
+        self.assertIn("the UI helper wasn't running; starting it again", err.getvalue())
+        # no socket file at all (a first run): the slow way, no start here
+        attempts.clear()
+        with mock.patch.object(pc, "helper_starting", return_value=False),                 mock.patch.object(pc, "_helper_waited", False),                 mock.patch.object(pc.os.path, "exists", return_value=False),                 mock.patch.object(pc, "u2_start_background", lambda: started.append(2)),                 self.assertRaises(OSError):
+            pc.connect_helper(Sock(), 5)
+        self.assertEqual((len(attempts), started), (1, [1]))
+
     def test_helper_restarts_when_any_file_under_lib_u2_is_newer(self):
         # the helper loads cdp.py once: an update that changed only the
         # page scripts must restart it too

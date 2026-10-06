@@ -756,9 +756,26 @@ def connect_helper(s, timeout):
     try:
         s.connect(U2_SOCK)
         return
-    except OSError:
-        if _helper_waited or not helper_starting():
+    except OSError as e:
+        if _helper_waited:
             raise
+        if not helper_starting():
+            if isinstance(e, FileNotFoundError) or not os.path.exists(U2_SOCK):
+                raise
+            # the socket file is there but nobody listens: the helper
+            # died (a crash, a kill) and left it, and nothing started it
+            # again since the file looked like a live helper, so every
+            # command went the slow adb way (twenty minutes of 12s
+            # scrolls, Oct 5). Cleared, started again, and waited for
+            # like a helper after an update.
+            for path in (U2_SOCK, U2_PID):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            u2_start_background()
+            print("burner: the UI helper wasn't running; starting it again (this command "
+                  "may take longer)", file=sys.stderr)
     _helper_waited = True
     _trace("the UI helper is starting; waiting for it")
     deadline = time.time() + HELPER_START_WAIT_S
