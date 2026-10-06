@@ -1755,18 +1755,22 @@ class U2Daemon:
         import base64
         png = arg.strip() == "png"
         # 0.6 scale, quality 75: about half the bytes of 0.7/80, and the
-        # vision models that read it shrink it further anyway.
+        # vision models that read it shrink it further anyway. A .png name
+        # gets the same small capture at a higher quality, re-encoded here:
+        # a full-size quality-100 capture took 2.2-4.3s on the phone against
+        # about 1s (Muse's Reddit run, 2026-10-06), and assistants name
+        # their shots .png out of habit, not for the pixels.
         with self._lock:
             with _t("shot rpc"):
-                data = self.d.jsonrpc.takeScreenshot(1 if png else 0.6,
-                                                     100 if png else 75)
+                data = self.d.jsonrpc.takeScreenshot(0.6, 90 if png else 75)
         if not data:
             raise RuntimeError("takeScreenshot returned nothing")
         if png:
             import io
             from PIL import Image
             buf = io.BytesIO()
-            Image.open(io.BytesIO(base64.b64decode(data))).save(buf, "PNG")
+            Image.open(io.BytesIO(base64.b64decode(data))).save(
+                buf, "PNG", compress_level=1)
             data = base64.b64encode(buf.getvalue()).decode()
         return data.encode()
 
