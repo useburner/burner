@@ -166,10 +166,26 @@ class WebSocket:
             pass
 
 
-def open_stream(dev):
-    """A socket to Chrome's DevTools socket on the phone, over adb."""
-    import adbutils
-    return dev.create_connection(adbutils.Network.LOCAL_ABSTRACT, SOCKET_NAME)
+OPEN_S = 6.0  # a stream to the DevTools socket through adb: a fraction of a second when the link is up
+
+
+def open_stream(dev, timeout=OPEN_S):
+    """A socket to Chrome's DevTools socket on the phone, over adb, opened
+    within `timeout`: adbutils gives the open 600s, and a link through the
+    tunnel that passes nothing never answers it (with Chrome in front, a
+    read hung until adb dropped the link, the review of Oct 6). Raises
+    ConnectionError when the phone doesn't answer in time. The callers
+    set the socket's own timeouts."""
+    t = dev.open_transport(timeout=timeout)
+    try:
+        t.send_command("localabstract:" + SOCKET_NAME)
+        t.check_okay()
+    except Exception as e:
+        t.close()
+        if isinstance(e, (socket.timeout, TimeoutError)) or type(e).__name__ == "AdbTimeout":
+            raise ConnectionError("no answer from the phone's adb in %.0fs (DevTools stream open)" % timeout)
+        raise
+    return t.conn
 
 
 def dechunk(data):

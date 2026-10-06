@@ -1243,6 +1243,19 @@ def plain_words(s):
     return " ".join((s or "").translate(_PLAIN).split())
 
 
+def selector_matches(xml, sel):
+    """How many rows of a read the phone's selector `sel` (see
+    selector_for: a row's exact text, or its exact description) would
+    find; 0 for a read that can't be parsed. Pure."""
+    import xml.etree.ElementTree as ET
+    attr, want = (("text", sel.get("text")) if "text" in sel
+                  else ("content-desc", sel.get("description")))
+    try:
+        return sum(1 for n in ET.fromstring(xml or "").iter("node") if (n.get(attr) or "") == want)
+    except ET.ParseError:
+        return 0
+
+
 def label_node(xml, label):
     """The one control on this read whose text or description is `label`
     (case-insensitive exact; "A || B" tries each): (its first row, the
@@ -1252,8 +1265,12 @@ def label_node(xml, label):
     by selector threw a NullPointerException on a web node in Chrome
     (espn.com, Oct 4). Raises RuntimeError when there is no such control,
     more than one, its words are cut off at an edge (see cut_off), or
-    another row sits over it (see row_over)."""
-    nodes = list(iter_nodes(xml or ""))
+    another row sits over it (see row_over), or the read can't be
+    parsed (empty, or cut)."""
+    try:
+        nodes = list(iter_nodes(xml or ""))
+    except Exception as e:
+        raise RuntimeError("the read can't be parsed (%s)" % err_text(e, 60))
     for alt in [p.strip() for p in label.split("||") if p.strip()]:
         low = plain_words(alt).lower()
         hits = [n for n in nodes
@@ -2411,8 +2428,14 @@ class U2Daemon:
             if before and _time.monotonic() - self._last_xml_t < BY_WORDS_S:
                 try:
                     node, alt = label_node(before, label)
-                    spec["tap_selector"] = tried = selector_for(node, alt)
-                    spec["words"] = label
+                    sel = selector_for(node, alt)
+                    # the phone clicks the first row its selector finds:
+                    # only when that is the one row with these exact words
+                    # (a search box holding "lofi" above the suggestion
+                    # "lofi" got the tap, the review of Oct 6)
+                    if selector_matches(before, sel) == 1:
+                        spec["tap_selector"] = tried = sel
+                        spec["words"] = label
                 except RuntimeError:
                     pass
             if "tap_selector" in spec:
@@ -2433,7 +2456,7 @@ class U2Daemon:
                 raise RuntimeError("act not sent: %s" % e)
             center = tuple(node["center"])
             fresh = selector_for(node, alt)
-            if not node["web"] and fresh != tried:
+            if not node["web"] and fresh != tried and selector_matches(xml, fresh) == 1:
                 # a native row on the read just taken: the phone finds it
                 # by its words at tap time, where it is then, with no
                 # second read to see it hold its place (2.7-3.1s for a tap

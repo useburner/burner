@@ -5074,6 +5074,65 @@ class WebPathTests(OfflineTestCase):
             run(spec, after, before=before)
             self.assertEqual(len(batches), 1, spec)
 
+    def test_a_tap_by_words_needs_one_row_with_those_exact_words(self):
+        # the review of Oct 6: label_node picks a row by rules the phone's
+        # selector can't express, and the phone clicks the first match
+        mod = _u2mux()
+        box = SAMPLE_XML.replace("</hierarchy>", """  <node text="lofi" resource-id="q" class="android.widget.EditText" package="com.example" bounds="[100,800][980,900]" clickable="true" enabled="true" focused="true"/>
+  <node text="lofi" class="android.widget.TextView" package="com.example" bounds="[100,1000][980,1100]" clickable="true" enabled="true" focused="false"/>
+</hierarchy>""")
+        node, alt = mod.label_node(box, "lofi")
+        self.assertEqual(node["center"], [540, 1050])  # the suggestion, not the box holding the words
+        self.assertEqual(mod.selector_matches(box, mod.selector_for(node, alt)), 2)
+        self.assertEqual(mod.selector_matches(SAMPLE_XML, mod.selector_for(*mod.label_node(SAMPLE_XML, "OK"))), 1)
+        self.assertEqual(mod.selector_matches("", {"text": "OK"}), 0)
+        # in a tap: by coordinates, on the row label_node chose
+        EmptyScreenTests.no_sleep(self, mod)
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([box], screen_on=True)
+        sent = []
+        tapped = box.replace('text="Hello"', 'text="Hello, tapped"')
+        dm._batch = lambda calls, timeout=45.0: sent.append(calls) or [None] * (len(calls) - 1) + [tapped]
+        dm._last_xml, dm._last_xml_t = box, mod._time.monotonic()
+        dm.cmd_act(json.dumps({"tap_label": "lofi"}))
+        self.assertEqual(sent[-1][1], ("click", [540, 1050]))
+        self.assertNotIn("count", [m for m, _ in sent[-1]])
+        # an empty read says it can't be parsed (a RuntimeError, as its callers catch)
+        with self.assertRaises(RuntimeError) as cm:
+            mod.label_node("", "OK")
+        self.assertIn("can't be parsed", str(cm.exception))
+
+    def test_chrome_s_devtools_stream_opens_within_a_bound(self):
+        # the review of Oct 6: the open waited adbutils' 600s on a link
+        # that passes nothing (a read hung with Chrome in front)
+        cdp = _cdp()
+        import socket
+        opened, closed = [], []
+
+        class T:
+            conn = "the socket"
+
+            def __init__(self, answer):
+                self.answer = answer
+
+            def send_command(self, c):
+                opened.append(c)
+
+            def check_okay(self):
+                if self.answer is not None:
+                    raise self.answer
+
+            def close(self):
+                closed.append(1)
+        dev = SimpleNamespace(open_transport=lambda timeout=None: opened.append(timeout) or T(None))
+        self.assertEqual(cdp.open_stream(dev), "the socket")
+        self.assertEqual(opened, [6.0, "localabstract:chrome_devtools_remote"])
+        dev = SimpleNamespace(open_transport=lambda timeout=None: T(socket.timeout("timed out")))
+        with self.assertRaises(ConnectionError) as cm:
+            cdp.open_stream(dev)
+        self.assertIn("no answer from the phone's adb in 6s", str(cm.exception))
+        self.assertEqual(closed, [1])
+
     def test_a_tap_then_type_batch(self):
         mod = _u2mux()
         calls = mod.act_calls({"set_text": "pudgy", "tap_first": [500, 650], "idle": 1200})
