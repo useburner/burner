@@ -3846,33 +3846,45 @@ class LabelTapTests(OfflineTestCase):
             dm.cmd_act(json.dumps({"tap_label": "OK"}))
         self.assertEqual(str(cm.exception), "act failed after sending: 2 rows read 'OK' now; the first was tapped")
         dm._batch = batch
-        # an older read: the row is read afresh and tapped where it is now
+        # an older read: the row is read afresh; a native row is then
+        # tapped by its words, the phone finding it where it is at tap time
+        # (no second read for its stillness: 2.7-3.1s taps, Oct 6)
         dm._last_xml_t = 0
         dm.d = _FakeServer([SAMPLE_XML], screen_on=True)
         dm.cmd_act(json.dumps({"tap_label": "OK"}))
-        self.assertEqual(sent[-1][1], ("click", [250, 450]))
+        self.assertEqual([m for m, _ in sent[-1]], ["wakeUp", "count", "click", "waitForIdle", "dumpWindowHierarchy"])
+        self.assertEqual(sent[-1][2][1][0]["text"], "OK")
         self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])
-        # the row moved since the assistant's read (a web page's rows report
-        # their old place for a moment after a scroll): it is read until
-        # two reads agree on its place, three at most
+        # a native row that moved since the assistant's read: the same, one read
         moved = SAMPLE_XML.replace("[100,400][400,500]", "[100,440][400,540]")
-        moved2 = SAMPLE_XML.replace("[100,400][400,500]", "[100,460][400,560]")
-        dm.d = _FakeServer([moved, moved2, moved2], screen_on=True)
+        dm.d = _FakeServer([moved], screen_on=True)
         dm._last_xml_t = 0
+        dm.cmd_act(json.dumps({"tap_label": "OK"}))
+        self.assertEqual(sent[-1][2][0], "click")
+        self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])
+        # a web page's rows report their old place for a moment after a
+        # scroll, and the phone's own click threw on a web node (Oct 4): a
+        # web row is read until two reads agree on its place, three at most,
+        # and tapped there
+        web = lambda x: x.replace('class="android.widget.FrameLayout" package="com.example"',
+                                  'class="android.webkit.WebView" package="com.example"', 1)
+        moved, moved2 = web(moved), web(SAMPLE_XML.replace("[100,400][400,500]", "[100,460][400,560]"))
+        dm._last_xml, dm._last_xml_t = web(SAMPLE_XML), 0
+        dm.d = _FakeServer([moved, moved2, moved2], screen_on=True)
         dm.cmd_act(json.dumps({"tap_label": "OK"}))
         self.assertEqual(sent[-1][1], ("click", [250, 510]))
         self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"] * 3)
         # still moving after three reads: the newest place is tapped
-        moved3 = SAMPLE_XML.replace("[100,400][400,500]", "[100,480][400,580]")
+        moved3 = web(SAMPLE_XML.replace("[100,400][400,500]", "[100,480][400,580]"))
+        dm._last_xml, dm._last_xml_t = web(SAMPLE_XML), 0
         dm.d = _FakeServer([moved, moved2, moved3], screen_on=True)
-        dm._last_xml_t = 0
         dm.cmd_act(json.dumps({"tap_label": "OK"}))
         self.assertEqual(sent[-1][1], ("click", [250, 530]))
         self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"] * 3)
         # the assistant's read didn't have the row whole (cut off at an
         # edge, then nudged): two reads that agree, then the tap
         dm._last_xml = CLIPPED_XML
-        dm.d = _FakeServer([SAMPLE_XML, SAMPLE_XML], screen_on=True)
+        dm.d = _FakeServer([web(SAMPLE_XML), web(SAMPLE_XML)], screen_on=True)
         dm.cmd_act(json.dumps({"tap_label": "OK"}))
         self.assertEqual(sent[-1][1], ("click", [250, 450]))
         self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"] * 2)
@@ -3901,13 +3913,14 @@ class LabelTapTests(OfflineTestCase):
         self.assertEqual(dm.d.calls, [])
         self.assertEqual(dm._last_xml, after)
         self.assertLess(mod._time.monotonic() - dm._last_xml_t, 5.0)
-        # from an older read: the fresh read, the tap where the row is
-        # now, the pause, the wait and the read; no screen sent back
+        # from an older read: the fresh read, then the row tapped by its
+        # words (the phone finds it where it is at tap time), the wait and
+        # the read; no screen sent back
         dm._last_xml_t = 0
         self.assertEqual(dm.cmd_act(json.dumps({"tap_label": "OK", "quiet": True, "idle": 1200})), b"ok")
         self.assertEqual([m for m, _ in sent[1]],
-                         ["wakeUp", "click", "dumpWindowHierarchy", "waitForIdle", "dumpWindowHierarchy"])
-        self.assertEqual(sent[1][1], ("click", [250, 450]))
+                         ["wakeUp", "count", "click", "waitForIdle", "dumpWindowHierarchy"])
+        self.assertEqual(sent[1][2][1][0]["text"], "OK")
         self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])
         self.assertEqual(dm._last_xml, after)
         self.assertEqual([m for m, _ in mod.act_calls({"key": 66, "quiet": True, "idle": 500})],

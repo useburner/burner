@@ -2301,10 +2301,11 @@ class U2Daemon:
             spec = dict(spec)
             label = spec.pop("tap_label")
             before = self._last_xml
+            tried = None
             if before and _time.monotonic() - self._last_xml_t < BY_WORDS_S:
                 try:
                     node, alt = label_node(before, label)
-                    spec["tap_selector"] = selector_for(node, alt)
+                    spec["tap_selector"] = tried = selector_for(node, alt)
                     spec["words"] = label
                 except RuntimeError:
                     pass
@@ -2321,9 +2322,22 @@ class U2Daemon:
                 raise RuntimeError("act not sent: the read before it failed (%s)"
                                    % err_text(e, 100))
             try:
-                center = label_target(xml, label)
+                node, alt = label_node(xml, label)
             except RuntimeError as e:
                 raise RuntimeError("act not sent: %s" % e)
+            center = tuple(node["center"])
+            fresh = selector_for(node, alt)
+            if not node["web"] and fresh != tried:
+                # a native row on the read just taken: the phone finds it
+                # by its words at tap time, where it is then, with no
+                # second read to see it hold its place (2.7-3.1s for a tap
+                # whose row came after the assistant's read, Oct 6)
+                spec["tap_selector"], spec["words"] = fresh, label
+                try:
+                    return self._act_batch(spec)
+                except _NotThere as e:
+                    spec.pop("tap_selector")
+                    log("%r not found by its words on the read just taken (%s)" % (label, e))
             try:
                 old = label_target(before, label)
             except RuntimeError:
