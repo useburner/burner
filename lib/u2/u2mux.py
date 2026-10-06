@@ -1312,6 +1312,29 @@ def act_calls(spec):
 ACTION_METHODS = ("click", "pressKeyCode", "setText")
 
 
+RELOOK_PAUSE_S = 0.4   # an action that left the screen as it was: this long, then
+RELOOK_IDLE_MS = 1200  # a wait for the UI to go quiet, this long at most, and a read
+
+
+def screen_sig(xml):
+    """What a read shows, for telling whether an action changed the
+    screen: each row's words, place and state (checked, selected,
+    focused), the system UI's rows aside (its clock and icons change on
+    their own). None for a read that can't be parsed. Pure."""
+    try:
+        return [(n["text"], n["desc"], tuple(n["center"]), n["checked"], n["selected"], n["focused"])
+                for n in iter_nodes(xml) if n["pkg"] != SYSTEM_UI]
+    except Exception:
+        return None
+
+
+def chrome_in(xml):
+    """Whether a read shows Chrome (a page there is read by the page
+    itself after an action). Pure."""
+    pkgs = set(re.findall(r'package="([^"]*)"', xml or ""))
+    return bool(pkgs & set(_cdp().CHROME_PACKAGES))
+
+
 def focused_field_selector(rid=""):
     """The phone's selector for the text field that has the focus: that
     very field when its resource id is known (a field that lost the focus
@@ -2387,6 +2410,8 @@ class U2Daemon:
         calls = act_calls(spec)
         acted = [i for i, (m, _) in enumerate(calls) if m in ACTION_METHODS]
         timeout = int(spec.get("idle", 2000)) / 1000.0 + 20
+        last, last_t = getattr(self, "_last_xml", ""), getattr(self, "_last_xml_t", 0.0)
+        before = last if last and _time.monotonic() - last_t < BY_WORDS_S else None
         with self._lock:
             self.invalidate()
             with _t("act batch" + (" (by words)" if "tap_selector" in spec else "")):
@@ -2446,6 +2471,9 @@ class U2Daemon:
                 if woke and acted:
                     raise RuntimeError("act failed after sending: the screen was off, so "
                                        "it was probably dropped; the screen is on now")
+            if (before and acted and "set_text" not in spec and not sleeps_the_screen(spec)
+                    and not chrome_in(xml) and screen_sig(xml) == screen_sig(before)):
+                xml = self._relook(xml)
             # The action landed in Chrome: the page itself says what it
             # shows now (the screen reader's tree may lag it). The read is
             # the newest first, so that the page is asked only with Chrome
@@ -2457,6 +2485,29 @@ class U2Daemon:
                 xml = page_xml
                 self._remember(xml)
         return xml.encode()
+
+    def _relook(self, xml):
+        """The read after an action that shows the screen exactly as it
+        was before: one more, a moment later, in one trip. A tap that
+        opens another app's window draws nothing for most of a second,
+        so the wait for the UI to go quiet ended at once and the read
+        showed the screen from before the tap (Settings' search bar,
+        Oct 6). The new read when it has words, else the one in hand."""
+        _time.sleep(RELOOK_PAUSE_S)
+        try:
+            with _t("act relook"):
+                res = self._batch([("waitForIdle", [RELOOK_IDLE_MS]),
+                                   ("dumpWindowHierarchy", [False, DUMP_DEPTH])],
+                                  timeout=RELOOK_IDLE_MS / 1000.0 + 20)
+        except Exception as e:
+            log("the screen looked unchanged after the action; the read again failed (%s)" % err_text(e, 80))
+            return xml
+        again = res[-1]
+        if not isinstance(again, str) or not has_words(again):
+            return xml
+        log("the screen looked unchanged after the action; read again: %s"
+            % ("changed" if screen_sig(again) != screen_sig(xml) else "still the same"))
+        return again
 
     def cmd_health(self, _):
         with self._lock:
@@ -2511,7 +2562,7 @@ _BOUNDS_RE = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
 
 def iter_nodes(xml):
     """Yield {text, desc, bounds, center, rect, enabled, clickable,
-    selected, focused, rid, web, field, cls, parent} for every node with
+    selected, focused, checked, pkg, rid, web, field, cls, parent} for every node with
     non-empty on-screen bounds,
     in document order; web: the node is inside a WebView (a browser's
     page, an app's web content); field: a text field (its text is what
@@ -2533,6 +2584,7 @@ def iter_nodes(xml):
                        "enabled": n.get("enabled") != "false",
                        "clickable": n.get("clickable") == "true",
                        "selected": n.get("selected") == "true", "focused": n.get("focused") == "true",
+                       "checked": n.get("checked") == "true", "pkg": n.get("package") or "",
                        "rid": n.get("resource-id") or "", "web": web,
                        "field": "edittext" in cls, "cls": cls, "parent": parent}
                 parent = count[0]

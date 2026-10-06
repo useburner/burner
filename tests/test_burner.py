@@ -3802,10 +3802,11 @@ class LabelTapTests(OfflineTestCase):
         mod.log = lambda *a: None
         dm.d = _FakeServer([SAMPLE_XML], screen_on=True)
         sent = []
+        tapped = SAMPLE_XML.replace('text="Hello"', 'text="Hello, tapped"')  # the screen after each tap
 
         def batch(calls, timeout=45.0):
             sent.append(calls)
-            return [None] * (len(calls) - 1) + [SAMPLE_XML]
+            return [None] * (len(calls) - 1) + [tapped]
         dm._batch = batch
         # the newest read is young and has the row once, whole and clear:
         # the phone finds it by its words at tap time, in the one round
@@ -3820,8 +3821,8 @@ class LabelTapTests(OfflineTestCase):
         def batch_miss(calls, timeout=45.0):
             sent.append(calls)
             if isinstance(calls[1][1][0], dict):
-                return [None, 0, RuntimeError("UiObjectNotFoundException")] + [None] * (len(calls) - 4) + [SAMPLE_XML]
-            return [None] * (len(calls) - 1) + [SAMPLE_XML]
+                return [None, 0, RuntimeError("UiObjectNotFoundException")] + [None] * (len(calls) - 4) + [tapped]
+            return [None] * (len(calls) - 1) + [tapped]
         dm._batch = batch_miss
         dm.cmd_act(json.dumps({"tap_label": "OK"}))
         self.assertEqual(sent[-1][1], ("click", [250, 450]))
@@ -4898,6 +4899,51 @@ class WebPathTests(OfflineTestCase):
         with self.assertRaises(RuntimeError) as cm:
             act(SAMPLE_XML)
         self.assertEqual(str(cm.exception), dm.NO_FIELD_TAP)
+
+    def test_an_action_that_left_the_screen_as_it_was_is_read_again(self):
+        # Settings, Oct 6: the search bar opens another app's window, which
+        # draws nothing for most of a second; the read after the tap showed
+        # the main page, and the tap printed the screen from before it
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        self.assertEqual(mod.screen_sig(SAMPLE_XML), mod.screen_sig(SAMPLE_XML))
+        self.assertNotEqual(mod.screen_sig(SAMPLE_XML), mod.screen_sig(SAMPLE_XML.replace('focused="true"', 'focused="false"')))
+        self.assertNotEqual(mod.screen_sig(SAMPLE_XML), mod.screen_sig(TAP_XML))
+        clock = SAMPLE_XML.replace("</hierarchy>", '<node text="12:01" package="com.android.systemui" class="android.widget.TextView" bounds="[0,0][90,40]"/></hierarchy>')
+        self.assertEqual(mod.screen_sig(clock), mod.screen_sig(clock.replace("12:01", "12:02")))  # the status bar's clock aside
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        mod._cdp = lambda: SimpleNamespace(CHROME_PACKAGES=("com.android.chrome",))
+        dm._page_read = lambda: None
+        batches = []
+        results = SAMPLE_XML.replace('text="Hello"', 'text="Search results"')  # the screen the tap opened
+
+        def run(spec, after, again=results, before=SAMPLE_XML):
+            batches.clear()
+            dm._last_xml, dm._last_xml_t = before, mod._time.monotonic()
+            reads = iter([after, again])
+
+            def batch(calls, timeout=45.0):
+                batches.append([m for m, _ in calls])
+                return [True] * (len(calls) - 1) + [next(reads)]
+            dm._batch = batch
+            return dm._act_batch(spec).decode()
+        # a tap whose read shows the screen from before: read again, the new screen kept
+        self.assertEqual(run({"tap": [250, 450], "idle": 1200}, SAMPLE_XML), results)
+        self.assertEqual(batches[1], ["waitForIdle", "dumpWindowHierarchy"])
+        self.assertEqual(dm._last_xml, results)
+        # a key too; still the same after: kept as it is
+        self.assertEqual(run({"key": 4, "idle": 1200}, SAMPLE_XML, again=SAMPLE_XML), SAMPLE_XML)
+        self.assertEqual(len(batches), 2)
+        # the screen changed: one trip; typing, a chained step, Chrome, no read before: one trip
+        for spec, after, before in (({"tap": [250, 450]}, results, SAMPLE_XML),
+                                    ({"set_text": "x"}, SAMPLE_XML, SAMPLE_XML),
+                                    ({"tap": [250, 450], "quiet": True}, SAMPLE_XML, SAMPLE_XML),
+                                    ({"tap": [250, 450]}, SAMPLE_XML.replace("com.example", "com.android.chrome"),
+                                     SAMPLE_XML.replace("com.example", "com.android.chrome")),
+                                    ({"tap": [250, 450]}, SAMPLE_XML, "")):
+            run(spec, after, before=before)
+            self.assertEqual(len(batches), 1, spec)
 
     def test_a_tap_then_type_batch(self):
         mod = _u2mux()
