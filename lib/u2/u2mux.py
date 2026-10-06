@@ -603,6 +603,42 @@ def apply_fast_config(d):
         log("configurator tweak failed:", err_text(e))
 
 
+GONE_WORDS = ("not online", "not found", "offline", "no devices", "no device")
+
+
+def device_gone(text):
+    """Whether an error from adb, or from the UI server's connect, says the
+    phone itself is gone from adb (the link through the tunnel dropped),
+    not that the server is sick. Pure."""
+    t = (text or "").lower()
+    return any(w in t for w in GONE_WORDS)
+
+
+def reconnect_device():
+    """The phone back on adb, as `burner ensure` does it: the tunnel
+    started (nothing when it runs) and `adb connect` to the target. True
+    when adb says it is connected. The link through the tunnel drops
+    after hours idle; the server on the phone is fine then, and a
+    command that restarted it instead ran into the 60s watchdog, three
+    times in a row (Oct 6)."""
+    tunnel = os.path.join(ROOT, "tunnel.sh")
+    if os.path.exists(tunnel):
+        try:
+            subprocess.run(["bash", tunnel, "start"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=20)
+        except Exception as e:
+            log("the tunnel couldn't be started (%s)" % err_text(e, 80))
+    try:
+        import adbutils
+        out = adbutils.adb.connect(TARGET, timeout=10)
+    except Exception as e:
+        log("adb connect %s failed (%s)" % (TARGET, err_text(e, 100)))
+        return False
+    out = " ".join(str(out).split())
+    log("adb connect %s: %s" % (TARGET, out[:80]))
+    return "connected" in out
+
+
 def ensure_server(force=False):
     """The on-device uiautomator2 server, listening and able to read the
     screen; restarted (killed on the phone, started fresh) when it
@@ -630,6 +666,17 @@ def ensure_server(force=False):
             log("server answers but reads empty or wordless screens; restarting it")
         except Exception as e:
             first = err_text(e)
+            if device_gone(first) and reconnect_device():
+                # the phone was gone from adb, not the server from the
+                # phone: back on adb, the server is asked again first
+                try:
+                    d = u2.connect(TARGET)
+                    apply_fast_config(d)
+                    if server_works(d, words=True):
+                        log("the phone is back on adb (%s); the server answers" % first)
+                        return d
+                except Exception as e2:
+                    first = err_text(e2)
             log("server not responding (%s); restarting it" % first)
     why = "no read"
     for attempt, pause in ((1, 1.0), (2, 2.0)):

@@ -5695,6 +5695,45 @@ class EmptyScreenTests(OfflineTestCase):
         self.assertEqual(mod.read_screen(Server()), SAMPLE_XML)
         self.assertEqual(seen, [("dumpWindowHierarchy", [False, 50], mod.DUMP_RPC_TIMEOUT)])
 
+    def test_helper_reconnects_the_phone_before_restarting_its_server(self):
+        # Oct 6: after hours idle the link through the tunnel had dropped;
+        # the server was fine, adb had lost the phone, and the helper's
+        # two restart tries ran three commands into the 60s watchdog
+        mod = _u2mux()
+        self.no_sleep(mod)
+        self.assertTrue(mod.device_gone("ConnectError: device 127.0.0.1:15555 not online"))
+        self.assertTrue(mod.device_gone("AdbError: device '127.0.0.1:15555' not found"))
+        self.assertFalse(mod.device_gone("RuntimeError: server can't read the screen"))
+        back = _FakeServer([SAMPLE_XML])
+        answers = iter([Exception("ConnectError: device 127.0.0.1:15555 not online"), back])
+
+        def connect(target):
+            a = next(answers)
+            if isinstance(a, Exception):
+                raise a
+            return a
+        fake_u2 = SimpleNamespace(connect=connect)
+        fake_adbutils = SimpleNamespace(adb=SimpleNamespace(
+            device=lambda target: self.fail("no server restart: the phone was the problem")))
+        calls = []
+        mod.reconnect_device = lambda: calls.append("reconnect") or True
+        mod.server_works = lambda d, words=False: True
+        mod.apply_fast_config = lambda d: None
+        with mock.patch.dict(sys.modules, {"uiautomator2": fake_u2, "adbutils": fake_adbutils}):
+            d = mod.ensure_server()
+        self.assertIs(d, back)
+        self.assertEqual(calls, ["reconnect"])
+        # the phone not coming back: the restart tries, as before
+        answers = iter([Exception("ConnectError: device 127.0.0.1:15555 not online")] * 3)
+        restarts = []
+        fake_adbutils = SimpleNamespace(adb=SimpleNamespace(
+            device=lambda target: restarts.append(1) or (_ for _ in ()).throw(RuntimeError("AdbError: device not found"))))
+        mod.reconnect_device = lambda: calls.append("reconnect") or False
+        with mock.patch.dict(sys.modules, {"uiautomator2": fake_u2, "adbutils": fake_adbutils}):
+            with self.assertRaises(RuntimeError):
+                mod.ensure_server()
+        self.assertEqual((calls, restarts), (["reconnect", "reconnect"], [1, 1]))
+
     def test_helper_ensure_server_kills_and_relaunches(self):
         mod = _u2mux()
         self.no_sleep(mod)
