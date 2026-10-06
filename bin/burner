@@ -2112,29 +2112,13 @@ def cmd_snap(args):
 
 
 def _capture_evidence(tag):
-    """Capture failure evidence: screenshot + compact dump. Returns a dict
-    with 'screenshot' (path or None) and 'screen' (list of top dump lines).
-    Best-effort: never raises, never blocks the error report."""
+    """Capture failure evidence: the screen's top rows, from the read just
+    taken. Returns a dict with 'screenshot' (None: a failed tap used to
+    take one, 1.45s, which the assistant didn't open and took again with
+    `burner shot`, Oct 6) and 'screen' (a list of top dump lines). `tag`
+    names the failure (tap-fail, wait-fail). Best-effort: never raises,
+    never blocks the error report."""
     ev = {"screenshot": None, "screen": []}
-    try:
-        # The UI helper's JPEG (~1s) first; screenshot.sh's adb PNG takes 3-4s.
-        ev["screenshot"] = shot_fast(os.path.join(ROOT, "shots", "{}-{}.jpg".format(
-            tag, time.strftime("%Y%m%d-%H%M%S"))))
-    except Exception:
-        pass
-    try:
-        if not ev["screenshot"]:
-            # Screenshot via the repo's screenshot.sh (wakes screen, saves to shots/).
-            r = subprocess.run([os.path.join(ROOT, "screenshot.sh")],
-                               capture_output=True, text=True, timeout=30)
-            out = (r.stdout or "").strip().splitlines()
-            # screenshot.sh prints the saved path on its last line.
-            for line in reversed(out):
-                if line.endswith(".png") and os.path.exists(line):
-                    ev["screenshot"] = line
-                    break
-    except Exception:
-        pass
     try:
         nodes = walk(ui_dump())
         # Top 15 nodes with text/desc, compact one-line format.
@@ -2159,12 +2143,14 @@ def _format_evidence(ev):
         lines.append("  screen was showing:")
         for s in ev["screen"][:10]:
             lines.append("    - {}".format(s))
+        if not ev.get("screenshot"):
+            lines.append("  (`burner state` lists it all; `burner shot` shows it)")
     return "\n".join(lines)
 
 
 def _tap_fail(args, msg, evidence=True):
     """Report a tap failure: human text on stderr, pure JSON on stdout with --json.
-    Attaches failure evidence (screenshot + screen contents) unless --no-evidence
+    Attaches failure evidence (the screen's top rows) unless --no-evidence
     or the message is its own evidence (evidence=False)."""
     ev = None
     if evidence and not getattr(args, "no_evidence", False):
@@ -2917,7 +2903,7 @@ def _wait_timeout_msg(args, suffix=""):
 
 def _wait_fail(args, msg):
     """Wait failure: human text on stderr, pure JSON on stdout with --json.
-    Attaches failure evidence (screenshot + screen contents) unless --no-evidence."""
+    Attaches failure evidence (the screen's top rows) unless --no-evidence."""
     ev = None
     if not getattr(args, "no_evidence", False):
         ev = _capture_evidence("wait-fail")
@@ -5126,7 +5112,7 @@ def build_parser():
                    help="after tapping, wait for the screen to stop changing "
                         "and show what appeared/disappeared")
     p.add_argument("--no-evidence", action="store_true",
-                   help="skip screenshot+dump capture on failure")
+                   help="skip the screen rows printed on failure")
     p.add_argument("--quiet", "-q", action="store_true",
                    help="don't print the screen afterwards")
     p.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
@@ -5142,7 +5128,7 @@ def build_parser():
     p.add_argument("--absent", action="store_true",
                    help="wait until the text disappears")
     p.add_argument("--no-evidence", action="store_true",
-                   help="skip screenshot+dump capture on failure")
+                   help="skip the screen rows printed on failure")
     p.add_argument("--quiet", "-q", action="store_true",
                    help="don't print the screen afterwards")
     p.add_argument("--json", action="store_true", default=argparse.SUPPRESS,

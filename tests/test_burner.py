@@ -8081,6 +8081,18 @@ class AirbnbRoundTests(OfflineTestCase):
             self.assertIn("gone from adb", str(cm.exception))
         self.assertFalse(pc.helper_lost_phone())
 
+    def test_a_failed_tap_s_evidence_takes_no_screenshot(self):
+        # Oct 6: a failed `tap Storage` took 3.3s, 1.45s of it a screenshot
+        # the assistant never opened (it took its own with `burner shot`)
+        self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
+        with mock.patch.object(pc, "shot_fast", side_effect=AssertionError("no screenshot")):
+            ev = pc._capture_evidence("tap-fail")
+        self.assertIsNone(ev["screenshot"])
+        self.assertIn("Hello [TextView]", ev["screen"])
+        text = pc._format_evidence(ev)
+        self.assertIn("screen was showing:", text)
+        self.assertIn("(`burner state` lists it all; `burner shot` shows it)", text)
+
     def test_the_third_scroll_the_same_way_earns_a_hint(self):
         # Muse scrolled up eight times, a read each, to reach the top (Oct 5)
         import datetime
