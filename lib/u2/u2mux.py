@@ -544,17 +544,20 @@ SYSTEM_UI = "com.android.systemui"
 
 def blank_screen(xml):
     """True for a read with no app on it: no node at all, or nothing but
-    the system UI's bare window (a node or two). The latter is what an
-    off screen reads like: the shade's window holds the focus with
-    nothing in it (Oct 4, a Pixel 7 off its charger, whose screen turns
-    off after 10s: label taps missed and `wait` timed out while
-    screenshots, which wake the phone first, looked fine). A pulled-down
-    shade or a lock screen has many more nodes. Pure."""
+    the system UI's windows with no word on them. An off screen reads
+    like that: the shade's bare window holds the focus (Oct 4, a Pixel 7
+    off its charger, whose screen turns off after 10s: label taps missed
+    and `wait` timed out while screenshots, which wake the phone first,
+    looked fine). So does a cold start whose window isn't in the screen
+    reader's tree yet: the status and navigation bars alone, 15 nodes and
+    no word, for 6-14s after the Play Store had drawn its first screen
+    (Oct 6; taken for a server that reads no words, it was replaced:
+    10s). A pulled-down shade or a lock screen has words. Pure."""
     if not real_screen(xml):
         return True
-    if xml.count("<node") > 2:
+    if not set(re.findall(r'package="([^"]*)"', xml)) <= {SYSTEM_UI}:
         return False
-    return set(re.findall(r'package="([^"]*)"', xml)) <= {SYSTEM_UI}
+    return xml.count("<node") <= 2 or re.search(r'\s(?:text|content-desc)="[^"]+"', xml) is None
 
 
 def mute_read(xml):

@@ -4096,6 +4096,51 @@ class StartAndSettingsTests(OfflineTestCase):
         self.assertIn("screen: com.example", out.getvalue())
         self.assertNotIn("screen: com.android.launcher", out.getvalue())
 
+    def test_a_start_whose_window_is_not_in_the_tree_yet_is_waited_for(self):
+        # the Play Store, Oct 6: drawn 2.4s after a cold start, while the
+        # reads held only the system UI's bars, no word, for 6-14s
+        self.allow("scrcpy_send", return_value=True)
+        self.allow("u2_invalidate")
+        self.allow("nav_record")
+        self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout="package:/data/app/x/base.apk\n", stderr=""))
+        reads = []
+
+        def u2(cmd, arg="", timeout=30):
+            reads.append(cmd)
+            return BARS_XML if len(reads) <= 7 else SAMPLE_XML
+        self.allow("u2sock", side_effect=u2)
+        self.allow("ui_dump", side_effect=lambda **kw: ET.fromstring(BARS_XML if len(reads) <= 7 else SAMPLE_XML))
+        with mock.patch.object(pc.time, "sleep"), mock.patch.object(pc, "LAUNCH_SLOW_S", 0), \
+                self.cap() as (out, err):
+            rc = pc.cmd_start(self.parse(["start", "com.example"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertIn("screen: com.example", out.getvalue())  # read on past the other budget
+        self.assertNotIn("no app's window", out.getvalue())
+        # never there: said so, with the way to see the screen
+        reads.clear()
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30: reads.append(cmd) or BARS_XML)
+        self.allow("ui_dump", side_effect=lambda **kw: ET.fromstring(BARS_XML))
+        with mock.patch.object(pc.time, "sleep"), mock.patch.object(pc, "LAUNCH_TREE_S", 0), \
+                self.cap() as (out, err):
+            rc = pc.cmd_start(self.parse(["start", "com.example"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertIn("(no app's window in the screen reader's tree yet; `burner shot` shows the screen)", out.getvalue())
+        # the helper takes such a read for no app on the screen, not for a
+        # server reading no words: never replaced for it, however long
+        mod = _u2mux()
+        self.assertTrue(mod.blank_screen(BARS_XML))
+        self.assertFalse(mod.mute_read(BARS_XML))
+        self.assertFalse(mod.blank_screen(BARS_XML.replace('content-desc=""', 'content-desc="Battery 80 percent"', 1)))
+        self.assertFalse(mod.blank_screen(MUTE_XML))
+        self.assertTrue(mod.mute_read(MUTE_XML))
+        EmptyScreenTests.no_sleep(self, mod)
+        dm = EmptyScreenTests._daemon(self, mod)  # a server restart fails the test
+        dm.d = _FakeServer([BARS_XML] * 3, screen_on=True)
+        dm._page_read = lambda **kw: None
+        dm._mute_since = mod._time.monotonic() - 30  # a long wordless spell already
+        for _ in range(3):
+            self.assertEqual(dm._dump(fresh=True), BARS_XML)
+
     def test_start_uses_adb_without_the_scrcpy_helper(self):
         self.allow("scrcpy_send", side_effect=RuntimeError("no scrcpy"))
         adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(
@@ -4150,6 +4195,13 @@ EMPTY_XML = '<?xml version="1.0"?><hierarchy rotation="0" />'
 SHADE_NODE = ('<node index="0" text="" class="android.widget.FrameLayout" '
               'package="com.android.systemui" bounds="[0,0][1080,2400]" />')
 SHADE_XML = '<?xml version="1.0"?><hierarchy rotation="0">' + SHADE_NODE + '</hierarchy>'
+# the system UI's bars alone, no word: a cold start's window not in the
+# screen reader's tree yet (the Play Store, Oct 6)
+BARS_XML = ('<?xml version="1.0"?><hierarchy rotation="0">'
+            + "".join('<node index="%d" text="" class="android.widget.FrameLayout" package="com.android.systemui"'
+                      ' content-desc="" bounds="[0,%d][1080,%d]" />' % (i, i * 10, i * 10 + 8) for i in range(15))
+            + '</hierarchy>')
+
 # An app's nodes without one word on them: what a badly reading server
 # returned for a Settings page (Oct 4), and what a screen mid-draw looks like.
 MUTE_XML = ('<?xml version="1.0"?><hierarchy rotation="0">'
@@ -5482,8 +5534,13 @@ class EmptyScreenTests(OfflineTestCase):
         self.assertFalse(mod.blank_screen(SAMPLE_XML))
         # an app's bare window is the app, mid-draw: not blank
         self.assertFalse(mod.blank_screen(SHADE_XML.replace("com.android.systemui", "com.example")))
-        # a pulled-down shade or a lock screen has many nodes: not blank
-        self.assertFalse(mod.blank_screen(SHADE_XML.replace(SHADE_NODE, SHADE_NODE * 5)))
+        # a pulled-down shade or a lock screen has words: not blank
+        clock = SHADE_NODE.replace('text=""', 'text="12:30"')
+        self.assertFalse(mod.blank_screen(SHADE_XML.replace(SHADE_NODE, SHADE_NODE * 4 + clock)))
+        # the system UI's bars alone with no word, however many: no app on
+        # the screen (a cold start's window not in the tree yet, Oct 6)
+        self.assertTrue(mod.blank_screen(SHADE_XML.replace(SHADE_NODE, SHADE_NODE * 5)))
+        self.assertTrue(mod.blank_screen(BARS_XML))
 
     def test_helper_mute_read(self):
         mod = _u2mux()
