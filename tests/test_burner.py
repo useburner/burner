@@ -5815,6 +5815,89 @@ class EmptyScreenTests(OfflineTestCase):
             with self.assertRaises(mod.LinkDead):
                 ka.request(dev, 9008, "GET", "/ping")
 
+    def test_a_frozen_link_is_found_while_an_answer_is_awaited(self):
+        # Oct 6, a stopped tunnel leg: a read on a reused stream waited its
+        # whole 25s before the link was looked at (34s for one `state`)
+        mod = _u2mux()
+        self.no_sleep(mod)
+        clock = [100.0]
+        waits, probes, closed = [], [], []
+
+        def select_never(r, w, x, t):
+            waits.append(t)
+            clock[0] += t
+            return [], [], []
+        conn = SimpleNamespace(sock=object(), close=lambda: closed.append("conn"))
+        ka = mod.KeepAliveHTTP()
+
+        def dead(dev, port, timeout=None):
+            probes.append(timeout)
+            raise mod.LinkDead("no answer from the phone's adb in 3s (stream open)")
+        with mock.patch.object(mod._time, "monotonic", lambda: clock[0]), \
+                mock.patch.object(mod.select, "select", select_never), \
+                mock.patch.object(mod, "open_stream", dead):
+            with self.assertRaises(mod.LinkDead):
+                ka._wait_answer(conn, None, 9008, 25.0)
+        self.assertEqual((waits, probes, closed), ([3.0], [3.0], ["conn"]))  # at 3s, not 25
+        # a slow server on a live link: checked, then waited for
+        waits.clear()
+        probes.clear()
+        answers = iter([False, False, True])
+
+        def select_late(r, w, x, t):
+            waits.append(t)
+            clock[0] += t
+            return ([r[0]] if next(answers) else []), [], []
+
+        def alive(dev, port, timeout=None):
+            probes.append(timeout)
+            return SimpleNamespace(close=lambda: closed.append("probe"))
+        with mock.patch.object(mod._time, "monotonic", lambda: clock[0]), \
+                mock.patch.object(mod.select, "select", select_late), \
+                mock.patch.object(mod, "open_stream", alive):
+            ka._wait_answer(conn, None, 9008, 25.0)
+        self.assertEqual((waits, probes), ([3.0, 5.0, 5.0], [3.0, 3.0]))
+        self.assertEqual(closed, ["conn", "probe", "probe"])
+        # an answer at once: no check; a short timeout: no check past it
+        waits.clear()
+        probes.clear()
+        with mock.patch.object(mod._time, "monotonic", lambda: clock[0]), \
+                mock.patch.object(mod.select, "select", lambda r, w, x, t: (r, [], [])), \
+                mock.patch.object(mod, "open_stream", alive):
+            ka._wait_answer(conn, None, 9008, 25.0)
+        with mock.patch.object(mod._time, "monotonic", lambda: clock[0]), \
+                mock.patch.object(mod.select, "select", select_never), \
+                mock.patch.object(mod, "open_stream", alive):
+            ka._wait_answer(conn, None, 9008, 2.0)
+        self.assertEqual((waits, probes), ([2.0], []))
+        # nothing to watch (not a socket): the read decides
+        with mock.patch.object(mod.select, "select", mock.Mock(side_effect=TypeError("not a socket"))):
+            ka._wait_answer(conn, None, 9008, 25.0)
+        # in a request: a dead link ends it, and its stream is dropped
+        core = mock.Mock(HTTPResponse=lambda content: SimpleNamespace(content=content), HTTPError=Exception)
+        dev = SimpleNamespace(serial="s")
+        sent = []
+        stream = SimpleNamespace(via_adb=True, sock=SimpleNamespace(settimeout=lambda t: None),
+                                 request=lambda *a, **k: sent.append(a[1]),
+                                 getresponse=lambda: self.fail("no read on a dead link"),
+                                 close=lambda: None)
+        ka._conns[(dev.serial, 9008)] = [stream, mod._time.monotonic()]
+        ka._wait_answer = mock.Mock(side_effect=mod.LinkDead("no answer"))
+        with mock.patch.dict(sys.modules, {"uiautomator2": mock.Mock(core=core), "uiautomator2.core": core}):
+            with self.assertRaises(mod.LinkDead):
+                ka.request(dev, 9008, "POST", "/jsonrpc/0", data=[{"method": "dumpWindowHierarchy"}])
+        self.assertEqual((sent, ka._conns), (["/jsonrpc/0"], {}))
+        # a stream that isn't adb's (the direct route): not watched
+        ka._wait_answer.reset_mock()
+        direct = SimpleNamespace(sock=SimpleNamespace(settimeout=lambda t: None),
+                                 request=lambda *a, **k: None, close=lambda: None,
+                                 getresponse=lambda: SimpleNamespace(status=200, reason="OK", will_close=False,
+                                                                     read=lambda: b"{}", getheader=lambda n: ""))
+        ka._conns[(dev.serial, 9008)] = [direct, mod._time.monotonic()]
+        with mock.patch.dict(sys.modules, {"uiautomator2": mock.Mock(core=core), "uiautomator2.core": core}):
+            ka.request(dev, 9008, "GET", "/ping")
+        ka._wait_answer.assert_not_called()
+
     def test_reconnect_device_escalates_to_adb_s_server(self):
         # Oct 6: adb kept the dead link as a device and said "already
         # connected" to a connect; what put the phone back was `burner

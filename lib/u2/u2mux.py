@@ -23,6 +23,7 @@ import http.client
 import json
 import os
 import re
+import select
 import socket
 import subprocess
 import sys
@@ -205,6 +206,7 @@ def direct_http(ip, port, timeout):
 
 
 STREAM_OPEN_S = 6.0  # opening a stream to the server through adb: 0.15-0.4s when the link is up
+PROBE_STREAM_S = 3.0  # the same, as a check of the link while an answer is awaited
 
 
 class LinkDead(Exception):
@@ -234,6 +236,7 @@ def open_stream(dev, port, timeout=STREAM_OPEN_S):
         raise
     t.conn.settimeout(None)
     conn.sock = t.conn
+    conn.via_adb = True  # its link is checked while an answer is awaited (see _wait_answer)
     return conn
 
 
@@ -266,6 +269,10 @@ class KeepAliveHTTP:
     # outside the lock, so this never delays a real request.
     WARM_S = 60.0
     REFRESH_S = 3.0
+    # An answer awaited on an adb stream: no byte this long, and the link
+    # is checked (a second stream opened); again this often after.
+    ANSWER_PROBE_S = 3.0
+    ANSWER_REPROBE_S = 5.0
 
     def __init__(self):
         import threading
@@ -389,6 +396,40 @@ class KeepAliveHTTP:
                 c.close()
             self._conns.clear()
 
+    def _wait_answer(self, conn, dev, port, timeout):
+        """Wait for the first bytes of the answer to a request sent on an
+        adb stream, checking the link while none come: a link through the
+        tunnel that froze (adb's table says "device", nothing gets
+        through) kept a read waiting its whole 25s before the link was
+        looked at (Oct 6, a stopped tunnel leg: 34s for one `state`). The
+        check opens a second stream to the server, PROBE_STREAM_S at
+        most. Raises LinkDead (the stream closed) when the link doesn't
+        answer; returns when the answer starts, when the timeout passes
+        (the read then raises its own timeout) or when the wait can't be
+        watched."""
+        deadline = _time.monotonic() + timeout
+        wait = self.ANSWER_PROBE_S
+        while True:
+            left = deadline - _time.monotonic()
+            if left <= 0:
+                return
+            try:
+                ready, _, _ = select.select([conn.sock], [], [], min(wait, left))
+            except (OSError, ValueError, TypeError):
+                return  # no socket to watch: the read decides
+            if ready or deadline - _time.monotonic() <= 0:
+                return
+            try:
+                open_stream(dev, port, timeout=PROBE_STREAM_S).close()
+            except LinkDead:
+                log("no answer in %.0fs and the link answers nothing: it is dead"
+                    % (timeout - (deadline - _time.monotonic())))
+                conn.close()
+                raise
+            except Exception:
+                return  # adb answered (the phone gone, say): the read decides
+            wait = self.ANSWER_REPROBE_S
+
     def request(self, dev, port, method, path, data=None, timeout=10.0,
                 print_request=False, replay=True):
         from uiautomator2.core import HTTPResponse, HTTPError
@@ -430,6 +471,8 @@ class KeepAliveHTTP:
                 try:
                     conn.request(method, path, body, headers=headers)
                     sent = True
+                    if getattr(conn, "via_adb", False):
+                        self._wait_answer(conn, dev, port, timeout)
                     resp = conn.getresponse()
                     content = resp.read()
                 except (http.client.RemoteDisconnected, BrokenPipeError,
@@ -2347,18 +2390,18 @@ class U2Daemon:
             # Maybe the on-device server died — reconnect once and retry.
             # The RLock makes concurrent handlers queue behind one reconnect.
             with self._lock:
-                gone, answers = phone_gone(e), False
+                gone, answers, why = phone_gone(e), False, e
                 if not gone:
                     try:
                         self.d.info
                         answers = True  # the server answers: the command is sent again
                     except Exception as e2:
-                        gone = phone_gone(e2)
+                        gone, why = phone_gone(e2), e2
                 if gone:
                     # the phone gone from adb (its link dropped), not the
                     # server from the phone: the link is remade whatever
                     # the restart cooldown says, since nothing is killed
-                    self._relink(err_text(e, 100))
+                    self._relink(err_text(why, 100))
                 elif not answers:
                     if not restart_allowed(_time.monotonic() - self._last_restart):
                         raise  # a restart a moment ago: no kill/relaunch loop
