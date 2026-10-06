@@ -4507,6 +4507,10 @@ def _scroll_plain(direction, times, quiet=False):
               file=sys.stderr)
     else:
         print("scrolled {} x{}".format(direction, times))
+        if times == 1:
+            hint = scroll_hint(direction)
+            if hint:
+                print("  " + hint)
     if root is not None:
         print_screen(root, note=note)
     return 1 if left else 0
@@ -4529,6 +4533,53 @@ def _scroll_plain_adb(direction, times, quiet=False):
         if root is not None:
             print_screen(root, note=note)
     return 0
+
+
+SCROLL_STREAK = 3       # the same scroll this many times in a row (this one included) earns the hint
+SCROLL_STREAK_S = 120   # within this long
+
+
+def scroll_streak(lines, direction, now):
+    """Whether the last logged commands are `scroll <direction>` by hand
+    (no --times, no --to), SCROLL_STREAK - 1 of them within
+    SCROLL_STREAK_S of `now` (a time.time()): with this scroll, a streak.
+    `lines` are run/commands.log lines (see log_line). Pure."""
+    import datetime
+    need = SCROLL_STREAK - 1
+    tail = [l.rstrip("\n") for l in lines if l.strip()][-need:]
+    if len(tail) < need:
+        return False
+    for line in tail:
+        m = re.match(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\s+\d+ms exit \d+ burner scroll (\S+)\s*$", line)
+        if not m or m.group(2) != direction:
+            return False
+        try:
+            t = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
+        except ValueError:
+            return False
+        if now - t > SCROLL_STREAK_S:
+            return False
+    return True
+
+
+def scroll_hint(direction):
+    """The hint printed on the third scroll the same way in a row: one
+    command goes further (eight `scroll up`s, a read each, took 13s to
+    reach the top of an app, Oct 5). Reads the command log; "" when
+    there is no streak or no log."""
+    if direction not in ("up", "down", "left", "right"):
+        return ""
+    try:
+        with open(COMMANDS_LOG, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()[-SCROLL_STREAK:]
+    except OSError:
+        return ""
+    if not scroll_streak(lines, direction, time.time()):
+        return ""
+    end = {"up": "top", "down": "bottom"}.get(direction)
+    return ("({n} scrolls {d} in a row: `burner scroll {d} --times 5` goes further in one command"
+            "{e})".format(n=SCROLL_STREAK, d=direction,
+                          e=", `burner scroll %s` to the end" % end if end else ""))
 
 
 def cmd_scroll(args):

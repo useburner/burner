@@ -7421,6 +7421,39 @@ class AirbnbRoundTests(OfflineTestCase):
         self.assertEqual([c[1] for c in calls], [{"key": 3, "idle": pc.IDLE_HOME_MS}, {"key": 4, "idle": pc.IDLE_ACT_MS}])
         self.assertIn("pressed HOME", out.getvalue())
 
+    def test_the_third_scroll_the_same_way_earns_a_hint(self):
+        # Muse scrolled up eight times, a read each, to reach the top (Oct 5)
+        import datetime
+        now = 1_800_000_000.0
+        stamp = lambda dt: datetime.datetime.fromtimestamp(now - dt).strftime("%Y-%m-%d %H:%M:%S")
+        up = lambda dt: "%s   1523ms exit 0 burner scroll up\n" % stamp(dt)
+        self.assertTrue(pc.scroll_streak([up(30), up(10)], "up", now))
+        self.assertTrue(pc.scroll_streak(["%s    20ms exit 0 burner state\n" % stamp(60), up(30), up(10)], "up", now))
+        self.assertFalse(pc.scroll_streak([up(30), "%s    20ms exit 0 burner state\n" % stamp(10)], "up", now))
+        self.assertFalse(pc.scroll_streak([up(30), up(10)], "down", now))  # the other way
+        self.assertFalse(pc.scroll_streak([up(300), up(10)], "up", now))  # too long ago
+        self.assertFalse(pc.scroll_streak(["%s   900ms exit 0 burner scroll up --times 3\n" % stamp(30), up(10)], "up", now))
+        self.assertFalse(pc.scroll_streak([up(10)], "up", now))
+        # the hint, from the command log, on a native scroll
+        self.allow("live_screen_dims", return_value=(1080, 2400))
+        self.allow("_scrcpy_swipe", return_value=True)
+        self.allow("read_after_root", return_value=(ET.fromstring(SAMPLE_XML), ""))
+        log = os.path.join(tempfile.mkdtemp(), "commands.log")
+        with open(log, "w", encoding="utf-8") as f:
+            f.write(up(30) + up(10))
+        with mock.patch.object(pc, "COMMANDS_LOG", log), mock.patch.object(pc, "_screen_pkg", "com.example"), \
+                mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc._scroll_plain("up", 1)
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertIn("(3 scrolls up in a row: `burner scroll up --times 5` goes further in one command, "
+                      "`burner scroll top` to the end)", out.getvalue())
+        # --times 2: no hint (the assistant uses it already); no streak: no hint
+        with mock.patch.object(pc, "COMMANDS_LOG", log), mock.patch.object(pc, "_screen_pkg", "com.example"), \
+                mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            pc._scroll_plain("up", 2)
+            pc._scroll_plain("down", 1)
+        self.assertNotIn("in a row", out.getvalue())
+
     def test_burner_tabs_lists_chrome_s_tabs(self):
         mod = _u2mux()
         calls = []
