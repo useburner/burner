@@ -5959,15 +5959,15 @@ class EmptyScreenTests(OfflineTestCase):
             return a
         dm.cmd_echo = echo
         events = []
-        back = _FakeServer([SAMPLE_XML])
+        server = dm.d
         mod.reconnect_device = lambda: events.append("reconnect") or True
         mod.apply_fast_config = lambda d: events.append("config")
         mod._KEEPALIVE = SimpleNamespace(close=lambda: events.append("close"))
-        fake_u2 = SimpleNamespace(connect=lambda target: events.append("connect") or back)
+        fake_u2 = SimpleNamespace(connect=lambda target: events.append("connect"))
         with mock.patch.dict(sys.modules, {"uiautomator2": fake_u2}):
             self.assertEqual(dm.handle("echo"), b"ok")
-        self.assertEqual(events, ["close", "reconnect", "connect", "config"])
-        self.assertIs(dm.d, back)
+        self.assertEqual(events, ["close", "reconnect"])  # the server's handle kept: no new one, no settings again
+        self.assertIs(dm.d, server)
         # the phone not coming back: the command fails with that, no restart
         answers = iter([ConnectionError("AdbError: device '127.0.0.1:15555' not found")])
         mod.reconnect_device = lambda: False

@@ -1670,11 +1670,12 @@ class U2Daemon:
         _time.sleep(0.4)
 
     def _relink(self, why):
-        """The phone back on adb and its server asked again, with no
-        restart: the link through the tunnel dropped (silently, after
-        hours idle, Oct 6) while the server on the phone is fine. Raises
-        when the phone doesn't come back."""
-        import uiautomator2 as u2
+        """The phone back on adb, with no restart: the link through the
+        tunnel dropped (after hours idle, Oct 6) while the server on the
+        phone is fine. The server's handle is kept: it names the phone by
+        its address, not by adb's link, and its settings live in the
+        server (asking for a new handle and setting them again cost
+        1-2.5s on Muse's box). Raises when the phone doesn't come back."""
         log("the phone is gone from adb (%s); reconnecting it" % why)
         _KEEPALIVE.close()
         with _t("adb reconnect"):
@@ -1682,8 +1683,6 @@ class U2Daemon:
         if not back:
             raise RuntimeError("the phone is gone from adb (%s) and did not come back "
                                "on a reconnect (adb connect %s)" % (why, TARGET))
-        self.d = u2.connect(TARGET)
-        apply_fast_config(self.d)
         self.invalidate()
 
     def _reconnect(self):
