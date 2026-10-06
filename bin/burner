@@ -4441,6 +4441,10 @@ def _web_scroll(direction, times=1, quiet=False):
         print("at the {}".format(direction))
     else:
         print("scrolled {} x{}".format(direction, times))
+        if times == 1:
+            hint = scroll_hint(direction)  # the same hint as a native scroll's
+            if hint:
+                print("  " + hint)
     if not quiet:
         print_screen(root, note=note)
     return 0

@@ -7496,6 +7496,11 @@ class AirbnbRoundTests(OfflineTestCase):
         self.assertEqual(rc, 0, err.getvalue())
         self.assertIn("(3 scrolls up in a row: `burner scroll up --times 5` goes further in one command, "
                       "`burner scroll top` to the end)", out.getvalue())
+        # a page in Chrome scrolled by the page itself: the same hint
+        self.allow("act_and_read", return_value=("ok", ET.fromstring(CHROME_XML), ""))
+        with mock.patch.object(pc, "COMMANDS_LOG", log), mock.patch.object(pc, "_screen_pkg", "com.android.chrome"),                 mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertEqual(pc._web_scroll("up", 1), 0)
+        self.assertIn("(3 scrolls up in a row:", out.getvalue())
         # --times 2: no hint (the assistant uses it already); no streak: no hint
         with mock.patch.object(pc, "COMMANDS_LOG", log), mock.patch.object(pc, "_screen_pkg", "com.example"), \
                 mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
