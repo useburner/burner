@@ -1024,24 +1024,34 @@ def clickable_target(node):
 
 
 
-# Every kind of space is one plain space when words are compared: Android
-# formats "6:30 AM" with a narrow no-break space before AM (U+202F), the
-# assistant types a plain one, and the exact match missed the row while
-# the fuzzy one found the two descriptions around it (the Clock app, Oct 5).
-_SPACES = dict.fromkeys(map(ord, "\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007"
-                                 "\u2008\u2009\u200a\u202f\u205f\u3000\t\r\n"), " ")
+# Words are compared in their plain form. Every kind of space is one
+# plain space: Android formats "6:30 AM" with a narrow no-break space
+# before AM (U+202F), the assistant types a plain one, and the exact match
+# missed the row while the fuzzy one found the two descriptions around it
+# (the Clock app, Oct 5). Typographic punctuation is its plain form: the
+# permission dialog's "Don\u2019t allow" has a curly apostrophe, the
+# assistant typed "Don't allow", and the tap failed twice (YouTube, Oct
+# 6); Settings writes "Wi\u2011Fi" with a non-breaking hyphen.
+_PLAIN = dict.fromkeys(map(ord, "\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007"
+                                "\u2008\u2009\u200a\u202f\u205f\u3000\t\r\n"), " ")
+_PLAIN.update(dict.fromkeys(map(ord, "\u2018\u2019\u201b\u2032\u02bc\uff07"), "'"))
+_PLAIN.update(dict.fromkeys(map(ord, "\u201c\u201d\u201e\u201f\u2033\uff02"), '"'))
+_PLAIN.update(dict.fromkeys(map(ord, "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\ufe63\uff0d"), "-"))
+_PLAIN[ord("\u2026")] = "..."
 
 
-def squash_spaces(s):
-    """`s` with every kind of space as one plain space, runs collapsed,
-    the ends trimmed. Pure."""
-    return " ".join((s or "").translate(_SPACES).split())
+def plain_words(s):
+    """`s` in its plain form, for comparing words: every kind of space as
+    one plain space (runs collapsed, the ends trimmed), curly quotes and
+    apostrophes, dashes and hyphens, and the ellipsis as their plain
+    forms. Pure."""
+    return " ".join((s or "").translate(_PLAIN).split())
 
 
 def find_nodes(nodes, text, exact=True):
     def label(n):
-        return squash_spaces(n["text"] or n["desc"] or "")
-    text = squash_spaces(text)
+        return plain_words(n["text"] or n["desc"] or "")
+    text = plain_words(text)
     if exact:
         return [n for n in nodes if label(n) == text]
     tl = text.lower()
@@ -3186,7 +3196,8 @@ def cmd_type(args):
             print("burner: the UI helper didn't confirm the tap on the field, "
                   "so it isn't tapped again; typing into whatever has the "
                   "focus now", file=sys.stderr)
-        time.sleep(0.5)
+        if got != "settled":
+            time.sleep(0.5)
     # Fast path: one atomic ACTION_SET_TEXT on the focused field, done by
     # the UI helper (it finds the field itself, so there is no screen read
     # first). set_text replaces the content, so --clear is implicit.
@@ -3236,15 +3247,16 @@ def cmd_type(args):
 
 
 def focus_field(label):
-    """Tap the field with this label: "done", "missing", or "unsure" when
-    the UI helper was asked and didn't answer (it may have tapped, so
-    there is no second tap). The helper's tap by label first: on a page
+    """Tap the field with this label: "settled" (the UI helper tapped it
+    and waited for the screen to settle), "done", "missing", or "unsure"
+    when the UI helper was asked and didn't answer (it may have tapped,
+    so there is no second tap). The helper's tap by label first: on a page
     it finds the field by its label and focuses a date, color or slider
     field without touching it (a touch on the label opened Chrome's
     picker, and the text went elsewhere)."""
     status, _root, _note = act_and_read({"tap_label": label})
     if status == "ok":
-        return "done"
+        return "settled"  # the helper's batch waited for the screen to settle
     if status == "lost" or status.startswith("failed"):
         return "unsure"
     r = u2sock("click_text", label, timeout=20)

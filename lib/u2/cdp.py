@@ -696,7 +696,7 @@ READ_JS = r"""
 # no choice, unless `index` picks one.
 FIND_JS = r"""
 (function(label, index, query, fill, exact){
-  const squash = s => (s || '').replace(/\s+/g, ' ').trim();
+  const squash = s => (s || '').replace(/[\u2018\u2019\u201B\u2032\u02BC\uFF07]/g, "'").replace(/[\u201C\u201D\u201E\u201F\u2033\uFF02]/g, '"').replace(/[\u2010-\u2015\u2212\uFE63\uFF0D]/g, '-').replace(/\u2026/g, '...').replace(/\s+/g, ' ').trim();
   const own = el => { let t = ''; for (const c of el.childNodes) if (c.nodeType === 3) t += c.nodeValue; return squash(t); };
   const attr = el => squash(el.getAttribute('aria-label') || el.getAttribute('alt') || el.getAttribute('title') || el.getAttribute('placeholder') || (el.tagName === 'INPUT' ? el.value : ''));
   const ACTIVE = 'a[href],button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=switch],[role=option],[onclick]';
@@ -852,7 +852,7 @@ FIND_JS = r"""
 # own box); else the one field in view (a person types into the only box).
 TARGET_JS = r"""
 (function(label, waitMs){
-  const squash = s => (s || '').replace(/\s+/g, ' ').trim();
+  const squash = s => (s || '').replace(/[\u2018\u2019\u201B\u2032\u02BC\uFF07]/g, "'").replace(/[\u201C\u201D\u201E\u201F\u2033\uFF02]/g, '"').replace(/[\u2010-\u2015\u2212\uFE63\uFF0D]/g, '-').replace(/\u2026/g, '...').replace(/\s+/g, ' ').trim();
   const FIELDS = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=image]):not([type=file]):not([type=checkbox]):not([type=radio]),textarea,[contenteditable=true],[role=textbox],[role=searchbox],[role=combobox]';
   const vh = innerHeight, vw = innerWidth;
   const inView = el => { const r = el.getBoundingClientRect();
@@ -1396,7 +1396,7 @@ FILL_JS = r"""
   const el = window.__burnerTarget;
   if (!el) return {ok: false, why: 'no field found'};
   if (!el.matches('input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=image]):not([type=file]),textarea,select,[contenteditable=true],[role=textbox],[role=searchbox],[role=combobox]')) return {ok: false, why: 'not a field'};
-  const squash = s => (s || '').replace(/\s+/g, ' ').trim();
+  const squash = s => (s || '').replace(/[\u2018\u2019\u201B\u2032\u02BC\uFF07]/g, "'").replace(/[\u201C\u201D\u201E\u201F\u2033\uFF02]/g, '"').replace(/[\u2010-\u2015\u2212\uFE63\uFF0D]/g, '-').replace(/\u2026/g, '...').replace(/\s+/g, ' ').trim();
   const fire = () => { el.dispatchEvent(new Event('input', {bubbles: true})); el.dispatchEvent(new Event('change', {bubbles: true})); };
   const setValue = v => { const d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value'); if (d && d.set) d.set.call(el, v); else el.value = v; fire(); };
   const tag = el.tagName.toLowerCase(), type = (el.type || '').toLowerCase();

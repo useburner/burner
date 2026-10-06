@@ -1171,26 +1171,36 @@ def selector_for(node, label):
     it at tap time, so a read need not come first. The shape is
     uiautomator2's Selector (text: mask 1, description: mask 64), built
     here so that no import is needed. Pure."""
-    if node["text"].lower() == label.lower():
-        key, value, mask = "text", node["text"], 1
+    if plain_words(node["text"]).lower() == plain_words(label).lower():
+        key, value, mask = "text", node["text"], 1  # its own words: the phone matches them exactly
     else:
         key, value, mask = "description", node["desc"], 64
     return {"mask": mask, "childOrSibling": [], "childOrSiblingSelector": [], key: value}
 
 
 
-# Every kind of space is one plain space when words are compared: Android
-# formats "6:30 AM" with a narrow no-break space before AM (U+202F), the
-# assistant types a plain one, and the exact match missed the row while
-# the fuzzy one found the two descriptions around it (the Clock app, Oct 5).
-_SPACES = dict.fromkeys(map(ord, "\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007"
-                                 "\u2008\u2009\u200a\u202f\u205f\u3000\t\r\n"), " ")
+# Words are compared in their plain form. Every kind of space is one
+# plain space: Android formats "6:30 AM" with a narrow no-break space
+# before AM (U+202F), the assistant types a plain one, and the exact match
+# missed the row while the fuzzy one found the two descriptions around it
+# (the Clock app, Oct 5). Typographic punctuation is its plain form: the
+# permission dialog's "Don\u2019t allow" has a curly apostrophe, the
+# assistant typed "Don't allow", and the tap failed twice (YouTube, Oct
+# 6); Settings writes "Wi\u2011Fi" with a non-breaking hyphen.
+_PLAIN = dict.fromkeys(map(ord, "\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007"
+                                "\u2008\u2009\u200a\u202f\u205f\u3000\t\r\n"), " ")
+_PLAIN.update(dict.fromkeys(map(ord, "\u2018\u2019\u201b\u2032\u02bc\uff07"), "'"))
+_PLAIN.update(dict.fromkeys(map(ord, "\u201c\u201d\u201e\u201f\u2033\uff02"), '"'))
+_PLAIN.update(dict.fromkeys(map(ord, "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\ufe63\uff0d"), "-"))
+_PLAIN[ord("\u2026")] = "..."
 
 
-def squash_spaces(s):
-    """`s` with every kind of space as one plain space, runs collapsed,
-    the ends trimmed. Pure."""
-    return " ".join((s or "").translate(_SPACES).split())
+def plain_words(s):
+    """`s` in its plain form, for comparing words: every kind of space as
+    one plain space (runs collapsed, the ends trimmed), curly quotes and
+    apostrophes, dashes and hyphens, and the ellipsis as their plain
+    forms. Pure."""
+    return " ".join((s or "").translate(_PLAIN).split())
 
 
 def label_node(xml, label):
@@ -1205,9 +1215,9 @@ def label_node(xml, label):
     another row sits over it (see row_over)."""
     nodes = list(iter_nodes(xml or ""))
     for alt in [p.strip() for p in label.split("||") if p.strip()]:
-        low = squash_spaces(alt).lower()
+        low = plain_words(alt).lower()
         hits = [n for n in nodes
-                if low in (squash_spaces(n["text"]).lower(), squash_spaces(n["desc"]).lower())]
+                if low in (plain_words(n["text"]).lower(), plain_words(n["desc"]).lower())]
         if not hits:
             continue
         controls = []  # the hits, one list per control
@@ -1222,7 +1232,7 @@ def label_node(xml, label):
             # the words typed into a field are not its label when another
             # row carries them (a search box holding "Pixel 7" beside that
             # suggestion)
-            typed = [c for c in controls if c[0].get("field") and squash_spaces(c[0]["text"]).lower() == low]
+            typed = [c for c in controls if c[0].get("field") and plain_words(c[0]["text"]).lower() == low]
             if typed and len(typed) < len(controls):
                 controls = [c for c in controls if c not in typed]
         if len(controls) > 1:
@@ -2267,11 +2277,31 @@ class U2Daemon:
                 reads += 1
             spec["tap"] = list(center)
         if "set_text" in spec and spec.get("field"):
-            # a native screen: the field with this label is tapped first,
-            # by the CLI's own lookup; setText alone goes to whatever field
-            # has the focus, and the CLI would report it typed into this one
+            # a native screen: setText goes to whatever field has the
+            # focus. When the newest read shows this very field focused
+            # (the assistant tapped it a moment ago), the text goes in at
+            # once: a tap of the field again, a pause and the typing took
+            # 4.1s (YouTube's search box, Oct 6). Otherwise the field is
+            # tapped first, by the CLI's own lookup, so that the typing
+            # isn't reported as going into this field when another has
+            # the focus.
+            if self._focused_field(spec["field"]):
+                spec = dict(spec)
+                spec.pop("field")
+                return self._act_batch(spec)
             raise RuntimeError("act not sent: --field on a native screen needs a tap on the field first")
         return self._act_batch(spec)
+
+    def _focused_field(self, label):
+        """Whether the newest read (BY_WORDS_S old at most) shows the
+        text field with this label, and that field has the focus."""
+        if not self._last_xml or _time.monotonic() - self._last_xml_t >= BY_WORDS_S:
+            return False
+        try:
+            node, _ = label_node(self._last_xml, label)
+        except RuntimeError:
+            return False
+        return bool(node.get("field") and node.get("focused"))
 
     def _native_row(self, label):
         """The centre of the row with these words on a fresh read by the
@@ -2416,8 +2446,9 @@ _BOUNDS_RE = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
 
 
 def iter_nodes(xml):
-    """Yield {text, desc, bounds, center, rect, enabled, clickable, web,
-    field, cls, parent} for every node with non-empty on-screen bounds,
+    """Yield {text, desc, bounds, center, rect, enabled, clickable,
+    selected, focused, web, field, cls, parent} for every node with
+    non-empty on-screen bounds,
     in document order; web: the node is inside a WebView (a browser's
     page, an app's web content); field: a text field (its text is what
     was typed); cls: its class, lowercased; parent: the index, in this
@@ -2437,7 +2468,8 @@ def iter_nodes(xml):
                        "rect": (x1, y1, x2, y2),
                        "enabled": n.get("enabled") != "false",
                        "clickable": n.get("clickable") == "true",
-                       "selected": n.get("selected") == "true", "web": web,
+                       "selected": n.get("selected") == "true", "focused": n.get("focused") == "true",
+                       "web": web,
                        "field": "edittext" in cls, "cls": cls, "parent": parent}
                 parent = count[0]
                 count[0] += 1
@@ -2489,12 +2521,12 @@ def find_node(xml, needle, fuzzy=True):
     (case-insensitive) match wins, then substring if fuzzy. "A || B"
     matches any of the labels (the first found, in that order). None on
     miss."""
-    needles = [squash_spaces(p).lower() for p in needle.split("||") if p.strip()]
+    needles = [plain_words(p).lower() for p in needle.split("||") if p.strip()]
     first_sub = None
     nodes = list(iter_nodes(xml))
     for nl in needles:
         for n in nodes:
-            labels = (squash_spaces(n["text"]).lower(), squash_spaces(n["desc"]).lower())
+            labels = (plain_words(n["text"]).lower(), plain_words(n["desc"]).lower())
             if nl in labels:
                 return n
             if fuzzy and first_sub is None and any(nl in l for l in labels):

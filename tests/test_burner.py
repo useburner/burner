@@ -2718,7 +2718,7 @@ class TypingSafetyTests(OfflineTestCase):
             calls.append((cmd, json.loads(arg)))
             return SAMPLE_XML
         self.allow("u2sock", side_effect=u2)
-        self.assertEqual(pc.focus_field("Date picker"), "done")
+        self.assertEqual(pc.focus_field("Date picker"), "settled")
         self.assertEqual(calls, [("act", {"tap_label": "Date picker", "idle": 1200})])
 
     def test_type_keys_resumes_with_adb_after_scrcpy_stops(self):
@@ -4853,6 +4853,52 @@ class WebPathTests(OfflineTestCase):
         with self.assertRaises(mod.U2NotFound):
             dm.cmd_wait_for(json.dumps({"text": "Top Stories", "timeout": 0.3}))
 
+    def test_a_native_type_into_the_focused_field_goes_in_at_once(self):
+        # YouTube, Oct 6: "Search YouTube" tapped, then typed with --field
+        # "Search YouTube": the field tapped again, a pause, the typing: 4.1s
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        sent = []
+        dm._act_batch = lambda spec: sent.append(spec) or SAMPLE_XML.encode()
+        dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()  # its "Search" field has the focus
+        self.assertEqual(dm.cmd_act(json.dumps({"set_text": "pudgy", "field": "Search", "idle": 1200})),
+                         SAMPLE_XML.encode())
+        self.assertEqual(sent, [{"set_text": "pudgy", "idle": 1200}])
+        # the field not focused, a row that isn't a field, or an old read: the CLI taps first
+        for xml, label, age in ((SAMPLE_XML.replace('focused="true"', 'focused="false"'), "Search", 0),
+                                (SAMPLE_XML, "OK", 0), (SAMPLE_XML, "Search", 60)):
+            dm._last_xml, dm._last_xml_t = xml, mod._time.monotonic() - age
+            with self.assertRaises(RuntimeError) as cm:
+                dm.cmd_act(json.dumps({"set_text": "pudgy", "field": label, "idle": 1200}))
+            self.assertIn("needs a tap on the field first", str(cm.exception))
+        self.assertEqual(len(sent), 1)
+
+    def test_typographic_punctuation_is_plain_when_words_are_matched(self):
+        # YouTube, Oct 6: the permission dialog's "Don\u2019t allow" (a curly
+        # apostrophe); the assistant typed "Don't allow"; the tap failed twice
+        self.assertEqual(pc.plain_words("Don\u2019t allow"), "Don't allow")
+        self.assertEqual(pc.plain_words("Wi\u2011Fi \u2013 \u201cHome\u201d\u2026"), 'Wi-Fi - "Home"...')
+        dialog = SAMPLE_XML.replace("</hierarchy>", """  <node text="Don\u2019t allow" class="android.widget.Button" package="com.google.android.permissioncontroller" bounds="[100,1800][980,1950]" clickable="true" enabled="true" focused="false"/>
+  <node text="Wi\u2011Fi" class="android.widget.TextView" package="com.android.settings" bounds="[100,2000][980,2100]" clickable="true" enabled="true" focused="false"/>
+</hierarchy>""")
+        nodes = pc.walk(ET.fromstring(dialog))
+        self.assertEqual([n["text"] for n in pc.find_nodes(nodes, "Don't allow")], ["Don\u2019t allow"])
+        self.assertEqual([n["text"] for n in pc.find_nodes(nodes, "wi-fi", exact=False)], ["Wi\u2011Fi"])
+        mod = _u2mux()
+        node, alt = mod.label_node(dialog, "Don't allow")
+        self.assertEqual((node["text"], alt), ("Don\u2019t allow", "Don't allow"))
+        self.assertEqual(mod.find_node(dialog, "Wi-Fi", fuzzy=False)["text"], "Wi\u2011Fi")
+        # the phone's own selector keeps the row's own words (it matches them exactly)
+        sel = mod.selector_for(node, "Don't allow")
+        self.assertEqual((sel.get("text"), sel["mask"]), ("Don\u2019t allow", 1))
+        # the page scripts that find a control or a field fold the same way; the page's read doesn't
+        cdp = _cdp()
+        for name in ("FIND_JS", "TARGET_JS", "FILL_JS"):
+            self.assertIn("\\u2019", getattr(cdp, name), name)
+        self.assertNotIn("\\u2019", cdp.READ_JS)
+
     def test_a_native_type_with_a_field_label_is_not_sent_by_the_helper(self):
         mod = _u2mux()
         EmptyScreenTests.no_sleep(self, mod)
@@ -4878,13 +4924,15 @@ class WebPathTests(OfflineTestCase):
                 return None
             return SAMPLE_XML
         self.allow("u2sock", side_effect=u2)
-        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+        with mock.patch.object(pc.time, "sleep") as slept, self.cap() as (out, err):
             rc = pc.cmd_type(self.parse(["type", "--field", "Password", "hunter2"]))
         self.assertEqual(rc, 0, err.getvalue())
         self.assertEqual([(c, s.get("set_text"), s.get("field"), s.get("tap_label")) for c, s in calls],
                          [("act", "hunter2", "Password", None),   # the one-op fill: not on a native screen
                           ("act", None, None, "Password"),        # the field tapped by its label
                           ("act", "hunter2", None, None)])        # then the text into the focused field
+        # the helper's tap waited for the screen to settle: no pause of the CLI's own
+        self.assertNotIn(mock.call(0.5), slept.call_args_list)
         self.assertIn("typed 7 chars", out.getvalue())
         self.assertNotIn("into Password", out.getvalue())
 
@@ -7746,9 +7794,9 @@ class AirbnbRoundTests(OfflineTestCase):
         # the Clock app, Oct 5: "6:30 AM" drawn with a narrow no-break space
         # before AM; the assistant typed a plain one; the exact match missed
         # the row, the fuzzy one found the two descriptions around it
-        self.assertEqual(pc.squash_spaces("6:30\u202fAM"), "6:30 AM")
-        self.assertEqual(pc.squash_spaces("  a\u00a0\u00a0b \t c "), "a b c")
-        self.assertEqual(pc.squash_spaces(""), "")
+        self.assertEqual(pc.plain_words("6:30\u202fAM"), "6:30 AM")
+        self.assertEqual(pc.plain_words("  a\u00a0\u00a0b \t c "), "a b c")
+        self.assertEqual(pc.plain_words(""), "")
         clock = SAMPLE_XML.replace("</hierarchy>", """  <node text="" content-desc="Alarm Tomorrow 6:30 AM Alarm is currently enabled." class="android.view.ViewGroup" package="com.example" bounds="[0,400][1080,700]" clickable="true" enabled="true">
     <node text="6:30\u202fAM" class="android.widget.TextView" package="com.example" bounds="[100,500][400,660]" clickable="true" enabled="true"/>
     <node text="" content-desc="6:30 AM alarm" class="android.widget.Switch" package="com.example" bounds="[800,500][1030,660]" clickable="true" enabled="true"/>
@@ -7760,7 +7808,7 @@ class AirbnbRoundTests(OfflineTestCase):
         plan = pc.plan_tap(nodes, 1080, 2400, text="6:30 AM")
         self.assertEqual((plan["action"], plan["xy"]), ("tap", (250, 580)))
         mod = _u2mux()
-        self.assertEqual(mod.squash_spaces("6:30\u202fAM"), "6:30 AM")
+        self.assertEqual(mod.plain_words("6:30\u202fAM"), "6:30 AM")
         row, alt = mod.label_node(clock, "6:30 AM")
         self.assertEqual((row["text"], alt), ("6:30\u202fAM", "6:30 AM"))
         self.assertEqual(mod.find_node(clock, "6:30 AM", fuzzy=False)["text"], "6:30\u202fAM")
