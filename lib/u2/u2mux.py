@@ -45,6 +45,11 @@ VENV_PY = next((p for p in (
 SOCK_PATH = os.path.join(ROOT, "run", "u2-mux.sock")
 PID_PATH = os.path.join(ROOT, "run", "u2-mux.pid")
 TARGET = "127.0.0.1:15555"
+# The CLI's adb (install.sh puts platform-tools there): adb's server is
+# restarted with it, so the server stays the CLI's version.
+ADB_BIN = os.path.join(WORKSPACE, ".android-tools", "platform-tools", "adb")
+if not os.path.exists(ADB_BIN):
+    ADB_BIN = "adb"
 
 
 LOG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
@@ -199,6 +204,39 @@ def direct_http(ip, port, timeout):
     return DirectHTTPConnection(ip, int(port), timeout=timeout)
 
 
+STREAM_OPEN_S = 6.0  # opening a stream to the server through adb: 0.15-0.4s when the link is up
+
+
+class LinkDead(Exception):
+    """adb didn't answer a stream open: the link to the phone is dead,
+    whatever adb's table says. Not an HTTPError: uiautomator2 takes one
+    of those as "the server isn't up" and launches a server, over shells
+    with no bound, on a link that answers nothing."""
+
+
+def open_stream(dev, port, timeout=STREAM_OPEN_S):
+    """An HTTP connection to the server's port through adb's streams,
+    opened within `timeout`. adbutils gives the open 600s; a link through
+    the tunnel that died silently while idle (no close from the far end,
+    after hours; Oct 6) never answers it, and adb only dropped the
+    transport after 75s: every command hung on it, and three in a row
+    ran into the CLI's 60s watchdog."""
+    from uiautomator2.core import AdbHTTPConnection
+    conn = AdbHTTPConnection(dev, port=port)
+    t = dev.open_transport(timeout=timeout)
+    try:
+        t.send_command("tcp:%d" % int(port))
+        t.check_okay()
+    except Exception as e:
+        t.close()
+        if isinstance(e, (socket.timeout, TimeoutError)) or type(e).__name__ == "AdbTimeout":
+            raise LinkDead("no answer from the phone's adb in %.0fs (stream open)" % timeout)
+        raise
+    t.conn.settimeout(None)
+    conn.sock = t.conn
+    return conn
+
+
 DIRECT_RETRY_S = 60.0  # a direct route that failed twice is tried again after this
 
 
@@ -343,10 +381,7 @@ class KeepAliveHTTP:
                     self._direct_retry_at = _time.monotonic() + DIRECT_RETRY_S
                     log("no direct route to the UI server (%s:%d: %s); through adb for %.0fs"
                         % (direct[0], direct[1], err_text(e, 80), DIRECT_RETRY_S))
-        from uiautomator2.core import AdbHTTPConnection
-        c = AdbHTTPConnection(dev, port=port)
-        c.connect()
-        return c
+        return open_stream(dev, port)
 
     def close(self):
         with self._lock:
@@ -383,6 +418,8 @@ class KeepAliveHTTP:
                         ent[0].close()
                     try:
                         fresh = self._open(dev, port)
+                    except LinkDead:
+                        raise  # the link is dead: not "no stream" (see LinkDead)
                     except Exception as e:
                         if sent:
                             raise stale  # the request went out once: not "not sent"
@@ -603,7 +640,8 @@ def apply_fast_config(d):
         log("configurator tweak failed:", err_text(e))
 
 
-GONE_WORDS = ("not online", "not found", "offline", "no devices", "no device")
+GONE_WORDS = ("not online", "not found", "offline", "no devices", "no device",
+              "no answer from the phone")
 
 
 def device_gone(text):
@@ -614,13 +652,49 @@ def device_gone(text):
     return any(w in t for w in GONE_WORDS)
 
 
+def phone_gone(e):
+    """Whether `e`, from a command on the phone's server, says the phone
+    is gone from adb (see device_gone): a transport's error (adb's, a
+    stream's, the link's), never the server's own answer, which says
+    "not found" of a missing element too."""
+    transport = (isinstance(e, (LinkDead, OSError))  # StreamUnavailable is a ConnectionError
+                 or type(e).__name__ in ("AdbError", "AdbTimeout", "AdbConnectionError", "ConnectError"))
+    return transport and device_gone(err_text(e))
+
+
+LINK_PROBE_S = 5.0    # one shell over the link; a dead link answers nothing for minutes
+ADB_CONNECT_S = 10.0  # `adb connect` through the tunnel: a CONNECT via the proxy and adb's handshake
+ONLINE_WAIT_S = 5.0   # after a connect, for adb to call the phone a device (1-2s through the proxy)
+
+
+def link_alive():
+    """Whether the phone answers over adb: one shell, LINK_PROBE_S at
+    most. adb's table still says "device" for a link through the tunnel
+    that died silently while idle (Oct 6), and anything sent on it waits
+    for an answer that never comes; uiautomator2's connect sends shells
+    with no bound, so the phone is asked this way first. False too when
+    adb has lost the phone (not found, offline)."""
+    import adbutils
+    try:
+        adbutils.adb.device(TARGET).shell("echo ok", timeout=LINK_PROBE_S)
+    except Exception as e:
+        log("the phone doesn't answer over adb (%s)" % err_text(e, 100))
+        return False
+    return True
+
+
 def reconnect_device():
-    """The phone back on adb, as `burner ensure` does it: the tunnel
-    started (nothing when it runs) and `adb connect` to the target. True
-    when adb says it is connected. The link through the tunnel drops
-    after hours idle; the server on the phone is fine then, and a
-    command that restarted it instead ran into the 60s watchdog, three
-    times in a row (Oct 6)."""
+    """The phone back on adb, as `burner ensure` does it (what put it
+    back on Oct 6, in 12.8s, after the helper's own tries had run three
+    commands into the 60s watchdog): the tunnel started (nothing when it
+    runs), the phone disconnected and connected again (adb keeps a dead
+    link as a device, and says "already connected" to a connect), and,
+    when it still doesn't answer, adb's server restarted and the connect
+    made once more. True when the phone answers a shell. uiautomator2
+    reconnects a lost phone on its own too, but with a second for each
+    connect, which a handshake through the proxy often outlasts: 8-10s
+    of tries, or "not online" (Oct 6)."""
+    import adbutils
     tunnel = os.path.join(ROOT, "tunnel.sh")
     if os.path.exists(tunnel):
         try:
@@ -628,15 +702,36 @@ def reconnect_device():
                            stderr=subprocess.DEVNULL, timeout=20)
         except Exception as e:
             log("the tunnel couldn't be started (%s)" % err_text(e, 80))
-    try:
-        import adbutils
-        out = adbutils.adb.connect(TARGET, timeout=10)
-    except Exception as e:
-        log("adb connect %s failed (%s)" % (TARGET, err_text(e, 100)))
-        return False
-    out = " ".join(str(out).split())
-    log("adb connect %s: %s" % (TARGET, out[:80]))
-    return "connected" in out
+    for step in ("connect", "restart"):
+        if step == "restart":
+            log("the phone still doesn't answer; restarting adb's server")
+            try:
+                adbutils.adb.server_kill()
+                _time.sleep(1.0)  # the old server lets go of its port
+                subprocess.run([ADB_BIN, "start-server"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=20)
+            except Exception as e:
+                log("adb's server couldn't be restarted (%s)" % err_text(e, 100))
+                return False
+        try:
+            adbutils.adb.disconnect(TARGET)
+        except Exception:
+            pass
+        try:
+            out = " ".join(str(adbutils.adb.connect(TARGET, timeout=ADB_CONNECT_S)).split())
+        except Exception as e:
+            out = "failed (%s)" % err_text(e, 100)
+        log("adb connect %s: %s" % (TARGET, out[:80]))
+        if "connected" not in out:
+            continue
+        try:
+            adbutils.adb.wait_for(TARGET, state="device", timeout=ONLINE_WAIT_S)
+        except Exception:
+            pass  # the shell below says whether it answers
+        if link_alive():
+            log("the phone is back on adb")
+            return True
+    return False
 
 
 def ensure_server(force=False):
@@ -658,6 +753,11 @@ def ensure_server(force=False):
         first = "its reads held no words"
         log("replacing the server: its reads held no words")
     else:
+        # the link first, with a bound: uiautomator2's connect runs shells
+        # with no bound, and a link that died silently (Oct 6) answers none
+        if not link_alive() and not reconnect_device():
+            raise RuntimeError("the phone is gone from adb and did not come back "
+                               "on a reconnect (adb connect %s)" % TARGET)
         try:
             d = u2.connect(TARGET)  # starts a dead server (and pushes a new jar)
             apply_fast_config(d)
@@ -666,7 +766,7 @@ def ensure_server(force=False):
             log("server answers but reads empty or wordless screens; restarting it")
         except Exception as e:
             first = err_text(e)
-            if device_gone(first) and reconnect_device():
+            if phone_gone(e) and reconnect_device():
                 # the phone was gone from adb, not the server from the
                 # phone: back on adb, the server is asked again first
                 try:
@@ -1526,6 +1626,23 @@ class U2Daemon:
             raise RuntimeError("the phone's screen is off and wakeUp failed (%s)" % err_text(e, 80))
         _time.sleep(0.4)
 
+    def _relink(self, why):
+        """The phone back on adb and its server asked again, with no
+        restart: the link through the tunnel dropped (silently, after
+        hours idle, Oct 6) while the server on the phone is fine. Raises
+        when the phone doesn't come back."""
+        import uiautomator2 as u2
+        log("the phone is gone from adb (%s); reconnecting it" % why)
+        _KEEPALIVE.close()
+        with _t("adb reconnect"):
+            back = reconnect_device()
+        if not back:
+            raise RuntimeError("the phone is gone from adb (%s) and did not come back "
+                               "on a reconnect (adb connect %s)" % (why, TARGET))
+        self.d = u2.connect(TARGET)
+        apply_fast_config(self.d)
+        self.invalidate()
+
     def _reconnect(self):
         """`burner ensure`: the server is checked, and replaced when it
         can't read, or reads no words while the screen is in a wordless
@@ -2230,9 +2347,19 @@ class U2Daemon:
             # Maybe the on-device server died — reconnect once and retry.
             # The RLock makes concurrent handlers queue behind one reconnect.
             with self._lock:
-                try:
-                    self.d.info
-                except Exception:
+                gone, answers = phone_gone(e), False
+                if not gone:
+                    try:
+                        self.d.info
+                        answers = True  # the server answers: the command is sent again
+                    except Exception as e2:
+                        gone = phone_gone(e2)
+                if gone:
+                    # the phone gone from adb (its link dropped), not the
+                    # server from the phone: the link is remade whatever
+                    # the restart cooldown says, since nothing is killed
+                    self._relink(err_text(e, 100))
+                elif not answers:
                     if not restart_allowed(_time.monotonic() - self._last_restart):
                         raise  # a restart a moment ago: no kill/relaunch loop
                     log("command %s failed (%s), reconnecting" % (cmd, err_text(e)))

@@ -4448,7 +4448,7 @@ class WebPathTests(OfflineTestCase):
         ka._open_direct = lambda ip, port: opened.append(("direct", ip, port)) or Conn("direct")
         adb = mock.Mock(return_value=Conn("adb"))
         with mock.patch.object(mod, "phone_config", return_value={"PHONE_TAILSCALE_IP": "100.64.0.9"}), \
-                mock.patch.dict(sys.modules, {"uiautomator2": mock.Mock(), "uiautomator2.core": mock.Mock(AdbHTTPConnection=adb)}):
+                mock.patch.object(mod, "open_stream", adb):
             c = ka._open(SimpleNamespace(serial="s"), 9008)
             self.assertEqual((c.how, ka.direct, opened), ("direct", True, [("direct", "100.64.0.9", 9008)]))
             adb.assert_not_called()
@@ -4475,7 +4475,7 @@ class WebPathTests(OfflineTestCase):
         ka2 = mod.KeepAliveHTTP()
         ka2._open_direct = mock.Mock(side_effect=AssertionError("no address, no direct try"))
         with mock.patch.object(mod, "phone_config", return_value={}), \
-                mock.patch.dict(sys.modules, {"uiautomator2": mock.Mock(), "uiautomator2.core": mock.Mock(AdbHTTPConnection=adb)}):
+                mock.patch.object(mod, "open_stream", adb):
             self.assertEqual(ka2._open(SimpleNamespace(serial="s"), 9008).how, "adb")
         # the proxy of a hosted assistant, as tunnel.sh reads it: the
         # CONNECT handshake tools/direct.py used, on a socket of its own
@@ -5696,16 +5696,48 @@ class EmptyScreenTests(OfflineTestCase):
         self.assertEqual(seen, [("dumpWindowHierarchy", [False, 50], mod.DUMP_RPC_TIMEOUT)])
 
     def test_helper_reconnects_the_phone_before_restarting_its_server(self):
-        # Oct 6: after hours idle the link through the tunnel had dropped;
-        # the server was fine, adb had lost the phone, and the helper's
-        # two restart tries ran three commands into the 60s watchdog
+        # Oct 6: after hours idle the link through the tunnel had died
+        # silently; the server was fine, adb had lost the phone, and the
+        # helper's two restart tries ran three commands into the 60s watchdog
         mod = _u2mux()
         self.no_sleep(mod)
         self.assertTrue(mod.device_gone("ConnectError: device 127.0.0.1:15555 not online"))
         self.assertTrue(mod.device_gone("AdbError: device '127.0.0.1:15555' not found"))
+        self.assertTrue(mod.device_gone("LinkDead: no answer from the phone's adb in 6s (stream open)"))
         self.assertFalse(mod.device_gone("RuntimeError: server can't read the screen"))
+        # the words alone don't make it the phone: a transport's error does
+        self.assertTrue(mod.phone_gone(ConnectionError("AdbError: device '127.0.0.1:15555' not found")))
+        self.assertTrue(mod.phone_gone(mod.LinkDead("no answer from the phone's adb in 6s (stream open)")))
+        self.assertFalse(mod.phone_gone(RuntimeError("uiautomator object not found")))
+        self.assertFalse(mod.phone_gone(ConnectionError("HTTPError: HTTP request failed: 500")))
         back = _FakeServer([SAMPLE_XML])
-        answers = iter([Exception("ConnectError: device 127.0.0.1:15555 not online"), back])
+        fake_u2 = SimpleNamespace(connect=lambda target: back)
+        fake_adbutils = SimpleNamespace(adb=SimpleNamespace(
+            device=lambda target: self.fail("no server restart: the phone was the problem")))
+        calls = []
+        mod.link_alive = lambda: calls.append("probe") or False
+        mod.reconnect_device = lambda: calls.append("reconnect") or True
+        mod.server_works = lambda d, words=False: True
+        mod.apply_fast_config = lambda d: None
+        with mock.patch.dict(sys.modules, {"uiautomator2": fake_u2, "adbutils": fake_adbutils}):
+            d = mod.ensure_server()
+        self.assertIs(d, back)
+        self.assertEqual(calls, ["probe", "reconnect"])
+        # the phone not coming back: said so at once, no restart tries
+        # (each would hang on the dead link)
+        calls.clear()
+        mod.reconnect_device = lambda: calls.append("reconnect") or False
+        with mock.patch.dict(sys.modules, {"uiautomator2": fake_u2, "adbutils": fake_adbutils}):
+            with self.assertRaises(RuntimeError) as cm:
+                mod.ensure_server()
+        self.assertIn("gone from adb", str(cm.exception))
+        self.assertEqual(calls, ["probe", "reconnect"])
+        # the link alive at the probe, the phone gone as the server is
+        # asked: reconnected and asked again, no restart
+        calls.clear()
+        mod.link_alive = lambda: calls.append("probe") or True
+        mod.reconnect_device = lambda: calls.append("reconnect") or True
+        answers = iter([ConnectionError("AdbError: device '127.0.0.1:15555' not found"), back])
 
         def connect(target):
             a = next(answers)
@@ -5713,26 +5745,166 @@ class EmptyScreenTests(OfflineTestCase):
                 raise a
             return a
         fake_u2 = SimpleNamespace(connect=connect)
-        fake_adbutils = SimpleNamespace(adb=SimpleNamespace(
-            device=lambda target: self.fail("no server restart: the phone was the problem")))
-        calls = []
-        mod.reconnect_device = lambda: calls.append("reconnect") or True
-        mod.server_works = lambda d, words=False: True
-        mod.apply_fast_config = lambda d: None
         with mock.patch.dict(sys.modules, {"uiautomator2": fake_u2, "adbutils": fake_adbutils}):
             d = mod.ensure_server()
         self.assertIs(d, back)
-        self.assertEqual(calls, ["reconnect"])
-        # the phone not coming back: the restart tries, as before
-        answers = iter([Exception("ConnectError: device 127.0.0.1:15555 not online")] * 3)
-        restarts = []
-        fake_adbutils = SimpleNamespace(adb=SimpleNamespace(
-            device=lambda target: restarts.append(1) or (_ for _ in ()).throw(RuntimeError("AdbError: device not found"))))
-        mod.reconnect_device = lambda: calls.append("reconnect") or False
-        with mock.patch.dict(sys.modules, {"uiautomator2": fake_u2, "adbutils": fake_adbutils}):
+        self.assertEqual(calls, ["probe", "reconnect"])
+
+    def test_a_stream_open_that_gets_no_answer_is_the_link_dead(self):
+        # Oct 6: a link through the tunnel died silently while idle; adb's
+        # table still said "device", and a stream opened on it waited 75s
+        mod = _u2mux()
+        self.no_sleep(mod)
+        import socket
+
+        class Sock:
+            def __init__(self):
+                self.timeout = 6
+
+            def settimeout(self, t):
+                self.timeout = t
+
+            def gettimeout(self):
+                return self.timeout
+
+            def close(self):
+                pass
+
+        class Transport:
+            def __init__(self, answer):
+                self.answer, self.sent, self.closed = answer, [], False
+                self.conn = Sock()
+
+            def send_command(self, cmd):
+                self.sent.append(cmd)
+
+            def check_okay(self):
+                if isinstance(self.answer, Exception):
+                    raise self.answer
+
+            def close(self):
+                self.closed = True
+        opened = []
+        state = {}
+        dev = SimpleNamespace(serial="s", open_transport=lambda timeout=None: opened.append(timeout) or state["t"])
+        core = mock.Mock(AdbHTTPConnection=lambda dev, port: SimpleNamespace(sock=None))
+        state["t"] = t = Transport(socket.timeout("timed out"))
+        with mock.patch.dict(sys.modules, {"uiautomator2": mock.Mock(), "uiautomator2.core": core}):
+            with self.assertRaises(mod.LinkDead) as cm:
+                mod.open_stream(dev, 9008)
+        self.assertEqual((opened, t.sent, t.closed), ([6.0], ["tcp:9008"], True))
+        self.assertTrue(mod.phone_gone(cm.exception))
+        # the link up: the stream is the connection's socket, with no timeout left on it
+        state["t"] = t = Transport(None)
+        with mock.patch.dict(sys.modules, {"uiautomator2": mock.Mock(), "uiautomator2.core": core}):
+            c = mod.open_stream(dev, 9008)
+        self.assertIs(c.sock, t.conn)
+        self.assertIsNone(t.conn.gettimeout())
+        self.assertFalse(t.closed)
+        # a phone adb has lost: adb's own error, as before
+        state["t"] = t = Transport(RuntimeError("AdbError: device 's' not found"))
+        with mock.patch.dict(sys.modules, {"uiautomator2": mock.Mock(), "uiautomator2.core": core}):
             with self.assertRaises(RuntimeError):
-                mod.ensure_server()
-        self.assertEqual((calls, restarts), (["reconnect", "reconnect"], [1, 1]))
+                mod.open_stream(dev, 9008)
+        self.assertTrue(t.closed)
+        # the keep-alive request passes a dead link on as it is (an
+        # HTTPError would have uiautomator2 launch a server over it)
+        ka = mod.KeepAliveHTTP()
+        ka._open = lambda dev, port: (_ for _ in ()).throw(mod.LinkDead("no answer from the phone's adb in 6s (stream open)"))
+        with mock.patch.dict(sys.modules, {"uiautomator2": mock.Mock(), "uiautomator2.core": core}):
+            with self.assertRaises(mod.LinkDead):
+                ka.request(dev, 9008, "GET", "/ping")
+
+    def test_reconnect_device_escalates_to_adb_s_server(self):
+        # Oct 6: adb kept the dead link as a device and said "already
+        # connected" to a connect; what put the phone back was `burner
+        # ensure`'s restart of adb's server
+        mod = _u2mux()
+        self.no_sleep(mod)
+        events, runs = [], []
+        connects = []
+        fake_adbutils = SimpleNamespace(adb=SimpleNamespace(
+            disconnect=lambda t: events.append("disconnect"),
+            connect=lambda t, timeout=None: events.append("connect") or (connects.pop(0) if connects else "connected to " + t),
+            wait_for=lambda serial, state="device", timeout=None: events.append("wait %s %g" % (state, timeout)),
+            server_kill=lambda: events.append("kill")))
+
+        def run():
+            with mock.patch.dict(sys.modules, {"adbutils": fake_adbutils}), \
+                    mock.patch.object(mod.subprocess, "run", lambda cmd, **kw: runs.append(cmd[-1])), \
+                    mock.patch.object(mod.os.path, "exists", lambda p: True):
+                return mod.reconnect_device()
+        alive = iter([False, True])
+        mod.link_alive = lambda: next(alive)
+        self.assertTrue(run())
+        self.assertEqual(events, ["disconnect", "connect", "wait device 5", "kill",
+                                  "disconnect", "connect", "wait device 5"])
+        self.assertEqual(runs, ["start", "start-server"])  # the tunnel, then adb's server
+        # answering after the first connect: adb's server is left alone
+        events.clear()
+        runs.clear()
+        mod.link_alive = lambda: True
+        self.assertTrue(run())
+        self.assertEqual((events, runs), (["disconnect", "connect", "wait device 5"], ["start"]))
+        # a connect adb refused: no wait for a phone that isn't coming, the restart next
+        events.clear()
+        connects.append("failed to connect to '127.0.0.1:15555': Connection refused")
+        self.assertTrue(run())
+        self.assertEqual(events, ["disconnect", "connect", "kill", "disconnect", "connect", "wait device 5"])
+        # never answering: False, both steps taken
+        events.clear()
+        mod.link_alive = lambda: False
+        self.assertFalse(run())
+        self.assertEqual(events, ["disconnect", "connect", "wait device 5", "kill",
+                                  "disconnect", "connect", "wait device 5"])
+
+    def test_the_helper_relinks_the_phone_whatever_the_restart_cooldown(self):
+        # Oct 6, 12:28: three seconds after `burner update` restarted the
+        # helper, adb had lost the phone; the restart cooldown raised the
+        # read without a word, and the CLI's adb reader sat 60s
+        mod = _u2mux()
+        self.no_sleep(mod)
+        dm = self._daemon(mod)
+        dm._last_restart = mod._time.monotonic()  # a restart a moment ago
+        dm.d = _FakeServer([])
+        answers = iter([ConnectionError("AdbError: device '127.0.0.1:15555' not found"), b"ok"])
+
+        def echo(arg):
+            a = next(answers)
+            if isinstance(a, Exception):
+                raise a
+            return a
+        dm.cmd_echo = echo
+        events = []
+        back = _FakeServer([SAMPLE_XML])
+        mod.reconnect_device = lambda: events.append("reconnect") or True
+        mod.apply_fast_config = lambda d: events.append("config")
+        mod._KEEPALIVE = SimpleNamespace(close=lambda: events.append("close"))
+        fake_u2 = SimpleNamespace(connect=lambda target: events.append("connect") or back)
+        with mock.patch.dict(sys.modules, {"uiautomator2": fake_u2}):
+            self.assertEqual(dm.handle("echo"), b"ok")
+        self.assertEqual(events, ["close", "reconnect", "connect", "config"])
+        self.assertIs(dm.d, back)
+        # the phone not coming back: the command fails with that, no restart
+        answers = iter([ConnectionError("AdbError: device '127.0.0.1:15555' not found")])
+        mod.reconnect_device = lambda: False
+        with mock.patch.dict(sys.modules, {"uiautomator2": fake_u2}):
+            with self.assertRaises(RuntimeError) as cm:
+                dm.handle("echo")
+        self.assertIn("gone from adb", str(cm.exception))
+        # a server that stopped answering within the cooldown: raised as
+        # before, no relink (the link is fine)
+
+        class Sick:
+            @property
+            def info(self):
+                raise RuntimeError("HTTPError: HTTP request failed: 500")
+        dm.d = Sick()
+        answers = iter([RuntimeError("HTTPError: HTTP request failed: 500")])
+        mod.reconnect_device = lambda: self.fail("no relink: the server is sick, not the link")
+        with self.assertRaises(RuntimeError) as cm:
+            dm.handle("echo")
+        self.assertIn("500", str(cm.exception))
 
     def test_helper_ensure_server_kills_and_relaunches(self):
         mod = _u2mux()
@@ -5749,7 +5921,7 @@ class EmptyScreenTests(OfflineTestCase):
         with mock.patch.dict(sys.modules, {"uiautomator2": fake_u2, "adbutils": fake_adbutils}):
             d = mod.ensure_server()
         self.assertEqual(d.reads, [SAMPLE_XML])  # the relaunched device, returned
-        self.assertEqual(adb_dev.shells, ["ps -A -o PID,ARGS", "kill -9 2843 2840 3200",
+        self.assertEqual(adb_dev.shells, ["echo ok", "ps -A -o PID,ARGS", "kill -9 2843 2840 3200",
                                           "ps -A -o PID,ARGS", "dumpsys power | grep -m1 mWakefulness=", "input keyevent 224"])
         self.assertEqual(closed, [1])
         self.assertEqual(len(configured), 2)  # every server it connected to
@@ -5780,7 +5952,7 @@ class EmptyScreenTests(OfflineTestCase):
         with mock.patch.dict(sys.modules, {"uiautomator2": fake_u2, "adbutils": fake_adbutils}):
             d = mod.ensure_server()
         self.assertIs(d, fresh)
-        self.assertEqual(adb_dev.shells, ["ps -A -o PID,ARGS", "kill -9 2843 2840 3200",
+        self.assertEqual(adb_dev.shells, ["echo ok", "ps -A -o PID,ARGS", "kill -9 2843 2840 3200",
                                           "ps -A -o PID,ARGS", "dumpsys power | grep -m1 mWakefulness=", "input keyevent 224"])
 
     def test_helper_restart_steps_in_order_and_a_wake_that_fails(self):
@@ -5861,7 +6033,7 @@ class EmptyScreenTests(OfflineTestCase):
                 mod.ensure_server()
         self.assertIn("couldn't be restarted: no server process was running", str(cm.exception))
         self.assertIn("(at first: it reads empty or wordless screens)", str(cm.exception))
-        self.assertEqual(adb_dev.shells, ["ps -A -o PID,ARGS", "dumpsys power | grep -m1 mWakefulness=", "input keyevent 224"] * 2)
+        self.assertEqual(adb_dev.shells, ["echo ok"] + ["ps -A -o PID,ARGS", "dumpsys power | grep -m1 mWakefulness=", "input keyevent 224"] * 2)
 
     def test_helper_connect_stamps_the_restart_even_when_it_fails(self):
         mod = _u2mux()
@@ -7510,6 +7682,33 @@ class AirbnbRoundTests(OfflineTestCase):
         self.assertEqual((row["text"], alt), ("6:30\u202fAM", "6:30 AM"))
         self.assertEqual(mod.find_node(clock, "6:30 AM", fuzzy=False)["text"], "6:30\u202fAM")
         self.assertEqual(mod.find_node(clock, "6:30 am", fuzzy=False)["text"], "6:30\u202fAM")
+
+    def test_a_read_the_helper_refused_for_a_lost_phone_goes_to_ensure(self):
+        # Oct 6: adb's own reader can't read while the helper's server
+        # holds the phone; four tries at it ran into the 60s watchdog
+        self._guards["ui_dump"].stop()  # the real one; what it falls back to is mocked below
+        root = ET.fromstring(SAMPLE_XML)
+        dumps = iter([None, root])
+        calls = []
+
+        def fast_dump(fresh=False):
+            d = next(dumps)
+            if d is None:
+                pc._u2_status = ("err the phone is gone from adb (AdbError: device not found) "
+                                 "and did not come back: the link through the tunnel is down")
+            return d
+        with mock.patch.object(pc, "_u2_status", "ok"), mock.patch.object(pc, "fast_dump", fast_dump), \
+                mock.patch.object(pc, "ensure", lambda heal_fast_paths=True: calls.append(heal_fast_paths) or True), \
+                mock.patch.object(pc, "adb_or_ensure", lambda *a, **k: self.fail("adb's reader isn't tried")), \
+                mock.patch.object(pc, "wake", lambda: self.fail("no wake either")):
+            self.assertIs(pc.ui_dump(), root)
+            self.assertEqual(calls, [False])  # adb only: the helper heals itself on its next command
+            # the helper still refusing after ensure: the reason, at once
+            dumps = iter([None, None])
+            with self.assertRaises(RuntimeError) as cm:
+                pc.ui_dump()
+            self.assertIn("gone from adb", str(cm.exception))
+        self.assertFalse(pc.helper_lost_phone())
 
     def test_the_third_scroll_the_same_way_earns_a_hint(self):
         # Muse scrolled up eight times, a read each, to reach the top (Oct 5)

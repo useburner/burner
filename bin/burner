@@ -919,12 +919,32 @@ def fast_dump(fresh=False):
 
 # ---------------------------------------------------------------- UI tree
 
+def helper_lost_phone():
+    """True when the UI helper's last answer says the phone is gone from
+    adb and its own reconnect failed (see u2mux.reconnect_device)."""
+    return _u2_status.startswith("err ") and "gone from adb" in _u2_status
+
+
 def ui_dump(retries=4, fresh=False):
     """Dump the UI hierarchy, retrying through app transitions/empty dumps.
     Fast path: uiautomator2 persistent server (~1s). Fallback: adb shell."""
     root = fast_dump(fresh=fresh)
     if root is not None:
         return root
+    if helper_lost_phone():
+        # The helper's own reconnect failed: `burner ensure`'s full
+        # recovery (the tunnel, adb's server, Wireless debugging turned
+        # back on), then the helper again. adb's own reader is no
+        # fallback here: it can't read while the helper's server holds
+        # the phone, and four tries at it ran into the 60s watchdog (Oct 6).
+        _trace("the helper lost the phone; ensure")
+        if ensure(heal_fast_paths=False):  # the helper heals itself on its next command
+            root = fast_dump(fresh=fresh)
+            if root is not None:
+                return root
+        why = (_u2_status[len("err "):] if _u2_status.startswith("err ")
+               else "the UI helper can't reach it")
+        raise RuntimeError("the phone is unreachable: " + why[:200])
     wake()  # screen timeout is 10s; dumps come back empty when asleep
     time.sleep(1)
     last = ""
