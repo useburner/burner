@@ -664,12 +664,13 @@ _u2_checked = False
 _u2_status = "ok"
 
 
-def u2_start_background():
+def u2_start_background(force=False):
     """Start the u2 mux without waiting for it. Until it is up, callers use
     the slower adb path; this call's successors get the fast one. Skipped if
-    a start began in the last 30s, so a burst of commands starts one."""
+    a start began in the last 30s, so a burst of commands starts one;
+    `force` starts anyway (a helper found dead right after a start)."""
     try:
-        if time.time() - os.path.getmtime(U2_STARTING) < 30:
+        if not force and time.time() - os.path.getmtime(U2_STARTING) < 30:
             return
     except OSError:
         pass
@@ -759,23 +760,27 @@ def connect_helper(s, timeout):
     except OSError as e:
         if _helper_waited:
             raise
-        if not helper_starting():
-            if isinstance(e, FileNotFoundError) or not os.path.exists(U2_SOCK):
-                raise
+        dead = not isinstance(e, FileNotFoundError) and os.path.exists(U2_SOCK)
+        if dead:
             # the socket file is there but nobody listens: the helper
             # died (a crash, a kill) and left it, and nothing started it
             # again since the file looked like a live helper, so every
             # command went the slow adb way (twenty minutes of 12s
-            # scrolls, Oct 5). Cleared, started again, and waited for
-            # like a helper after an update.
+            # scrolls, Oct 5). A helper starting makes its socket only
+            # when it listens, so this is a dead one whatever the start
+            # stamp says (two commands right after an update waited out
+            # the stamp's 30s and went the slow way, Oct 5). Cleared,
+            # started again, and waited for like a helper after an update.
             for path in (U2_SOCK, U2_PID):
                 try:
                     os.remove(path)
                 except OSError:
                     pass
-            u2_start_background()
+            u2_start_background(force=True)
             print("burner: the UI helper wasn't running; starting it again (this command "
                   "may take longer)", file=sys.stderr)
+        elif not helper_starting():
+            raise
     _helper_waited = True
     _trace("the UI helper is starting; waiting for it")
     deadline = time.time() + HELPER_START_WAIT_S

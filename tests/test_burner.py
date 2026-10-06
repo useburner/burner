@@ -3962,15 +3962,17 @@ class HelperStalenessTests(OfflineTestCase):
                 attempts.append(path)
                 if len(attempts) < 3:
                     raise ConnectionRefusedError("nobody listens")
-        with mock.patch.object(pc, "helper_starting", return_value=False),                 mock.patch.object(pc, "_helper_waited", False),                 mock.patch.object(pc.os.path, "exists", lambda path: path == pc.U2_SOCK),                 mock.patch.object(pc.os, "remove", lambda path: removed.append(path)),                 mock.patch.object(pc, "u2_start_background", lambda: started.append(1)),                 mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+        # even right after a start (the stamp says one is under way): a
+        # helper that listens has its socket, so a refused one is dead
+        with mock.patch.object(pc, "helper_starting", return_value=True),                 mock.patch.object(pc, "_helper_waited", False),                 mock.patch.object(pc.os.path, "exists", lambda path: path == pc.U2_SOCK),                 mock.patch.object(pc.os, "remove", lambda path: removed.append(path)),                 mock.patch.object(pc, "u2_start_background", lambda force=False: started.append(force)),                 mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             pc.connect_helper(Sock(), 5)
-        self.assertEqual((len(attempts), started, sorted(removed)), (3, [1], sorted([pc.U2_SOCK, pc.U2_PID])))
+        self.assertEqual((len(attempts), started, sorted(removed)), (3, [True], sorted([pc.U2_SOCK, pc.U2_PID])))
         self.assertIn("the UI helper wasn't running; starting it again", err.getvalue())
         # no socket file at all (a first run): the slow way, no start here
         attempts.clear()
-        with mock.patch.object(pc, "helper_starting", return_value=False),                 mock.patch.object(pc, "_helper_waited", False),                 mock.patch.object(pc.os.path, "exists", return_value=False),                 mock.patch.object(pc, "u2_start_background", lambda: started.append(2)),                 self.assertRaises(OSError):
+        with mock.patch.object(pc, "helper_starting", return_value=False),                 mock.patch.object(pc, "_helper_waited", False),                 mock.patch.object(pc.os.path, "exists", return_value=False),                 mock.patch.object(pc, "u2_start_background", lambda force=False: started.append(2)),                 self.assertRaises(OSError):
             pc.connect_helper(Sock(), 5)
-        self.assertEqual((len(attempts), started), (1, [1]))
+        self.assertEqual((len(attempts), started), (1, [True]))
 
     def test_helper_restarts_when_any_file_under_lib_u2_is_newer(self):
         # the helper loads cdp.py once: an update that changed only the
