@@ -1756,13 +1756,13 @@ class U2Daemon:
         png = arg.strip() == "png"
         # 0.6 scale, quality 75: about half the bytes of 0.7/80, and the
         # vision models that read it shrink it further anyway. A .png name
-        # gets the same small capture at a higher quality, re-encoded here:
-        # a full-size quality-100 capture took 2.2-4.3s on the phone against
-        # about 1s (Muse's Reddit run, 2026-10-06), and assistants name
-        # their shots .png out of habit, not for the pixels.
+        # gets the same capture, re-encoded here: the bytes crossing the link
+        # set the time (full size at quality 100: 2.2-4.3s; 0.6 at 90:
+        # 2.1-2.9s; 0.6 at 75: 1.0-1.6s, Muse 2026-10-06), and assistants
+        # name their shots .png out of habit, not for the pixels.
         with self._lock:
             with _t("shot rpc"):
-                data = self.d.jsonrpc.takeScreenshot(0.6, 90 if png else 75)
+                data = self.d.jsonrpc.takeScreenshot(0.6, 75)
         if not data:
             raise RuntimeError("takeScreenshot returned nothing")
         if png:
