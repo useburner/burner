@@ -4853,27 +4853,78 @@ class WebPathTests(OfflineTestCase):
         with self.assertRaises(mod.U2NotFound):
             dm.cmd_wait_for(json.dumps({"text": "Top Stories", "timeout": 0.3}))
 
-    def test_a_native_type_into_the_focused_field_goes_in_at_once(self):
+    def test_a_native_type_into_a_field_goes_in_one_trip_when_it_can(self):
         # YouTube, Oct 6: "Search YouTube" tapped, then typed with --field
-        # "Search YouTube": the field tapped again, a pause, the typing: 4.1s
+        # "Search YouTube": the field tapped again, a pause, the typing: 4.1s;
+        # Settings, Oct 6: the read after the tap came before the box had the focus
         mod = _u2mux()
         EmptyScreenTests.no_sleep(self, mod)
         dm = EmptyScreenTests._daemon(self, mod)
         dm.d = _FakeServer([])
-        sent = []
+        sent, reads = [], []
         dm._act_batch = lambda spec: sent.append(spec) or SAMPLE_XML.encode()
-        dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()  # its "Search" field has the focus
-        self.assertEqual(dm.cmd_act(json.dumps({"set_text": "pudgy", "field": "Search", "idle": 1200})),
-                         SAMPLE_XML.encode())
-        self.assertEqual(sent, [{"set_text": "pudgy", "idle": 1200}])
-        # the field not focused, a row that isn't a field, or an old read: the CLI taps first
-        for xml, label, age in ((SAMPLE_XML.replace('focused="true"', 'focused="false"'), "Search", 0),
-                                (SAMPLE_XML, "OK", 0), (SAMPLE_XML, "Search", 60)):
-            dm._last_xml, dm._last_xml_t = xml, mod._time.monotonic() - age
+        unfocused = SAMPLE_XML.replace('focused="true"', 'focused="false"')
+        moved = unfocused.replace("[100,600][900,700]", "[100,900][900,1000]")
+
+        def act(xml_before, xml_now=None, label="Search", age=0):
+            sent.clear()
+            reads.clear()
+            dm._last_xml, dm._last_xml_t = xml_before, mod._time.monotonic() - age
+            dm._dump = lambda fresh=False, **kw: reads.append(fresh) or xml_now
+            return dm.cmd_act(json.dumps({"set_text": "pudgy", "field": label, "idle": 1200}))
+        # focused on the newest read: at once, into that very field, no read
+        self.assertEqual(act(SAMPLE_XML), SAMPLE_XML.encode())
+        self.assertEqual((reads, [s.get("tap_first") for s in sent]), ([], [None]))
+        self.assertEqual(sent[0]["field_selector"]["resourceId"], "com.example:id/q")
+        self.assertNotIn("field", sent[0])
+        # unfocused on it, focused on a read now: at once
+        act(unfocused, SAMPLE_XML)
+        self.assertEqual((reads, sent[0].get("tap_first"), "field_selector" in sent[0]), ([True], None, True))
+        # unfocused on both, in the same place: tapped and typed in one batch
+        act(unfocused, unfocused)
+        self.assertEqual((reads, sent[0]["tap_first"]), ([True], [500, 650]))
+        # moved since, gone, not a field, an old read: the CLI's way (it taps first)
+        for before, now, label, age in ((unfocused, moved, "Search", 0), (unfocused, TAP_XML, "Search", 0),
+                                        (SAMPLE_XML, None, "OK", 0), (SAMPLE_XML, None, "Search", 60),
+                                        (SAMPLE_XML, None, "Password", 0)):
             with self.assertRaises(RuntimeError) as cm:
-                dm.cmd_act(json.dumps({"set_text": "pudgy", "field": label, "idle": 1200}))
-            self.assertIn("needs a tap on the field first", str(cm.exception))
-        self.assertEqual(len(sent), 1)
+                act(before, now, label, age)
+            self.assertEqual(str(cm.exception), dm.NO_FIELD_TAP)
+            self.assertEqual(sent, [])
+        # the field lost the focus before the typing (the phone found no
+        # such field): nothing typed, so "not sent", and the CLI taps it
+        dm._act_batch = mock.Mock(side_effect=RuntimeError(
+            "act failed after sending: {'code': -32002, 'message': 'UiObjectNotFoundException'}"))
+        with self.assertRaises(RuntimeError) as cm:
+            act(SAMPLE_XML)
+        self.assertEqual(str(cm.exception), dm.NO_FIELD_TAP)
+
+    def test_a_tap_then_type_batch(self):
+        mod = _u2mux()
+        calls = mod.act_calls({"set_text": "pudgy", "tap_first": [500, 650], "idle": 1200})
+        self.assertEqual([m for m, _ in calls],
+                         ["wakeUp", "click", "dumpWindowHierarchy", "waitForIdle", "setText",
+                          "dumpWindowHierarchy", "waitForIdle", "dumpWindowHierarchy"])
+        self.assertEqual(calls[1][1], [500, 650])
+        self.assertEqual(calls[4][1][0], mod.focused_field_selector())  # whichever field took the focus
+        # the selectors are uiautomator2's own shape
+        self.assertEqual(mod.focused_field_selector(),
+                         {"mask": 131088, "childOrSibling": [], "childOrSiblingSelector": [],
+                          "focused": True, "className": "android.widget.EditText"})
+        self.assertEqual(mod.focused_field_selector("a:id/b"),
+                         {"mask": 2228224, "childOrSibling": [], "childOrSiblingSelector": [],
+                          "focused": True, "resourceId": "a:id/b"})
+        calls = mod.act_calls({"set_text": "x", "field_selector": mod.focused_field_selector("a:id/b")})
+        self.assertEqual(calls[1], ("setText", [mod.focused_field_selector("a:id/b"), "x"]))
+        # the typing failed after the tap: said so, never "not sent"
+        EmptyScreenTests.no_sleep(self, mod)
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        dm._batch = lambda calls, timeout=45.0: [None, True, SAMPLE_XML, True,
+                                                 RuntimeError("UiObjectNotFoundException"), SAMPLE_XML, True, SAMPLE_XML]
+        with self.assertRaises(RuntimeError) as cm:
+            dm._act_batch({"set_text": "pudgy", "tap_first": [500, 650], "idle": 1200})
+        self.assertIn("act failed after sending: the field was tapped; the typing failed", str(cm.exception))
 
     def test_typographic_punctuation_is_plain_when_words_are_matched(self):
         # YouTube, Oct 6: the permission dialog's "Don\u2019t allow" (a curly

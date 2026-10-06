@@ -1282,8 +1282,14 @@ def act_calls(spec):
     elif "key" in spec:
         calls.append(("pressKeyCode", [int(spec["key"])]))
     elif "set_text" in spec:
-        from uiautomator2._selector import Selector
-        sel = dict(Selector(focused=True, className="android.widget.EditText"))
+        if "tap_first" in spec:
+            # the field tapped, the screen given its wait, then the text
+            # into the field that took the focus: one trip for both
+            x, y = spec["tap_first"]
+            calls.append(("click", [int(x), int(y)]))
+            calls.append(("dumpWindowHierarchy", [False, DUMP_DEPTH]))
+            calls.append(("waitForIdle", [int(spec.get("idle", 2000))]))
+        sel = spec.get("field_selector") or focused_field_selector()
         calls.append(("setText", [sel, str(spec["set_text"])]))
     if calls:
         if not sleeps_the_screen(spec):
@@ -1304,6 +1310,34 @@ def act_calls(spec):
 
 
 ACTION_METHODS = ("click", "pressKeyCode", "setText")
+
+
+def focused_field_selector(rid=""):
+    """The phone's selector for the text field that has the focus: that
+    very field when its resource id is known (a field that lost the focus
+    is then not found, and nothing is typed), else any EditText with the
+    focus. uiautomator2's Selector shape (focused: mask 0x20000, class
+    name: 0x10, resource id: 0x200000), built here so that no import is
+    needed. Pure."""
+    sel = {"childOrSibling": [], "childOrSiblingSelector": [], "focused": True}
+    if rid:
+        sel.update(mask=0x20000 | 0x200000, resourceId=rid)
+    else:
+        sel.update(mask=0x20000 | 0x10, className="android.widget.EditText")
+    return sel
+
+
+def field_node(xml, label):
+    """The text field with this label on a read (see label_node: once,
+    whole, nothing over it), or None (no such row, several, or a row that
+    isn't a text field). Pure."""
+    if not xml:
+        return None
+    try:
+        node, _ = label_node(xml, label)
+    except RuntimeError:
+        return None
+    return node if node.get("field") else None
 SLEEP_KEYS = (26, 223, 276)  # POWER, SLEEP, SOFT_SLEEP
 
 
@@ -2277,31 +2311,56 @@ class U2Daemon:
                 reads += 1
             spec["tap"] = list(center)
         if "set_text" in spec and spec.get("field"):
-            # a native screen: setText goes to whatever field has the
-            # focus. When the newest read shows this very field focused
-            # (the assistant tapped it a moment ago), the text goes in at
-            # once: a tap of the field again, a pause and the typing took
-            # 4.1s (YouTube's search box, Oct 6). Otherwise the field is
-            # tapped first, by the CLI's own lookup, so that the typing
-            # isn't reported as going into this field when another has
-            # the focus.
-            if self._focused_field(spec["field"]):
-                spec = dict(spec)
-                spec.pop("field")
-                return self._act_batch(spec)
-            raise RuntimeError("act not sent: --field on a native screen needs a tap on the field first")
+            return self._type_into_field(spec)
         return self._act_batch(spec)
 
-    def _focused_field(self, label):
-        """Whether the newest read (BY_WORDS_S old at most) shows the
-        text field with this label, and that field has the focus."""
-        if not self._last_xml or _time.monotonic() - self._last_xml_t >= BY_WORDS_S:
-            return False
+    NO_FIELD_TAP = "act not sent: --field on a native screen needs a tap on the field first"
+
+    def _type_into_field(self, spec):
+        """`type --field` on a native screen, where setText goes to
+        whatever field has the focus. With the field on the newest read
+        (the assistant's, BY_WORDS_S old at most): focused there, the text
+        goes in at once, into that very field; unfocused there, a read
+        now, since the read after a tap can come before the field takes
+        the focus (Settings' search box, Oct 6), and on it the text goes
+        in at once when the field has the focus, or the field is tapped
+        and the text typed in one batch when it is still in its place. A
+        tap of the field, a pause and the typing, a trip each, took 4.1s
+        (YouTube's search box, Oct 6). Anything else is "not sent": the
+        CLI taps the field by its own lookup first, so the typing isn't
+        reported as going into this field when another has the focus."""
+        spec = dict(spec)
+        label = spec.pop("field")
+        young = self._last_xml and _time.monotonic() - self._last_xml_t < BY_WORDS_S
+        before = field_node(self._last_xml, label) if young else None
+        if before is None:
+            raise RuntimeError(self.NO_FIELD_TAP)
+        if before["focused"]:
+            return self._type_at_once(spec, before)
         try:
-            node, _ = label_node(self._last_xml, label)
-        except RuntimeError:
-            return False
-        return bool(node.get("field") and node.get("focused"))
+            with _t("field read"):
+                xml = self._dump(fresh=True)
+        except Exception as e:
+            raise RuntimeError("act not sent: the read before it failed (%s)" % err_text(e, 100))
+        now = field_node(xml, label)
+        if now is not None and now["focused"]:
+            return self._type_at_once(spec, now)
+        if now is not None and now["center"] == before["center"]:
+            spec["tap_first"] = list(now["center"])
+            return self._act_batch(spec)
+        raise RuntimeError(self.NO_FIELD_TAP)
+
+    def _type_at_once(self, spec, node):
+        """The text into this focused field in one batch: "not sent" when
+        the field doesn't have the focus after all (the phone found no
+        such field, and nothing was typed)."""
+        spec["field_selector"] = focused_field_selector(node.get("rid", ""))
+        try:
+            return self._act_batch(spec)
+        except RuntimeError as e:
+            if "UiObjectNotFound" in str(e) or "-32002" in str(e):
+                raise RuntimeError(self.NO_FIELD_TAP)
+            raise
 
     def _native_row(self, label):
         """The centre of the row with these words on a fresh read by the
@@ -2346,6 +2405,11 @@ class U2Daemon:
                 # any other error (a NullPointerException on a web node, Oct
                 # 4) may have come after the touch went in: no second tap
                 raise RuntimeError("act failed after sending: %s" % err)
+            later = [results[i] for i in acted[1:] if isinstance(results[i], Exception)]
+            if later:
+                # a field tapped, then its typing failed (no field took the focus)
+                raise RuntimeError("act failed after sending: the field was tapped; the typing failed (%s)"
+                                   % err_text(later[0], 120))
             if "tap_selector" in spec and acted:
                 n = results[acted[0] - 1]
                 if isinstance(n, int) and n > 1:
@@ -2447,7 +2511,7 @@ _BOUNDS_RE = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
 
 def iter_nodes(xml):
     """Yield {text, desc, bounds, center, rect, enabled, clickable,
-    selected, focused, web, field, cls, parent} for every node with
+    selected, focused, rid, web, field, cls, parent} for every node with
     non-empty on-screen bounds,
     in document order; web: the node is inside a WebView (a browser's
     page, an app's web content); field: a text field (its text is what
@@ -2469,7 +2533,7 @@ def iter_nodes(xml):
                        "enabled": n.get("enabled") != "false",
                        "clickable": n.get("clickable") == "true",
                        "selected": n.get("selected") == "true", "focused": n.get("focused") == "true",
-                       "web": web,
+                       "rid": n.get("resource-id") or "", "web": web,
                        "field": "edittext" in cls, "cls": cls, "parent": parent}
                 parent = count[0]
                 count[0] += 1
