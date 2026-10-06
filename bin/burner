@@ -6591,11 +6591,16 @@ def cmd_update(args):
 
 
 def wait_for_helper(timeout):
-    """True once the UI helper answers, or False after timeout seconds."""
+    """True once the UI helper answers that it is connected to the
+    phone's UI server ("alive"), or False after timeout seconds. "dead"
+    (the helper up, its server not yet: it was being restarted after an
+    update, and the next command paid 50s, Oct 5) keeps waiting."""
     t0 = time.time()
     while time.time() - t0 < timeout:
-        if os.path.exists(U2_SOCK) and u2sock("health", timeout=10) is not None:
-            return True
+        if os.path.exists(U2_SOCK):
+            r = u2sock("health", timeout=10)
+            if r is not None and r.strip().startswith("alive"):
+                return True
         time.sleep(0.5)
     return False
 

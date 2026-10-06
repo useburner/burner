@@ -7571,3 +7571,16 @@ class AirbnbRoundTests(OfflineTestCase):
         with self.assertRaises(RuntimeError) as cm:
             dm.cmd_act(json.dumps({"open": "https://www.espn.com/nfl/"}))
         self.assertEqual(str(cm.exception), "act not sent: not a page")
+
+    def test_the_update_waits_for_a_helper_that_is_connected_not_just_up(self):
+        # after an update the helper answered "dead" (its server being
+        # restarted) and the update said "helpers restarted."; the next
+        # command paid 50s (Oct 5)
+        answers = iter(["dead", "dead", "alive"])
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30: next(answers))
+        with mock.patch.object(pc.os.path, "exists", return_value=True), mock.patch.object(pc.time, "sleep"):
+            self.assertTrue(pc.wait_for_helper(5))
+        self.allow("u2sock", return_value="dead")
+        clock = iter([0.0, 0.0, 10.0])
+        with mock.patch.object(pc.os.path, "exists", return_value=True), mock.patch.object(pc.time, "sleep"),                 mock.patch.object(pc.time, "time", side_effect=lambda: next(clock, 10.0)):
+            self.assertFalse(pc.wait_for_helper(5))
