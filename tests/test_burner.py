@@ -4137,7 +4137,7 @@ class StartAndSettingsTests(OfflineTestCase):
                 self.cap() as (out, err):
             rc = pc.cmd_start(self.parse(["start", "com.example"]))
         self.assertEqual(rc, 0, err.getvalue())
-        self.assertIn("(no app's window in the screen reader's tree yet; `burner shot` shows the screen)", out.getvalue())
+        self.assertIn("(no app's window readable yet; `burner shot` shows the screen)", out.getvalue())
         # the helper takes such a read for no app on the screen, not for a
         # server reading no words: never replaced for it, however long
         mod = _u2mux()
@@ -7513,9 +7513,9 @@ class CoordinateTapTests(OfflineTestCase):
         self.assertEqual(dm.cmd_dump("page"), b"")
         self.assertEqual(fake.front_page.call_count, dm.LAUNCH_CONTACT_TRIES)
 
-    def test_a_launch_whose_reads_hold_no_app_asks_chrome_s_tabs(self):
-        # Oct 6: Chrome launched from the Play Store was drawn while the
-        # screen reader's tree held no app for about 15s: ten tries twice, 18.6s
+    def test_a_launch_with_the_screen_off_wakes_it_to_look_for_the_page(self):
+        # Oct 6: a Wikipedia open took 66s with the screen off: "nothing
+        # readable" and pages "hidden" on every try, the screen woken only after
         mod = _u2mux()
         EmptyScreenTests.no_sleep(self, mod)
         calls = []
@@ -7525,19 +7525,55 @@ class CoordinateTapTests(OfflineTestCase):
             calls.append(("front_page", kw.get("quick"), kw.get("hint"))) or _FakePage())
         dm = EmptyScreenTests._daemon(self, mod)
         mod.log = lambda *a: None
-        link = "https://www.google.com/search?q=weather"
-        dm.d = _FakeServer([BARS_XML] * 3)
+        link = "https://en.m.wikipedia.org/wiki/Main_Page"
+        woke = []
+        dm._wake = lambda: woke.append(1)
+        dm.d = _FakeServer([BARS_XML, CHROME_XML], screen_on=False)
         dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()  # the newest read: not Chrome
         self.assertIn('text="Box Score"', dm.cmd_dump("page " + link).decode())
+        self.assertEqual(woke, [1])
         self.assertEqual([c for c in calls if c[0] == "front_page"], [("front_page", True, link)])
-        self.assertEqual(len(dm.d.calls), 3)  # two reads with no app, then the tabs asked
-        # another app in front: its tabs are never asked (a Chrome still
-        # coming up was kept from coming up by them, Oct 5)
+        # the screen on and no app in the reads: the tabs aren't asked (a
+        # Chrome still coming up was kept from coming up by them, Oct 5)
         calls.clear()
-        launcher = SAMPLE_XML.replace("com.example", "com.android.launcher3")
-        dm.d = _FakeServer([launcher] * dm.LAUNCH_CONTACT_TRIES)
+        woke.clear()
+        dm.d = _FakeServer([BARS_XML] * dm.LAUNCH_CONTACT_TRIES, screen_on=True)
         self.assertEqual(dm.cmd_dump("page " + link), b"")
-        self.assertEqual([c for c in calls if c[0] == "front_page"], [])
+        self.assertEqual(([c for c in calls if c[0] == "front_page"], woke), ([], []))
+
+    def test_an_old_read_of_chrome_is_checked_before_its_tabs_are_scanned(self):
+        # no page in hand, and the read that says Chrome is in front is old:
+        # the screen is looked at first (woken when off); another app in
+        # front then means no scan of Chrome's tabs ("hidden" after 4s, Oct 6)
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = WebPathTests._fake_cdp(self, mod, calls)
+        fake.front_page = mock.Mock(side_effect=AssertionError("no scan of Chrome's tabs"))
+        dm = EmptyScreenTests._daemon(self, mod)
+        mod.log = lambda *a: None
+        dm._web = None
+        woke = []
+        dm._wake = lambda: woke.append(1)
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic() - 60
+        dm.d = _FakeServer([BARS_XML, SAMPLE_XML], screen_on=False)
+        self.assertIsNone(dm._page())
+        self.assertEqual((woke, dm.d.calls), ([1], ["dumpWindowHierarchy"] * 2))
+        self.assertEqual(dm._last_xml, SAMPLE_XML)  # the look is the newest read
+        # Chrome still in front: the tabs are asked as before
+        fake.front_page = mock.Mock(return_value=_FakePage())
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic() - 60
+        dm.d = _FakeServer([CHROME_XML], screen_on=True)
+        self.assertIsNotNone(dm._page())
+        fake.front_page.assert_called_once()
+        # a young read: no look first
+        dm._web = None
+        fake.front_page.reset_mock()
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        dm.d = _FakeServer([], screen_on=True)
+        dm._page()
+        self.assertEqual(dm.d.calls, [])
+        fake.front_page.assert_called_once()
 
     def test_the_current_tab_gets_the_long_probe_from_the_start_after_a_launch(self):
         cdp = _cdp()

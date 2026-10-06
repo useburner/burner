@@ -1750,8 +1750,8 @@ LAUNCH_SLOW_S = 9.0     # an installed app's cold start is given this long in al
                         # "didn't come to the front" (Airbnb, Oct 5: the Play Store still
                         # in front 4s in, and the verdict while the app was starting)
 LAUNCH_TREE_S = 14.0    # a launch whose reads hold no app's window at all: read this long
-                        # (the Play Store had drawn 2.4s after a cold start; its window
-                        # stayed out of the screen reader's tree for 6-14s, Oct 6)
+                        # (a window not readable yet: the helper wakes an off screen, so
+                        # this is a splash or a window still coming, Oct 6)
 LAUNCH_REREADS = 4      # reads after a launch while another app is still in
                         # front (0.4s apart): the window takes a moment to come
 IDLE_SCROLL_MS = 500    # the read after a swipe: it stops dead, the content is
@@ -3689,8 +3689,8 @@ def launch_read(quiet, expect=None):
         if attempt > LAUNCH_REREADS:
             # the quick reads are spent: an app that is installed is still
             # starting (one that isn't gets its verdict now); with no app's
-            # window in the reads at all, the app may be drawn while the
-            # screen reader's tree doesn't have it yet: longer, then
+            # window in the reads at all, the window isn't readable yet:
+            # longer, then
             if installed is None:
                 installed = app_installed(expect)
             budget = LAUNCH_TREE_S if front is None else LAUNCH_SLOW_S
@@ -3699,7 +3699,7 @@ def launch_read(quiet, expect=None):
         _trace("{} in front, not {} yet; reading again".format(front, expect))
         time.sleep(0.4)
     if expect and front is None:
-        note = "(no app's window in the screen reader's tree yet; `burner shot` shows the screen)"
+        note = "(no app's window readable yet; `burner shot` shows the screen)"
     print_screen(root, note=note)
     return front
 

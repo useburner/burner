@@ -548,11 +548,11 @@ def blank_screen(xml):
     like that: the shade's bare window holds the focus (Oct 4, a Pixel 7
     off its charger, whose screen turns off after 10s: label taps missed
     and `wait` timed out while screenshots, which wake the phone first,
-    looked fine). So does a cold start whose window isn't in the screen
-    reader's tree yet: the status and navigation bars alone, 15 nodes and
-    no word, for 6-14s after the Play Store had drawn its first screen
-    (Oct 6; taken for a server that reads no words, it was replaced:
-    10s). A pulled-down shade or a lock screen has words. Pure."""
+    looked fine). An off screen read as the status and navigation bars
+    alone too, 15 nodes and no word (Oct 6: after a launch with the screen
+    off, taken for a server that reads no words, the server was replaced:
+    10s; Muse's screenshots, which wake the phone, showed the app). A
+    pulled-down shade or a lock screen has words. Pure."""
     if not real_screen(xml):
         return True
     if not set(re.findall(r'package="([^"]*)"', xml)) <= {SYSTEM_UI}:
@@ -1449,7 +1449,7 @@ class U2Daemon:
         return None
 
     LAUNCH_CONTACT_TRIES = 10  # a Chrome just launched: its DevTools side is asked this often, 0.4s apart
-    BLIND_TRIES = 2  # reads with no app in them at all before Chrome's tabs are asked anyway
+    FRONT_STALE_S = 10.0  # no page in hand: a read of Chrome older than this is checked first
     OPENED_FOR_S = 60.0        # a link the CLI launched is the tab scan's hint this long
 
     def _address_hint(self, last, hint=None):
@@ -1489,29 +1489,47 @@ class U2Daemon:
                 return None
             if _time.monotonic() < getattr(self, "_web_retry_at", 0.0):
                 return None  # out of reach a moment ago: the screen reader, for now
+            if (getattr(self, "_web", None) is None
+                    and _time.monotonic() - getattr(self, "_last_xml_t", 0.0) > self.FRONT_STALE_S):
+                # no page in hand, and the read that says Chrome is in
+                # front is old: one look at the screen first (Chrome may
+                # have left the front, or the screen gone off: a scan of
+                # its tabs then answered "hidden" after 4s, Oct 6)
+                xml = self._front_read()
+                info = screen_of(xml) if xml else None
+                if not info or not _cdp().is_chrome(info[2]):
+                    self._front_look = xml or None  # what is in front, for _dump
+                    return None
+                last = xml
         current = getattr(self, "_web", None)
         chrome_in_front = True
         hint = self._address_hint(last, hint)
         # (an older cdp module takes no hint: none passed when there is none)
         hinted = {"hint": hint} if hint else {}
         if assume_chrome:
+            woke = False
             for i in range(self.LAUNCH_CONTACT_TRIES):
                 try:
                     # Chrome's window in front first (its address bar, when
                     # it is, is the hint): the tabs are asked only then
                     with _t("dump rpc (launch check)"):
                         xml = read_screen(self.d)
+                    if not woke and blank_screen(xml) and screen_on(self.d) is False:
+                        # the screen went off between commands (this phone
+                        # turns it off soon after the last touch): nothing
+                        # on it reads, and Chrome's pages say "hidden" (a
+                        # 66s open, Oct 6)
+                        woke = True
+                        log("the screen is off; waking it to look for the page")
+                        self._wake()
+                        with _t("dump rpc (launch check)"):
+                            xml = read_screen(self.d)
                     if has_words(xml):
                         self._remember(xml)
                         self._front_cache = (xml, screen_of(xml))
                     front = (screen_of(xml) or (0, 0, ""))[2]
-                    if not _cdp().is_chrome(front) and (front or i < self.BLIND_TRIES):
+                    if not _cdp().is_chrome(front):
                         raise RuntimeError("%s in front, not Chrome yet" % (front or "nothing readable"))
-                    # no app in the read at all, a second on: the screen
-                    # reader's tree can lag a window that is drawn by 5-15s
-                    # (Chrome after a launch from the Play Store: two rounds
-                    # of tries, 18.6s for an open, Oct 6); Chrome's tabs
-                    # say whether a page is visible
                     bar = url_bar_of(xml)
                     with _t("web page (after a launch)"):
                         self._web = _cdp().front_page(getattr(self.d, "_dev", None), current,
@@ -1760,6 +1778,27 @@ class U2Daemon:
         except Exception as e:
             raise RuntimeError("the phone's screen is off and wakeUp failed (%s)" % err_text(e, 80))
         _time.sleep(0.4)
+
+    def _front_read(self):
+        """One read of what is in front now, the screen woken first when it
+        is off (a blank read, and the phone says so); remembered when it
+        has words. "" when the screen can't be read."""
+        try:
+            with self._lock:
+                with _t("dump rpc (front check)"):
+                    xml = read_screen(self.d)
+                if blank_screen(xml) and screen_on(self.d) is False:
+                    log("the screen is off; waking it")
+                    self._wake()
+                    with _t("dump rpc (front check)"):
+                        xml = read_screen(self.d)
+        except Exception as e:
+            log("the look at the screen failed (%s)" % err_text(e, 80))
+            return ""
+        if has_words(xml):
+            self._remember(xml)
+            self._front_cache = (xml, screen_of(xml))
+        return xml
 
     def _relink(self, why):
         """The phone back on adb, with no restart: the link through the
