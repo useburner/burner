@@ -986,6 +986,21 @@ def selector_for(node, label):
     return {"mask": mask, "childOrSibling": [], "childOrSiblingSelector": [], key: value}
 
 
+
+# Every kind of space is one plain space when words are compared: Android
+# formats "6:30 AM" with a narrow no-break space before AM (U+202F), the
+# assistant types a plain one, and the exact match missed the row while
+# the fuzzy one found the two descriptions around it (the Clock app, Oct 5).
+_SPACES = dict.fromkeys(map(ord, "\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007"
+                                 "\u2008\u2009\u200a\u202f\u205f\u3000\t\r\n"), " ")
+
+
+def squash_spaces(s):
+    """`s` with every kind of space as one plain space, runs collapsed,
+    the ends trimmed. Pure."""
+    return " ".join((s or "").translate(_SPACES).split())
+
+
 def label_node(xml, label):
     """The one control on this read whose text or description is `label`
     (case-insensitive exact; "A || B" tries each): (its first row, the
@@ -998,8 +1013,9 @@ def label_node(xml, label):
     another row sits over it (see row_over)."""
     nodes = list(iter_nodes(xml or ""))
     for alt in [p.strip() for p in label.split("||") if p.strip()]:
-        low = alt.lower()
-        hits = [n for n in nodes if low in (n["text"].lower(), n["desc"].lower())]
+        low = squash_spaces(alt).lower()
+        hits = [n for n in nodes
+                if low in (squash_spaces(n["text"]).lower(), squash_spaces(n["desc"]).lower())]
         if not hits:
             continue
         controls = []  # the hits, one list per control
@@ -1014,7 +1030,7 @@ def label_node(xml, label):
             # the words typed into a field are not its label when another
             # row carries them (a search box holding "Pixel 7" beside that
             # suggestion)
-            typed = [c for c in controls if c[0].get("field") and c[0]["text"].lower() == low]
+            typed = [c for c in controls if c[0].get("field") and squash_spaces(c[0]["text"]).lower() == low]
             if typed and len(typed) < len(controls):
                 controls = [c for c in controls if c not in typed]
         if len(controls) > 1:
@@ -2250,12 +2266,12 @@ def find_node(xml, needle, fuzzy=True):
     (case-insensitive) match wins, then substring if fuzzy. "A || B"
     matches any of the labels (the first found, in that order). None on
     miss."""
-    needles = [p.strip().lower() for p in needle.split("||") if p.strip()]
+    needles = [squash_spaces(p).lower() for p in needle.split("||") if p.strip()]
     first_sub = None
     nodes = list(iter_nodes(xml))
     for nl in needles:
         for n in nodes:
-            labels = (n["text"].lower(), n["desc"].lower())
+            labels = (squash_spaces(n["text"]).lower(), squash_spaces(n["desc"]).lower())
             if nl in labels:
                 return n
             if fuzzy and first_sub is None and any(nl in l for l in labels):

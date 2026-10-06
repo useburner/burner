@@ -7421,6 +7421,30 @@ class AirbnbRoundTests(OfflineTestCase):
         self.assertEqual([c[1] for c in calls], [{"key": 3, "idle": pc.IDLE_HOME_MS}, {"key": 4, "idle": pc.IDLE_ACT_MS}])
         self.assertIn("pressed HOME", out.getvalue())
 
+    def test_every_kind_of_space_is_one_space_when_words_are_matched(self):
+        # the Clock app, Oct 5: "6:30 AM" drawn with a narrow no-break space
+        # before AM; the assistant typed a plain one; the exact match missed
+        # the row, the fuzzy one found the two descriptions around it
+        self.assertEqual(pc.squash_spaces("6:30\u202fAM"), "6:30 AM")
+        self.assertEqual(pc.squash_spaces("  a\u00a0\u00a0b \t c "), "a b c")
+        self.assertEqual(pc.squash_spaces(""), "")
+        clock = SAMPLE_XML.replace("</hierarchy>", """  <node text="" content-desc="Alarm Tomorrow 6:30 AM Alarm is currently enabled." class="android.view.ViewGroup" package="com.example" bounds="[0,400][1080,700]" clickable="true" enabled="true">
+    <node text="6:30\u202fAM" class="android.widget.TextView" package="com.example" bounds="[100,500][400,660]" clickable="true" enabled="true"/>
+    <node text="" content-desc="6:30 AM alarm" class="android.widget.Switch" package="com.example" bounds="[800,500][1030,660]" clickable="true" enabled="true"/>
+  </node>
+</hierarchy>""")
+        nodes = pc.walk(ET.fromstring(clock))
+        hits = pc.find_nodes(nodes, "6:30 AM")
+        self.assertEqual([n["text"] for n in hits], ["6:30\u202fAM"])
+        plan = pc.plan_tap(nodes, 1080, 2400, text="6:30 AM")
+        self.assertEqual((plan["action"], plan["xy"]), ("tap", (250, 580)))
+        mod = _u2mux()
+        self.assertEqual(mod.squash_spaces("6:30\u202fAM"), "6:30 AM")
+        row, alt = mod.label_node(clock, "6:30 AM")
+        self.assertEqual((row["text"], alt), ("6:30\u202fAM", "6:30 AM"))
+        self.assertEqual(mod.find_node(clock, "6:30 AM", fuzzy=False)["text"], "6:30\u202fAM")
+        self.assertEqual(mod.find_node(clock, "6:30 am", fuzzy=False)["text"], "6:30\u202fAM")
+
     def test_the_third_scroll_the_same_way_earns_a_hint(self):
         # Muse scrolled up eight times, a read each, to reach the top (Oct 5)
         import datetime

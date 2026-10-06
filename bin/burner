@@ -974,9 +974,25 @@ def clickable_target(node):
     return node["center"]
 
 
+
+# Every kind of space is one plain space when words are compared: Android
+# formats "6:30 AM" with a narrow no-break space before AM (U+202F), the
+# assistant types a plain one, and the exact match missed the row while
+# the fuzzy one found the two descriptions around it (the Clock app, Oct 5).
+_SPACES = dict.fromkeys(map(ord, "\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007"
+                                 "\u2008\u2009\u200a\u202f\u205f\u3000\t\r\n"), " ")
+
+
+def squash_spaces(s):
+    """`s` with every kind of space as one plain space, runs collapsed,
+    the ends trimmed. Pure."""
+    return " ".join((s or "").translate(_SPACES).split())
+
+
 def find_nodes(nodes, text, exact=True):
     def label(n):
-        return n["text"] or n["desc"] or ""
+        return squash_spaces(n["text"] or n["desc"] or "")
+    text = squash_spaces(text)
     if exact:
         return [n for n in nodes if label(n) == text]
     tl = text.lower()
