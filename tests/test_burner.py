@@ -4147,12 +4147,28 @@ class StartAndSettingsTests(OfflineTestCase):
         self.assertFalse(mod.blank_screen(MUTE_XML))
         self.assertTrue(mod.mute_read(MUTE_XML))
         EmptyScreenTests.no_sleep(self, mod)
-        dm = EmptyScreenTests._daemon(self, mod)  # a server restart fails the test
-        dm.d = _FakeServer([BARS_XML] * 3, screen_on=True)
+        dm = EmptyScreenTests._daemon(self, mod)
+        restarts, woke = [], []
+        dm.connect = lambda force=False: restarts.append(force)
+        dm._wake = lambda: woke.append(1)
         dm._page_read = lambda **kw: None
+        # the screen off (Oct 6): woken and read again, never a replacement
+        dm.d = _FakeServer([BARS_XML, SAMPLE_XML], screen_on=False)
         dm._mute_since = mod._time.monotonic() - 30  # a long wordless spell already
-        for _ in range(3):
-            self.assertEqual(dm._dump(fresh=True), BARS_XML)
+        self.assertEqual(dm._dump(fresh=True), SAMPLE_XML)
+        self.assertEqual((woke, restarts), ([1], []))
+        # the screen on and the bars alone, read after read: the wordless
+        # spell decides, and a server that sees no app is replaced
+        dm.d = _FakeServer([BARS_XML, SAMPLE_XML], screen_on=True)
+        dm._mute_since, dm._wordless_seen = mod._time.monotonic() - 30, False
+        self.assertEqual(dm._dump(fresh=True), SAMPLE_XML)
+        self.assertEqual(restarts, [True])
+        # a moment of them: kept, as a transition
+        restarts.clear()
+        dm.d = _FakeServer([BARS_XML], screen_on=True)
+        dm._mute_since, dm._wordless_seen = None, False
+        self.assertEqual(dm._dump(fresh=True), BARS_XML)
+        self.assertEqual(restarts, [])
 
     def test_start_uses_adb_without_the_scrcpy_helper(self):
         self.allow("scrcpy_send", side_effect=RuntimeError("no scrcpy"))
@@ -4240,11 +4256,38 @@ class _FakeDev:
     def shell(self, cmd, timeout=None):
         self.shells.append(cmd)
         assert timeout, "a phone shell needs a timeout"
+        if cmd == "echo ok":
+            return "ok"
         if cmd.startswith("dumpsys power"):
             return {True: "mWakefulness=Awake", False: "mWakefulness=Asleep"}.get(self.awake, "")
         if not cmd.startswith("ps"):
             return ""
         return self.listings.pop(0) if len(self.listings) > 1 else self.listings[0]
+
+    def open_transport(self, timeout=None):
+        """A stream to the phone's shell (see u2mux.bounded_shell): its
+        command runs through `shell` above."""
+        assert timeout, "a phone shell needs a bound on the whole of it"
+        dev = self
+
+        class Transport:
+            def __init__(self):
+                self.cmd = None
+                self.conn = SimpleNamespace(settimeout=lambda t: None)
+
+            def send_command(self, c):
+                assert c.startswith("shell:"), c
+                self.cmd = c[len("shell:"):]
+
+            def check_okay(self):
+                pass
+
+            def read_until_close(self, encoding="utf-8"):
+                return dev.shell(self.cmd, timeout=timeout)
+
+            def close(self):
+                pass
+        return Transport()
 
 
 NO_WINDOWS = '<hierarchy rotation="0" />'  # a look at the windows that shows nothing over the page
@@ -4946,9 +4989,16 @@ class WebPathTests(OfflineTestCase):
         # unfocused on it, focused on a read now: at once
         act(unfocused, SAMPLE_XML)
         self.assertEqual((reads, sent[0].get("tap_first"), "field_selector" in sent[0]), ([True], None, True))
-        # unfocused on both, in the same place: tapped and typed in one batch
+        # unfocused on both, in the same place: tapped and typed in one
+        # batch, the typing pinned to that field
         act(unfocused, unfocused)
         self.assertEqual((reads, sent[0]["tap_first"]), ([True], [500, 650]))
+        self.assertEqual(sent[0]["field_selector"]["resourceId"], "com.example:id/q")
+        # focused, but with no resource id to pin it: a read now first
+        # (the focus may have moved since the assistant's read)
+        norid = SAMPLE_XML.replace('resource-id="com.example:id/q"', 'resource-id=""')
+        act(norid, norid)
+        self.assertEqual((reads, sent[0]["field_selector"]), ([True], mod.focused_field_selector()))
         # moved since, gone, not a field, an old read: the CLI's way (it taps first)
         for before, now, label, age in ((unfocused, moved, "Search", 0), (unfocused, TAP_XML, "Search", 0),
                                         (SAMPLE_XML, None, "OK", 0), (SAMPLE_XML, None, "Search", 60),
@@ -5000,6 +5050,9 @@ class WebPathTests(OfflineTestCase):
         # a key too; still the same after: kept as it is
         self.assertEqual(run({"key": 4, "idle": 1200}, SAMPLE_XML, again=SAMPLE_XML), SAMPLE_XML)
         self.assertEqual(len(batches), 2)
+        # nothing readable on the read again: that read, not the one from
+        # before the action (the CLI reads a thin screen again)
+        self.assertEqual(run({"tap": [250, 450], "idle": 1200}, SAMPLE_XML, again=BARS_XML), BARS_XML)
         # a row or two where the read before had a dozen: taken mid-transition,
         # read again (Settings' "About phone" read as its search bar alone, Oct 6)
         dozen = SAMPLE_XML.replace("</hierarchy>", "".join(
@@ -5046,7 +5099,9 @@ class WebPathTests(OfflineTestCase):
                                                  RuntimeError("UiObjectNotFoundException"), SAMPLE_XML, True, SAMPLE_XML]
         with self.assertRaises(RuntimeError) as cm:
             dm._act_batch({"set_text": "pudgy", "tap_first": [500, 650], "idle": 1200})
-        self.assertIn("act failed after sending: the field was tapped; the typing failed", str(cm.exception))
+        # no field had the focus: said so in the words the CLI types its other ways on
+        self.assertIn("act failed after sending: the field was tapped; no editable field had the focus",
+                      str(cm.exception))
 
     def test_typographic_punctuation_is_plain_when_words_are_matched(self):
         # YouTube, Oct 6: the permission dialog's "Don\u2019t allow" (a curly
@@ -6062,9 +6117,10 @@ class EmptyScreenTests(OfflineTestCase):
         with mock.patch.object(mod._time, "monotonic", lambda: clock[0]), \
                 mock.patch.object(mod.select, "select", select_never), \
                 mock.patch.object(mod, "open_stream", dead):
-            with self.assertRaises(mod.LinkDead):
+            with self.assertRaises(mod.LinkDead) as cm:
                 ka._wait_answer(conn, None, 9008, 25.0)
         self.assertEqual((waits, probes, closed), ([3.0], [3.0], ["conn"]))  # at 3s, not 25
+        self.assertTrue(cm.exception.sent)  # the request had gone out: it may have acted
         # a slow server on a live link: checked, then waited for
         waits.clear()
         probes.clear()
@@ -6084,7 +6140,9 @@ class EmptyScreenTests(OfflineTestCase):
             ka._wait_answer(conn, None, 9008, 25.0)
         self.assertEqual((waits, probes), ([3.0, 5.0, 5.0], [3.0, 3.0]))
         self.assertEqual(closed, ["conn", "probe", "probe"])
-        # an answer at once: no check; a short timeout: no check past it
+        # an answer at once: no check; a short timeout: no check past it,
+        # and the timeout raised at its end (the read after the wait would
+        # have waited a second timeout: a hung server's 25s read took 50s)
         waits.clear()
         probes.clear()
         with mock.patch.object(mod._time, "monotonic", lambda: clock[0]), \
@@ -6094,8 +6152,22 @@ class EmptyScreenTests(OfflineTestCase):
         with mock.patch.object(mod._time, "monotonic", lambda: clock[0]), \
                 mock.patch.object(mod.select, "select", select_never), \
                 mock.patch.object(mod, "open_stream", alive):
-            ka._wait_answer(conn, None, 9008, 2.0)
+            with self.assertRaises(TimeoutError):
+                ka._wait_answer(conn, None, 9008, 2.0)
         self.assertEqual((waits, probes), ([2.0], []))
+        # a link check that fails another way: said, and the wait goes on
+        # without checks to its end
+        waits.clear()
+        logged = []
+        mod.log = lambda *a: logged.append(" ".join(str(x) for x in a))
+        with mock.patch.object(mod._time, "monotonic", lambda: clock[0]), \
+                mock.patch.object(mod.select, "select", select_never), \
+                mock.patch.object(mod, "open_stream", mock.Mock(side_effect=ValueError("api changed"))):
+            with self.assertRaises(TimeoutError):
+                ka._wait_answer(conn, None, 9008, 10.0)
+        self.assertEqual(waits, [3.0, 7.0])
+        self.assertTrue(any("the link check failed" in line for line in logged), logged)
+        mod.log = lambda *a: None
         # nothing to watch (not a socket): the read decides
         with mock.patch.object(mod.select, "select", mock.Mock(side_effect=TypeError("not a socket"))):
             ka._wait_answer(conn, None, 9008, 25.0)
@@ -6124,10 +6196,11 @@ class EmptyScreenTests(OfflineTestCase):
             ka.request(dev, 9008, "GET", "/ping")
         ka._wait_answer.assert_not_called()
 
-    def test_reconnect_device_escalates_to_adb_s_server(self):
+    def test_reconnect_device_reconnects_and_leaves_adb_s_server_alone(self):
         # Oct 6: adb kept the dead link as a device and said "already
-        # connected" to a connect; what put the phone back was `burner
-        # ensure`'s restart of adb's server
+        # connected" to a connect: disconnected first, then connected. adb's
+        # server is the CLI's `ensure`'s to restart (with its checks of the
+        # phone's port); the scrcpy helper's streams use it too
         mod = _u2mux()
         self.no_sleep(mod)
         events, runs = [], []
@@ -6136,36 +6209,142 @@ class EmptyScreenTests(OfflineTestCase):
             disconnect=lambda t: events.append("disconnect"),
             connect=lambda t, timeout=None: events.append("connect") or (connects.pop(0) if connects else "connected to " + t),
             wait_for=lambda serial, state="device", timeout=None: events.append("wait %s %g" % (state, timeout)),
-            server_kill=lambda: events.append("kill")))
+            server_kill=lambda: self.fail("adb's server is the CLI's to restart")))
 
         def run():
             with mock.patch.dict(sys.modules, {"adbutils": fake_adbutils}), \
                     mock.patch.object(mod.subprocess, "run", lambda cmd, **kw: runs.append(cmd[-1])), \
                     mock.patch.object(mod.os.path, "exists", lambda p: True):
                 return mod.reconnect_device()
-        alive = iter([False, True])
-        mod.link_alive = lambda: next(alive)
-        self.assertTrue(run())
-        self.assertEqual(events, ["disconnect", "connect", "wait device 5", "kill",
-                                  "disconnect", "connect", "wait device 5"])
-        self.assertEqual(runs, ["start", "start-server"])  # the tunnel, then adb's server
-        # answering after the first connect: adb's server is left alone
-        events.clear()
-        runs.clear()
         mod.link_alive = lambda: True
         self.assertTrue(run())
         self.assertEqual((events, runs), (["disconnect", "connect", "wait device 5"], ["start"]))
-        # a connect adb refused: no wait for a phone that isn't coming, the restart next
-        events.clear()
-        connects.append("failed to connect to '127.0.0.1:15555': Connection refused")
-        self.assertTrue(run())
-        self.assertEqual(events, ["disconnect", "connect", "kill", "disconnect", "connect", "wait device 5"])
-        # never answering: False, both steps taken
+        # still no answer: False, and why
         events.clear()
         mod.link_alive = lambda: False
         self.assertFalse(run())
-        self.assertEqual(events, ["disconnect", "connect", "wait device 5", "kill",
-                                  "disconnect", "connect", "wait device 5"])
+        self.assertEqual(events, ["disconnect", "connect", "wait device 5"])
+        # a connect adb refused: no wait for a phone that isn't coming
+        events.clear()
+        connects.append("failed to connect to '127.0.0.1:15555': Connection refused")
+        self.assertFalse(run())
+        self.assertEqual(events, ["disconnect", "connect"])
+        self.assertIn("Connection refused", mod.LINK_WHY[0])
+
+    def test_link_alive_bounds_the_whole_shell(self):
+        # the review of Oct 6: adbutils bounds only the reading of a
+        # shell's output; the stream's open waited 600s on a link that
+        # passes nothing (adb dropped it after 75s)
+        mod = _u2mux()
+        self.no_sleep(mod)
+        import socket
+
+        class Stuck(_FakeDev):
+            def open_transport(self, timeout=None):
+                opened.append(timeout)
+                t = super().open_transport(timeout)
+
+                def no_okay():
+                    raise socket.timeout("timed out")
+                t.check_okay = no_okay
+                return t
+        opened = []
+        dev = Stuck()
+        with self.assertRaises(mod.LinkDead):
+            mod.bounded_shell(dev, "echo ok", 5.0)
+        self.assertEqual((opened, dev.shells), ([5.0], []))
+        fake_adbutils = SimpleNamespace(adb=SimpleNamespace(device=lambda target: dev))
+        with mock.patch.dict(sys.modules, {"adbutils": fake_adbutils}):
+            self.assertFalse(mod.link_alive())
+            self.assertIn("no answer from the phone's adb in 5s (shell)", mod.LINK_WHY[0])
+            # a phone that answers: True
+            ok = _FakeDev()
+            fake_adbutils.adb.device = lambda target: ok
+            self.assertTrue(mod.link_alive())
+            self.assertEqual(ok.shells, ["echo ok"])
+            # a shell that says something else (an unauthorized phone): False
+            odd = _FakeDev()
+            odd.shell = lambda cmd, timeout=None: "error: device unauthorized"
+            fake_adbutils.adb.device = lambda target: odd
+            self.assertFalse(mod.link_alive())
+            self.assertIn("unauthorized", mod.LINK_WHY[0])
+
+    def test_an_act_on_a_dead_link_is_sent_again_only_when_it_never_went_out(self):
+        # the review of Oct 6: an act whose stream couldn't be opened was
+        # reported "failed after sending", though nothing went out
+        mod = _u2mux()
+        self.no_sleep(mod)
+        dm = self._daemon(mod)
+        dm.d = _FakeServer([])
+        dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()
+        dm._batch = mock.Mock(side_effect=mod.LinkDead("no answer from the phone's adb in 6s (stream open)"))
+        with self.assertRaises(mod.ActNotSent) as cm:
+            dm._act_batch({"key": 4, "idle": 1200})
+        self.assertTrue(str(cm.exception).startswith("act not sent: the UI server couldn't be reached"))
+        dm._batch = mock.Mock(side_effect=mod.LinkDead("the link died with the request out", sent=True))
+        with self.assertRaises(RuntimeError) as cm:
+            dm._act_batch({"key": 4, "idle": 1200})
+        self.assertTrue(str(cm.exception).startswith("act failed after sending"))
+        # in the command loop: not sent and the phone gone, so the link is
+        # remade and the act sent once more; sent, never again
+        relinks = []
+        dm._relink = lambda why: relinks.append(why)
+        answers = iter([mod.ActNotSent("act not sent: the UI server couldn't be reached "
+                                       "(LinkDead: no answer from the phone's adb in 6s (stream open))"), b"ok"])
+
+        def act(arg):
+            a = next(answers)
+            if isinstance(a, Exception):
+                raise a
+            return a
+        dm.cmd_act = act
+        self.assertEqual(dm.handle("act {}"), b"ok")
+        self.assertEqual(len(relinks), 1)
+        answers = iter([RuntimeError("act failed after sending: the link died with the request out")])
+        with self.assertRaises(RuntimeError):
+            dm.handle("act {}")
+        self.assertEqual(len(relinks), 1)
+        # not sent for another reason (the words aren't on the screen): no relink
+        answers = iter([mod.ActNotSent("act not sent: the read before it failed (RuntimeError: no read)")])
+        with self.assertRaises(mod.ActNotSent):
+            dm.handle("act {}")
+        self.assertEqual(len(relinks), 1)
+
+    def test_a_relink_that_failed_is_not_tried_again_at_once(self):
+        mod = _u2mux()
+        self.no_sleep(mod)
+        dm = self._daemon(mod)
+        tries = []
+        mod.reconnect_device = lambda: tries.append(1) or False
+        mod._KEEPALIVE = SimpleNamespace(close=lambda: None)
+        with self.assertRaises(RuntimeError) as cm:
+            dm._relink("AdbError: device not found")
+        self.assertIn("did not come back", str(cm.exception))
+        with self.assertRaises(RuntimeError) as cm:
+            dm._relink("AdbError: device not found")
+        self.assertIn("a reconnect 0s ago failed", str(cm.exception))
+        self.assertEqual(tries, [1])
+        # later, tried again
+        dm._relink_failed_at -= mod.RELINK_RETRY_S + 1
+        mod.reconnect_device = lambda: tries.append(1) or True
+        dm._relink("AdbError: device not found")
+        self.assertEqual((tries, dm._relink_failed_at), ([1, 1], None))
+
+    def test_a_set_text_that_answers_false_is_not_typed(self):
+        # the phone's setText answers false when the field didn't take the
+        # text: it was reported "typed"
+        mod = _u2mux()
+        self.no_sleep(mod)
+        dm = self._daemon(mod)
+        dm.d = _FakeServer([])
+        dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()
+
+        def batch(calls, timeout=45.0):
+            return [False if m == "setText" else True for m, _ in calls[:-1]] + [SAMPLE_XML]
+        dm._batch = batch
+        with self.assertRaises(RuntimeError) as cm:
+            dm._act_batch({"set_text": "hunter2", "idle": 1200})
+        self.assertIn("no editable field took the text", str(cm.exception))
 
     def test_the_helper_relinks_the_phone_whatever_the_restart_cooldown(self):
         # Oct 6, 12:28: three seconds after `burner update` restarted the
@@ -8076,10 +8255,53 @@ class AirbnbRoundTests(OfflineTestCase):
             self.assertEqual(calls, [False])  # adb only: the helper heals itself on its next command
             # the helper still refusing after ensure: the reason, at once
             dumps = iter([None, None])
-            with self.assertRaises(RuntimeError) as cm:
+            with self.assertRaises(pc.PhoneUnreachable) as cm:
                 pc.ui_dump()
             self.assertIn("gone from adb", str(cm.exception))
         self.assertFalse(pc.helper_lost_phone())
+
+    def test_an_unreachable_phone_is_one_line_not_a_traceback(self):
+        # the review of Oct 6: ui_dump's "the phone is unreachable" printed
+        # as a traceback, which reads as a crash in burner
+        def unreachable(args):
+            raise pc.PhoneUnreachable("the phone is unreachable: the phone is gone from adb (AdbError: "
+                                      "device '127.0.0.1:15555' not found) and did not come back")
+        with mock.patch.object(pc, "cmd_state", unreachable), mock.patch.object(sys, "argv", ["burner", "state"]), \
+                self.cap() as (out, err), self.assertRaises(SystemExit) as cm:
+            pc.main()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("burner: the phone is unreachable: the phone is gone from adb", err.getvalue())
+        self.assertIn("Run `burner ensure`", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        # the helper's word that its link answers nothing is a lost phone too
+        with mock.patch.object(pc, "_u2_status", "err no answer from the phone's adb: the link died with the request out"):
+            self.assertTrue(pc.helper_lost_phone())
+        with mock.patch.object(pc, "_u2_status", "err act not sent: not on the last read"):
+            self.assertFalse(pc.helper_lost_phone())
+
+    def test_type_with_a_field_that_took_no_text_types_another_way(self):
+        # the phone's setText answering false is "no editable field took the
+        # text": the field is tapped by its label and typed the other ways
+        self.allow("u2_invalidate")
+        self.allow("nav_record")
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            spec = json.loads(arg) if cmd == "act" else {}
+            calls.append((cmd, spec))
+            if cmd == "act" and spec.get("field"):
+                pc._u2_status = ("err act failed after sending: no editable field took the text "
+                                 "(the phone's setText said no)")
+                return None
+            return SAMPLE_XML
+        self.allow("u2sock", side_effect=u2)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_type(self.parse(["type", "--field", "Password", "hunter2"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual([(c, s.get("set_text"), s.get("field"), s.get("tap_label")) for c, s in calls][:3],
+                         [("act", "hunter2", "Password", None), ("act", None, None, "Password"),
+                          ("act", "hunter2", None, None)])
+        self.assertIn("typed 7 chars", out.getvalue())
 
     def test_a_failed_tap_s_evidence_takes_no_screenshot(self):
         # Oct 6: a failed `tap Storage` took 3.3s, 1.45s of it a screenshot

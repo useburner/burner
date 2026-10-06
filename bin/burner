@@ -919,10 +919,17 @@ def fast_dump(fresh=False):
 
 # ---------------------------------------------------------------- UI tree
 
+class PhoneUnreachable(RuntimeError):
+    """The phone can't be read: the UI helper lost it and `ensure` didn't
+    bring it back. main() prints it as one line."""
+
+
 def helper_lost_phone():
     """True when the UI helper's last answer says the phone is gone from
-    adb and its own reconnect failed (see u2mux.reconnect_device)."""
-    return _u2_status.startswith("err ") and "gone from adb" in _u2_status
+    adb (its own reconnect failed, see u2mux.reconnect_device) or that its
+    link answers nothing."""
+    return _u2_status.startswith("err ") and (
+        "gone from adb" in _u2_status or "no answer from the phone's adb" in _u2_status)
 
 
 def ui_dump(retries=4, fresh=False):
@@ -943,8 +950,9 @@ def ui_dump(retries=4, fresh=False):
             if root is not None:
                 return root
         why = (_u2_status[len("err "):] if _u2_status.startswith("err ")
-               else "the UI helper can't reach it")
-        raise RuntimeError("the phone is unreachable: " + why[:200])
+               else "the UI helper's read after `ensure` came back {}".format(
+                   "empty or unreadable" if _u2_status == "ok" else _u2_status or "with nothing"))
+        raise PhoneUnreachable("the phone is unreachable: " + why[:200])
     wake()  # screen timeout is 10s; dumps come back empty when asleep
     time.sleep(1)
     last = ""
@@ -3173,7 +3181,7 @@ def cmd_type(args):
         if status == "ok":
             print("typed {} chars into {}".format(len(args.text), args.field))
             return print_act(status, root, note, "typing")
-        if status == "lost" or status.startswith("failed"):
+        if status == "lost" or (status.startswith("failed") and "no editable field" not in status):
             # the helper had it: its word on what happened, no claim of typing
             return print_act(status, root, note, "typing")
     if args.field:
@@ -6931,6 +6939,9 @@ def main():
         print("burner: the phone didn't answer in time. Check that it's on "
               "the charger with the screen awake and that Tailscale is "
               "connected, then run `burner doctor`.", file=sys.stderr)
+    except PhoneUnreachable as e:
+        print("burner: {}. Run `burner ensure`, and check that the phone is on "
+              "and Tailscale is connected.".format(e), file=sys.stderr)
     except RuntimeError as e:
         if "kept coming back empty" not in str(e):
             raise

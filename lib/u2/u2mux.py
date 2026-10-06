@@ -46,11 +46,6 @@ VENV_PY = next((p for p in (
 SOCK_PATH = os.path.join(ROOT, "run", "u2-mux.sock")
 PID_PATH = os.path.join(ROOT, "run", "u2-mux.pid")
 TARGET = "127.0.0.1:15555"
-# The CLI's adb (install.sh puts platform-tools there): adb's server is
-# restarted with it, so the server stays the CLI's version.
-ADB_BIN = os.path.join(WORKSPACE, ".android-tools", "platform-tools", "adb")
-if not os.path.exists(ADB_BIN):
-    ADB_BIN = "adb"
 
 
 LOG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
@@ -213,7 +208,18 @@ class LinkDead(Exception):
     """adb didn't answer a stream open: the link to the phone is dead,
     whatever adb's table says. Not an HTTPError: uiautomator2 takes one
     of those as "the server isn't up" and launches a server, over shells
-    with no bound, on a link that answers nothing."""
+    with no bound, on a link that answers nothing. `sent`: a request had
+    gone out on the link before it was found dead (it may have acted)."""
+
+    def __init__(self, msg, sent=False):
+        super().__init__(msg)
+        self.sent = sent
+
+
+class ActNotSent(RuntimeError):
+    """"act not sent: ...": the action never went out because the phone's
+    server couldn't be reached or the read before it failed. Safe to send
+    again once the link is back (see U2Daemon.handle)."""
 
 
 def open_stream(dev, port, timeout=STREAM_OPEN_S):
@@ -238,6 +244,26 @@ def open_stream(dev, port, timeout=STREAM_OPEN_S):
     conn.sock = t.conn
     conn.via_adb = True  # its link is checked while an answer is awaited (see _wait_answer)
     return conn
+
+
+def bounded_shell(dev, cmd, timeout):
+    """The output of `cmd` in the phone's shell, the whole of it within
+    `timeout`. adbutils bounds only the reading of a shell's output: the
+    stream's open waits for the phone with its own 600s, and a link that
+    passes nothing never answers it (see open_stream). Raises LinkDead
+    when the phone doesn't answer in time."""
+    c = dev.open_transport(timeout=timeout)
+    try:
+        c.send_command("shell:" + cmd)
+        c.check_okay()
+        out = c.read_until_close()
+    except Exception as e:
+        if isinstance(e, (socket.timeout, TimeoutError)) or type(e).__name__ == "AdbTimeout":
+            raise LinkDead("no answer from the phone's adb in %.0fs (shell)" % timeout)
+        raise
+    finally:
+        c.close()
+    return out.rstrip() if isinstance(out, str) else out
 
 
 DIRECT_RETRY_S = 60.0  # a direct route that failed twice is tried again after this
@@ -403,31 +429,40 @@ class KeepAliveHTTP:
         through) kept a read waiting its whole 25s before the link was
         looked at (Oct 6, a stopped tunnel leg: 34s for one `state`). The
         check opens a second stream to the server, PROBE_STREAM_S at
-        most. Raises LinkDead (the stream closed) when the link doesn't
-        answer; returns when the answer starts, when the timeout passes
-        (the read then raises its own timeout) or when the wait can't be
-        watched."""
+        most. Raises LinkDead (sent: the request went out) when the link
+        doesn't answer, and the read's own timeout when no answer came in
+        `timeout` (the read after it would have waited a second `timeout`:
+        a hung server's 25s read took 50s); returns when the answer
+        starts, or at once when the socket can't be watched (the read
+        then keeps its own timeout). A link check that fails another way
+        is logged, and the wait goes on without checks."""
         deadline = _time.monotonic() + timeout
-        wait = self.ANSWER_PROBE_S
+        wait, checking = self.ANSWER_PROBE_S, True
         while True:
             left = deadline - _time.monotonic()
             if left <= 0:
-                return
+                raise socket.timeout("no answer in %.0fs" % timeout)
             try:
-                ready, _, _ = select.select([conn.sock], [], [], min(wait, left))
-            except (OSError, ValueError, TypeError):
-                return  # no socket to watch: the read decides
-            if ready or deadline - _time.monotonic() <= 0:
+                ready, _, _ = select.select([conn.sock], [], [], min(wait, left) if checking else left)
+            except (OSError, ValueError, TypeError) as e:
+                if not isinstance(e, TypeError):
+                    log("the answer can't be watched (%s); the read waits for it" % err_text(e, 80))
                 return
+            if ready:
+                return
+            if not checking or deadline - _time.monotonic() <= 0:
+                continue
             try:
                 open_stream(dev, port, timeout=PROBE_STREAM_S).close()
             except LinkDead:
                 log("no answer in %.0fs and the link answers nothing: it is dead"
                     % (timeout - (deadline - _time.monotonic())))
                 conn.close()
-                raise
-            except Exception:
-                return  # adb answered (the phone gone, say): the read decides
+                raise LinkDead("no answer from the phone's adb: the link died with the request out",
+                               sent=True)
+            except Exception as e:
+                log("the link check failed (%s); waiting for the answer without it" % err_text(e, 80))
+                checking = False
             wait = self.ANSWER_REPROBE_S
 
     def request(self, dev, port, method, path, data=None, timeout=10.0,
@@ -459,7 +494,8 @@ class KeepAliveHTTP:
                         ent[0].close()
                     try:
                         fresh = self._open(dev, port)
-                    except LinkDead:
+                    except LinkDead as e:
+                        e.sent = e.sent or sent  # the request went out once: it may have acted
                         raise  # the link is dead: not "no stream" (see LinkDead)
                     except Exception as e:
                         if sent:
@@ -657,13 +693,13 @@ def kill_server_on_phone(dev):
     user, so adb's shell may) and check they are gone. Returns the PIDs
     found. uiautomator2 can't do this: it only stops a server it launched
     itself, and never relaunches one that still answers /ping."""
-    pids = server_pids(dev.shell(PS_SERVER, timeout=SHELL_TIMEOUT))
+    pids = server_pids(bounded_shell(dev, PS_SERVER, SHELL_TIMEOUT))
     if not pids:
         log("no UI server process on the phone")
         return pids
-    dev.shell("kill -9 " + " ".join(pids), timeout=SHELL_TIMEOUT)
+    bounded_shell(dev, "kill -9 " + " ".join(pids), SHELL_TIMEOUT)
     _time.sleep(0.6)  # the accessibility connection takes a moment to free
-    left = server_pids(dev.shell(PS_SERVER, timeout=SHELL_TIMEOUT))
+    left = server_pids(bounded_shell(dev, PS_SERVER, SHELL_TIMEOUT))
     if left:
         raise RuntimeError("could not kill the UI server on the phone (pid %s)" % " ".join(left))
     log("killed the server on the phone (pid %s)" % " ".join(pids))
@@ -713,33 +749,44 @@ ADB_CONNECT_S = 10.0  # `adb connect` through the tunnel: a CONNECT via the prox
 ONLINE_WAIT_S = 5.0   # after a connect, for adb to call the phone a device (1-2s through the proxy)
 
 
+LINK_WHY = [""]  # why the phone last didn't answer over adb, for the messages
+
+
 def link_alive():
     """Whether the phone answers over adb: one shell, LINK_PROBE_S at
-    most. adb's table still says "device" for a link through the tunnel
-    that died silently while idle (Oct 6), and anything sent on it waits
-    for an answer that never comes; uiautomator2's connect sends shells
-    with no bound, so the phone is asked this way first. False too when
-    adb has lost the phone (not found, offline)."""
+    most in all (see bounded_shell). adb's table still says "device" for
+    a link through the tunnel that died silently while idle (Oct 6), and
+    anything sent on it waits for an answer that never comes;
+    uiautomator2's connect sends shells with no bound, so the phone is
+    asked this way first. False too when adb has lost the phone (not
+    found, offline, unauthorized); LINK_WHY[0] then says which."""
     import adbutils
     try:
-        adbutils.adb.device(TARGET).shell("echo ok", timeout=LINK_PROBE_S)
+        out = bounded_shell(adbutils.adb.device(TARGET), "echo ok", LINK_PROBE_S)
     except Exception as e:
-        log("the phone doesn't answer over adb (%s)" % err_text(e, 100))
+        LINK_WHY[0] = err_text(e, 100)
+        log("the phone doesn't answer over adb (%s)" % LINK_WHY[0])
+        return False
+    if "ok" not in (out or ""):
+        LINK_WHY[0] = "its shell said %r" % (out or "")[:40]
+        log("the phone doesn't answer over adb (%s)" % LINK_WHY[0])
         return False
     return True
 
 
 def reconnect_device():
-    """The phone back on adb, as `burner ensure` does it (what put it
-    back on Oct 6, in 12.8s, after the helper's own tries had run three
+    """The phone back on adb, the first steps of `burner ensure` (what put
+    it back on Oct 6, after the helper's own tries had run three
     commands into the 60s watchdog): the tunnel started (nothing when it
-    runs), the phone disconnected and connected again (adb keeps a dead
-    link as a device, and says "already connected" to a connect), and,
-    when it still doesn't answer, adb's server restarted and the connect
-    made once more. True when the phone answers a shell. uiautomator2
-    reconnects a lost phone on its own too, but with a second for each
-    connect, which a handshake through the proxy often outlasts: 8-10s
-    of tries, or "not online" (Oct 6)."""
+    runs), and the phone disconnected and connected again (adb keeps a
+    dead link as a device, and says "already connected" to a connect).
+    True when the phone answers a shell. adb's server isn't restarted
+    here: the CLI's `ensure` does that, with its checks of the phone's
+    port, when the helper says the phone is gone (the scrcpy helper's
+    streams use that server too). uiautomator2 reconnects a lost phone
+    on its own too, but with a second for each connect, which a
+    handshake through the proxy often outlasts: 8-10s of tries, or "not
+    online" (Oct 6)."""
     import adbutils
     tunnel = os.path.join(ROOT, "tunnel.sh")
     if os.path.exists(tunnel):
@@ -748,35 +795,25 @@ def reconnect_device():
                            stderr=subprocess.DEVNULL, timeout=20)
         except Exception as e:
             log("the tunnel couldn't be started (%s)" % err_text(e, 80))
-    for step in ("connect", "restart"):
-        if step == "restart":
-            log("the phone still doesn't answer; restarting adb's server")
-            try:
-                adbutils.adb.server_kill()
-                _time.sleep(1.0)  # the old server lets go of its port
-                subprocess.run([ADB_BIN, "start-server"], stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, timeout=20)
-            except Exception as e:
-                log("adb's server couldn't be restarted (%s)" % err_text(e, 100))
-                return False
-        try:
-            adbutils.adb.disconnect(TARGET)
-        except Exception:
-            pass
-        try:
-            out = " ".join(str(adbutils.adb.connect(TARGET, timeout=ADB_CONNECT_S)).split())
-        except Exception as e:
-            out = "failed (%s)" % err_text(e, 100)
-        log("adb connect %s: %s" % (TARGET, out[:80]))
-        if "connected" not in out:
-            continue
-        try:
-            adbutils.adb.wait_for(TARGET, state="device", timeout=ONLINE_WAIT_S)
-        except Exception:
-            pass  # the shell below says whether it answers
-        if link_alive():
-            log("the phone is back on adb")
-            return True
+    try:
+        adbutils.adb.disconnect(TARGET)
+    except Exception:
+        pass
+    try:
+        out = " ".join(str(adbutils.adb.connect(TARGET, timeout=ADB_CONNECT_S)).split())
+    except Exception as e:
+        out = "failed (%s)" % err_text(e, 100)
+    log("adb connect %s: %s" % (TARGET, out[:80]))
+    if "connected" not in out:
+        LINK_WHY[0] = "adb connect: " + out[:80]
+        return False
+    try:
+        adbutils.adb.wait_for(TARGET, state="device", timeout=ONLINE_WAIT_S)
+    except Exception:
+        pass  # the shell below says whether it answers
+    if link_alive():
+        log("the phone is back on adb")
+        return True
     return False
 
 
@@ -802,8 +839,8 @@ def ensure_server(force=False):
         # the link first, with a bound: uiautomator2's connect runs shells
         # with no bound, and a link that died silently (Oct 6) answers none
         if not link_alive() and not reconnect_device():
-            raise RuntimeError("the phone is gone from adb and did not come back "
-                               "on a reconnect (adb connect %s)" % TARGET)
+            raise RuntimeError("the phone is gone from adb (%s) and did not come back "
+                               "on a reconnect (adb connect %s)" % (LINK_WHY[0], TARGET))
         try:
             d = u2.connect(TARGET)  # starts a dead server (and pushes a new jar)
             apply_fast_config(d)
@@ -853,7 +890,7 @@ def screen_awake(dev):
     """Whether the phone's screen is on, asked over adb (there may be no
     server to ask): True, False, or None when adb can't say."""
     try:
-        out = dev.shell("dumpsys power | grep -m1 mWakefulness=", timeout=SHELL_TIMEOUT)
+        out = bounded_shell(dev, "dumpsys power | grep -m1 mWakefulness=", SHELL_TIMEOUT)
     except Exception as e:
         log("couldn't read the screen state (%s)" % err_text(e, 80))
         return None
@@ -865,7 +902,7 @@ def wake_phone(dev):
     """Turn the screen on over adb before a server starts (no server to
     ask yet). KEYCODE_WAKEUP does nothing to a screen that is on."""
     try:
-        dev.shell("input keyevent 224", timeout=SHELL_TIMEOUT)
+        bounded_shell(dev, "input keyevent 224", SHELL_TIMEOUT)
     except Exception as e:
         log("wake over adb failed (%s)" % err_text(e, 80))
 
@@ -1315,6 +1352,7 @@ def act_calls(spec):
 ACTION_METHODS = ("click", "pressKeyCode", "setText")
 
 
+RELINK_RETRY_S = 20.0  # a reconnect that failed isn't tried again sooner (the CLI's `ensure` then)
 RELOOK_PAUSE_S = 0.4   # an action that left the screen as it was: this long, then
 RELOOK_IDLE_MS = 1200  # a wait for the UI to go quiet, this long at most, and a read
 
@@ -1725,6 +1763,11 @@ class U2Daemon:
                 raise RuntimeError("the phone's screen is off and would not wake")
             return xml, True
         if real_screen(xml):
+            if xml.count("<node") > 2:
+                # the system UI's bars alone with the screen on: a moment
+                # of a transition, or, read after read, a server that sees
+                # no app; the wordless spell decides (see _fix_wordless_read)
+                return self._fix_wordless_read(xml, what, replace), False
             return xml, False  # the system UI's bare window: mid-transition
         if not restart_allowed(_time.monotonic() - self._last_restart):
             if self._restart_error:
@@ -1807,13 +1850,21 @@ class U2Daemon:
         its address, not by adb's link, and its settings live in the
         server (asking for a new handle and setting them again cost
         1-2.5s on Muse's box). Raises when the phone doesn't come back."""
+        failed = getattr(self, "_relink_failed_at", None)
+        if failed is not None and _time.monotonic() - failed < RELINK_RETRY_S:
+            # tried a moment ago and the phone didn't come back: say so at
+            # once, and the CLI recovers it its own way (`ensure`)
+            raise RuntimeError("the phone is gone from adb (%s); a reconnect %.0fs ago failed (%s)"
+                               % (why, _time.monotonic() - failed, LINK_WHY[0]))
         log("the phone is gone from adb (%s); reconnecting it" % why)
         _KEEPALIVE.close()
         with _t("adb reconnect"):
             back = reconnect_device()
         if not back:
+            self._relink_failed_at = _time.monotonic()
             raise RuntimeError("the phone is gone from adb (%s) and did not come back "
-                               "on a reconnect (adb connect %s)" % (why, TARGET))
+                               "on a reconnect (adb connect %s: %s)" % (why, TARGET, LINK_WHY[0]))
+        self._relink_failed_at = None
         self.invalidate()
 
     def _reconnect(self):
@@ -2374,8 +2425,8 @@ class U2Daemon:
                 with _t("tap read"):
                     xml = self._dump(fresh=True)
             except Exception as e:
-                raise RuntimeError("act not sent: the read before it failed (%s)"
-                                   % err_text(e, 100))
+                raise ActNotSent("act not sent: the read before it failed (%s)"
+                                 % err_text(e, 100))
             try:
                 node, alt = label_node(xml, label)
             except RuntimeError as e:
@@ -2436,18 +2487,21 @@ class U2Daemon:
         before = field_node(self._last_xml, label) if young else None
         if before is None:
             raise RuntimeError(self.NO_FIELD_TAP)
-        if before["focused"]:
+        if before["focused"] and before.get("rid"):
+            # its resource id pins it: a field that lost the focus since is
+            # not found by the phone, and nothing is typed
             return self._type_at_once(spec, before)
         try:
             with _t("field read"):
                 xml = self._dump(fresh=True)
         except Exception as e:
-            raise RuntimeError("act not sent: the read before it failed (%s)" % err_text(e, 100))
+            raise ActNotSent("act not sent: the read before it failed (%s)" % err_text(e, 100))
         now = field_node(xml, label)
         if now is not None and now["focused"]:
             return self._type_at_once(spec, now)
         if now is not None and now["center"] == before["center"]:
             spec["tap_first"] = list(now["center"])
+            spec["field_selector"] = focused_field_selector(now.get("rid", ""))
             return self._act_batch(spec)
         raise RuntimeError(self.NO_FIELD_TAP)
 
@@ -2498,7 +2552,11 @@ class U2Daemon:
                 except StreamUnavailable as e:
                     # no stream to the server could be opened: nothing went
                     # out, and the caller acts its own way
-                    raise RuntimeError("act not sent: the UI server couldn't be reached (%s)" % e)
+                    raise ActNotSent("act not sent: the UI server couldn't be reached (%s)" % e)
+                except LinkDead as e:
+                    if not e.sent:
+                        raise ActNotSent("act not sent: the UI server couldn't be reached (%s)" % e)
+                    raise RuntimeError("act failed after sending: %s" % str(e)[:120])
                 except Exception as e:
                     raise RuntimeError("act failed after sending: %s" % str(e)[:120])
             if acted and isinstance(results[acted[0]], Exception):
@@ -2510,9 +2568,19 @@ class U2Daemon:
                 raise RuntimeError("act failed after sending: %s" % err)
             later = [results[i] for i in acted[1:] if isinstance(results[i], Exception)]
             if later:
-                # a field tapped, then its typing failed (no field took the focus)
-                raise RuntimeError("act failed after sending: the field was tapped; the typing failed (%s)"
-                                   % err_text(later[0], 120))
+                # a field tapped, then its typing failed: when no field had
+                # the focus, the CLI types its other ways (it taps the field
+                # by its label first; a second tap on a field is harmless)
+                err = later[0]
+                gone = "UiObjectNotFound" in str(err) or "-32002" in str(err)
+                raise RuntimeError("act failed after sending: the field was tapped; %s (%s)"
+                                   % ("no editable field had the focus" if gone else "the typing failed",
+                                      err_text(err, 120)))
+            if any(calls[i][0] == "setText" and results[i] is False for i in acted):
+                # the phone's setText answers false when the field didn't take
+                # the text: nothing was typed, and the CLI types another way
+                raise RuntimeError("act failed after sending: no editable field took the text "
+                                   "(the phone's setText said no)")
             if "tap_selector" in spec and acted:
                 n = results[acted[0] - 1]
                 if isinstance(n, int) and n > 1:
@@ -2571,21 +2639,29 @@ class U2Daemon:
         one more, a moment later, in one trip. A tap that opens another
         app's window draws nothing for most of a second, so the wait for
         the UI to go quiet ended at once and the read showed the screen
-        from before the tap (Settings' search bar, Oct 6). The new read
-        when it has words, else the one in hand."""
+        from before the tap (Settings' search bar, Oct 6). The new read,
+        or, when it has no words, that read too (the screen is moving to
+        something not readable yet; the CLI reads a thin screen again),
+        rather than the read from before the action. The one in hand when
+        the read again fails, which is logged."""
         _time.sleep(RELOOK_PAUSE_S)
         try:
             with _t("act relook"):
                 res = self._batch([("waitForIdle", [RELOOK_IDLE_MS]),
                                    ("dumpWindowHierarchy", [False, DUMP_DEPTH])],
-                                  timeout=RELOOK_IDLE_MS / 1000.0 + 20)
+                                  timeout=RELOOK_IDLE_MS / 1000.0 + 4)
         except Exception as e:
             log("the screen looked unchanged or half drawn after the action; the read again failed (%s)"
                 % err_text(e, 80))
             return xml
         again = res[-1]
-        if not isinstance(again, str) or not has_words(again):
+        if not isinstance(again, str):
+            log("the screen looked unchanged or half drawn after the action; the read again failed (%s)"
+                % err_text(again, 80))
             return xml
+        if not has_words(again):
+            log("the screen looked unchanged or half drawn after the action; read again: nothing readable yet")
+            return again
         log("the screen looked unchanged or half drawn after the action; read again: %s"
             % ("changed" if screen_sig(again) != screen_sig(xml) else "still the same"))
         return again
@@ -2608,6 +2684,13 @@ class U2Daemon:
             return b"__NOT_FOUND__"
         except Exception as e:
             if cmd in NO_RETRY:
+                if isinstance(e, ActNotSent) and device_gone(str(e)):
+                    # nothing went out, and the phone is gone from adb: the
+                    # link remade, the action once more (it can't happen twice)
+                    log("%s %s: %s" % (cmd, arg[:80], err_text(e, 160)))
+                    with self._lock:
+                        self._relink(err_text(e, 100))
+                    return fn(arg)
                 # The phone may already have acted (the reply was lost, not
                 # the request). Replaying would tap or type twice.
                 log("%s %s: %s" % (cmd, arg[:80], err_text(e, 160)))
