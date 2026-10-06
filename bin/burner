@@ -954,11 +954,18 @@ def walk(root):
     return out
 
 
+def _takes_taps(attrs):
+    """A node that takes a tap: clickable, or selected (a tab of a
+    navigation bar reads as selected and not clickable: the Clock app's
+    "Alarms" tab beside the title "Alarms", Oct 5)."""
+    return attrs.get("clickable") == "true" or attrs.get("selected") == "true"
+
+
 def tappable_row(node):
-    """True for a row that takes a tap: clickable itself, or inside a
-    clickable row (a button's words). Pure."""
-    return bool(node.get("clickable")) or any(
-        p.attrib.get("clickable") == "true" for p in node.get("parents", ()))
+    """True for a row that takes a tap: clickable or selected itself, or
+    inside such a row (a button's words, a tab's label). Pure."""
+    return (bool(node.get("clickable")) or str(node.get("selected")).lower() == "true"
+            or any(_takes_taps(p.attrib) for p in node.get("parents", ())))
 
 
 def clickable_target(node):

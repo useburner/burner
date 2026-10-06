@@ -895,13 +895,15 @@ def takes_tap(n, target, size):
 
 
 def can_tap(nodes, n):
-    """True for a row that takes a tap: clickable itself, or inside a
-    clickable row (see iter_nodes: parent). Pure."""
-    if n["clickable"]:
+    """True for a row that takes a tap: clickable or selected itself (a
+    tab of a navigation bar reads as selected and not clickable: the
+    Clock app's "Alarms" tab beside the title "Alarms", Oct 5), or
+    inside such a row (see iter_nodes: parent). Pure."""
+    if n["clickable"] or n.get("selected"):
         return True
     p = n.get("parent")
     while p is not None:
-        if nodes[p]["clickable"]:
+        if nodes[p]["clickable"] or nodes[p].get("selected"):
             return True
         p = nodes[p].get("parent")
     return False
@@ -2214,7 +2216,8 @@ def iter_nodes(xml):
                        "bounds": n.get("bounds"), "center": [(x1 + x2) // 2, (y1 + y2) // 2],
                        "rect": (x1, y1, x2, y2),
                        "enabled": n.get("enabled") != "false",
-                       "clickable": n.get("clickable") == "true", "web": web,
+                       "clickable": n.get("clickable") == "true",
+                       "selected": n.get("selected") == "true", "web": web,
                        "field": "edittext" in cls, "cls": cls, "parent": parent}
                 parent = count[0]
                 count[0] += 1

@@ -7584,3 +7584,29 @@ class AirbnbRoundTests(OfflineTestCase):
         clock = iter([0.0, 0.0, 10.0])
         with mock.patch.object(pc.os.path, "exists", return_value=True), mock.patch.object(pc.time, "sleep"),                 mock.patch.object(pc.time, "time", side_effect=lambda: next(clock, 10.0)):
             self.assertFalse(pc.wait_for_helper(5))
+
+    def test_a_selected_tab_takes_the_tap_beside_a_title_with_the_same_words(self):
+        # the Clock app, Oct 5: the title "Alarms" and the navigation bar's
+        # "Alarms" tab, none of them clickable (the tab reads as selected):
+        # the helper refused the tap as two rows, the plan too
+        clock = """<hierarchy rotation="0">
+  <node text="" class="android.widget.FrameLayout" package="com.google.android.deskclock" bounds="[0,0][1080,2400]" clickable="false" enabled="true">
+    <node text="Alarms" class="android.widget.TextView" package="com.google.android.deskclock" bounds="[63,177][245,262]" clickable="false" enabled="true"/>
+    <node text="" content-desc="Alarms" class="android.widget.FrameLayout" package="com.google.android.deskclock" bounds="[0,2169][216,2337]" clickable="false" enabled="true" selected="true">
+      <node text="Alarms" class="android.widget.TextView" package="com.google.android.deskclock" bounds="[48,2280][166,2320]" clickable="false" enabled="true" selected="true"/>
+    </node>
+    <node text="" content-desc="World Clock" class="android.widget.FrameLayout" package="com.google.android.deskclock" bounds="[216,2169][432,2337]" clickable="false" enabled="true" selected="false"/>
+  </node>
+</hierarchy>"""
+        root = ET.fromstring(clock)
+        pc._update_screen_from_dump(root)
+        plan = pc.plan_tap(pc.walk(root), 1080, 2400, text="Alarms")
+        self.assertEqual((plan["action"], plan["xy"]), ("tap", (108, 2253)))
+        mod = _u2mux()
+        row, alt = mod.label_node(clock, "Alarms")
+        self.assertEqual(row["bounds"], "[0,2169][216,2337]")
+        # two tabs alike, neither selected: still two rows
+        two = clock.replace('selected="true"', 'selected="false"').replace('content-desc="World Clock"', 'content-desc="Alarms"')
+        self.assertEqual(pc.plan_tap(pc.walk(ET.fromstring(two)), 1080, 2400, text="Alarms")["action"], "ambiguous")
+        with self.assertRaises(RuntimeError):
+            mod.label_node(two, "Alarms")
