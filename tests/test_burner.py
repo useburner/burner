@@ -5000,6 +5000,17 @@ class WebPathTests(OfflineTestCase):
         # a key too; still the same after: kept as it is
         self.assertEqual(run({"key": 4, "idle": 1200}, SAMPLE_XML, again=SAMPLE_XML), SAMPLE_XML)
         self.assertEqual(len(batches), 2)
+        # a row or two where the read before had a dozen: taken mid-transition,
+        # read again (Settings' "About phone" read as its search bar alone, Oct 6)
+        dozen = SAMPLE_XML.replace("</hierarchy>", "".join(
+            '<node text="Row %d" package="com.example" class="android.widget.TextView" bounds="[0,%d][1080,%d]"/>'
+            % (i, 800 + i * 100, 880 + i * 100) for i in range(12)) + "</hierarchy>")
+        thin = SAMPLE_XML.replace('text="Hello"', 'text=""').replace('text="OK"', 'text=""')
+        self.assertTrue(mod.half_drawn_after(thin, dozen))
+        self.assertFalse(mod.half_drawn_after(thin, SAMPLE_XML))  # few rows before: a small screen
+        self.assertFalse(mod.half_drawn_after(dozen, dozen))
+        self.assertEqual(run({"tap": [250, 450], "idle": 1200}, thin, before=dozen), results)
+        self.assertEqual(len(batches), 2)
         # the screen changed: one trip; typing, a chained step, Chrome, no read before: one trip
         for spec, after, before in (({"tap": [250, 450]}, results, SAMPLE_XML),
                                     ({"set_text": "x"}, SAMPLE_XML, SAMPLE_XML),

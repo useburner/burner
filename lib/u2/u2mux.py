@@ -1331,6 +1331,22 @@ def screen_sig(xml):
         return None
 
 
+def worded_rows(xml):
+    """How many rows of a read carry words (text or a description), the
+    system UI's aside. Pure."""
+    try:
+        return sum(1 for n in iter_nodes(xml) if n["pkg"] != SYSTEM_UI and (n["text"] or n["desc"]))
+    except Exception:
+        return 0
+
+
+def half_drawn_after(xml, before):
+    """Whether the read after an action looks taken mid-transition: a row
+    or two with words where the read before had a dozen (Settings' "About
+    phone" read as its search bar alone after the tap, Oct 6). Pure."""
+    return worded_rows(xml) <= 2 and worded_rows(before) >= 12
+
+
 def chrome_in(xml):
     """Whether a read shows Chrome (a page there is read by the page
     itself after an action). Pure."""
@@ -2495,7 +2511,8 @@ class U2Daemon:
                     raise RuntimeError("act failed after sending: the screen was off, so "
                                        "it was probably dropped; the screen is on now")
             if (before and acted and "set_text" not in spec and not sleeps_the_screen(spec)
-                    and not chrome_in(xml) and screen_sig(xml) == screen_sig(before)):
+                    and not chrome_in(xml)
+                    and (screen_sig(xml) == screen_sig(before) or half_drawn_after(xml, before))):
                 xml = self._relook(xml)
             # The action landed in Chrome: the page itself says what it
             # shows now (the screen reader's tree may lag it). The read is
@@ -2511,11 +2528,12 @@ class U2Daemon:
 
     def _relook(self, xml):
         """The read after an action that shows the screen exactly as it
-        was before: one more, a moment later, in one trip. A tap that
-        opens another app's window draws nothing for most of a second,
-        so the wait for the UI to go quiet ended at once and the read
-        showed the screen from before the tap (Settings' search bar,
-        Oct 6). The new read when it has words, else the one in hand."""
+        was before, or a row or two of a dozen (see half_drawn_after):
+        one more, a moment later, in one trip. A tap that opens another
+        app's window draws nothing for most of a second, so the wait for
+        the UI to go quiet ended at once and the read showed the screen
+        from before the tap (Settings' search bar, Oct 6). The new read
+        when it has words, else the one in hand."""
         _time.sleep(RELOOK_PAUSE_S)
         try:
             with _t("act relook"):
@@ -2523,12 +2541,13 @@ class U2Daemon:
                                    ("dumpWindowHierarchy", [False, DUMP_DEPTH])],
                                   timeout=RELOOK_IDLE_MS / 1000.0 + 20)
         except Exception as e:
-            log("the screen looked unchanged after the action; the read again failed (%s)" % err_text(e, 80))
+            log("the screen looked unchanged or half drawn after the action; the read again failed (%s)"
+                % err_text(e, 80))
             return xml
         again = res[-1]
         if not isinstance(again, str) or not has_words(again):
             return xml
-        log("the screen looked unchanged after the action; read again: %s"
+        log("the screen looked unchanged or half drawn after the action; read again: %s"
             % ("changed" if screen_sig(again) != screen_sig(xml) else "still the same"))
         return again
 
