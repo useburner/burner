@@ -517,7 +517,11 @@ def _answer(p):
     if isinstance(p, Page):
         return "hidden"
     if isinstance(p, ConnectionError):
-        return "refused"
+        # with the refusal's words (Chrome's handshake status, a closed
+        # stream): seven live tabs refused at once after a helper restart
+        # with no word why (Oct 5)
+        why = " ".join(str(p).split())[:70]
+        return "refused (%s)" % why if why else "refused"
     return "no answer" if p is None else "no answer (%s)" % type(p).__name__
 
 

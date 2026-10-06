@@ -7178,7 +7178,7 @@ class AirbnbRoundTests(OfflineTestCase):
             def __init__(self, dev, target, probe_s=None):
                 self.target, self.visible_at = target, (1.0 if target == "D" else 0.0)
                 if target in ("B", "C"):
-                    raise ConnectionError("refused")
+                    raise ConnectionError("")
 
             def close(self):
                 pass
@@ -7282,7 +7282,7 @@ class AirbnbRoundTests(OfflineTestCase):
                 if target == "B":
                     raise TimeoutError("timed out")
                 if target == "C":
-                    raise ConnectionError("refused")
+                    raise ConnectionError("websocket handshake refused: HTTP/1.1 500 Internal Server Error")
 
             def close(self):
                 pass
@@ -7292,7 +7292,9 @@ class AirbnbRoundTests(OfflineTestCase):
             with self.assertRaises(RuntimeError) as cm:
                 cdp.front_page(None)
         self.assertEqual(str(cm.exception), "no visible page among Chrome's 3 tabs probed: "
-                         "airbnb.com/s/woodbury/homes: hidden; x.com: no answer (TimeoutError); (no address): refused")
+                         "airbnb.com/s/woodbury/homes: hidden; x.com: no answer (TimeoutError); "
+                         "(no address): refused (websocket handshake refused: HTTP/1.1 500 Internal Server Error)")
+        self.assertEqual(cdp._answer(ConnectionError("")), "refused")
 
     def test_url_bar_of_reads_chrome_s_address_bar(self):
         mod = _u2mux()
@@ -7424,7 +7426,7 @@ class AirbnbRoundTests(OfflineTestCase):
             def __init__(self, dev, target, probe_s=None):
                 self.target, self.visible_at = target, 0.0
                 if target not in ("A", "F", "G"):
-                    raise ConnectionError("refused")
+                    raise ConnectionError("")
 
             def close(self):
                 pass
