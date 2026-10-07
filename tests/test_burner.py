@@ -4489,6 +4489,18 @@ class HiddenControlTests(OfflineTestCase):
         why = []
         self.assertIsNone(mod.hid_itself(PLAYER_SHOWN_XML, took, node, why))
         self.assertEqual(why, ["'Play video' is at its point now"])  # said in the helper's log
+        # the player's own touch surface, a wordless clickable view over all
+        # of it, takes the touch that brings the controls back (the live
+        # check: "'viewgroup' is at its point now"); a small one is a button
+        def surface(xml, rect):
+            return xml.replace('<node text="What It Takes"', '<node text="" class="android.view.ViewGroup" '
+                               'package="com.google.android.youtube" content-desc="" clickable="true" '
+                               'enabled="true" bounds="%s"/><node text="What It Takes"' % rect)
+        self.assertEqual(mod.hid_itself(PLAYER_SHOWN_XML, surface(PLAYER_HIDDEN_XML, "[0,250][1080,858]"), node),
+                         "Video player")
+        why = []
+        self.assertIsNone(mod.hid_itself(PLAYER_SHOWN_XML, surface(PLAYER_HIDDEN_XML, "[459,474][619,634]"), node, why))
+        self.assertEqual(why, ["'viewgroup' is at its point now"])
         # a progress bar beside the player counts the seconds on its own:
         # the same row (YouTube, Oct 7: the reveal didn't happen for it)
         def bar(xml, at):

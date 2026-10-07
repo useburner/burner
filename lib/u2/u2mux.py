@@ -1441,6 +1441,7 @@ def loose_label_node(nodes, alts):
 
 BOX_AREA_MAX = 0.6  # a box around a hidden control with no words of its own is
                     # smaller than this share of the screen (a page's whole body is no box)
+SURFACE_SHARE = 0.5  # a wordless clickable view in that box this big is its touch surface
 _DIGITS = re.compile(r"\d+")
 
 
@@ -1457,8 +1458,10 @@ def hid_itself(before, now, node, why=None):
       box: inside it, or within its rectangle (the captions over a video
       change as it plays, beside the player's own rows);
     - nothing that takes a tap is at the control's point on `now` but the
-      box or what holds it (a button that took the control's place, "Play
-      video", would take the touch).
+      box, what holds it, or its touch surface (wordless, in the box, and
+      SURFACE_SHARE of it at least: YouTube's player has one, the live
+      check); a button that took the control's place ("Play video") would
+      take the touch.
     Then a touch where the control was brings it back. Returns the box's
     words (its class when it has none), or None, with the reason added to
     the list `why` when one is given (the helper logs it). Pure."""
@@ -1530,9 +1533,12 @@ def hid_itself(before, now, node, why=None):
     holds = set(chain(new, box[1]))
     for i, n in enumerate(new):
         x1, y1, x2, y2 = n["rect"]
-        if (x1 <= cx <= x2 and y1 <= cy <= y2 and (n["clickable"] or n["field"])
-                and i not in holds):
-            return no("%s is at its point now" % said(n))
+        if not (x1 <= cx <= x2 and y1 <= cy <= y2 and (n["clickable"] or n["field"])) or i in holds:
+            continue
+        if (not worded(n) and not n["field"] and in_box(new, n, box[1])
+                and (x2 - x1) * (y2 - y1) >= SURFACE_SHARE * (bx2 - bx1) * (by2 - by1)):
+            continue  # the box's touch surface
+        return no("%s is at its point now" % said(n))
     b = new[box[1]]
     return b["text"] or b["desc"] or b["cls"].split(".")[-1]
 
