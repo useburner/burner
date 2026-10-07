@@ -9,6 +9,7 @@ For working on burner itself. None of these are needed to use it.
 | `benchcmp.py` | Compares two saved runs. Flags anything 20% and 300ms slower, or failing now. | no |
 | `verify.py` | Behaviour checks a bench can't see: scroll distance, a fresh read after a scroll, row taps, dialog refusal, landscape taps, unique screenshot names. | yes |
 | `tracesum.py` | Where a command's time went, from `BURNER_TRACE=json`: adb calls, sleeps, u2 RPCs, unaccounted. | no |
+| `pagetaps.py` | burner's page taps against a local headless Chrome, each round trip delayed: pages that move the target after the scroll (a late image, a growing slot, a target that never stops) and pages where a good touch must pass. Exit 1 when a tap clicked anything but its target. | no (needs Chrome) |
 | `linkbench.sh` | Raw link timings (one adb call, batched, parallel). | yes |
 | `offburner.py` | Reads a pasted assistant timeline and lists every place it drove the phone without `burner`. | no |
 | `fresh-install-test.sh` | Installs this checkout into a throwaway HOME and checks a clean install needs no hand patches. | no (needs network) |
