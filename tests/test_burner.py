@@ -1921,6 +1921,43 @@ class SetupWizardTests(OfflineTestCase):
             rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to="Battery", quiet=True))
         self.assertEqual((rc, steps.call_count), (1, 1))
         self.assertIn("not found: Battery (the list doesn't move any further down after 1 scroll)", err.getvalue())
+        # the read after that swipe failed: no verdict on the list (review of Oct 7)
+        self.allow("_settled_dump", return_value=None)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to="Battery", quiet=True))
+        self.assertEqual(rc, 1)
+        self.assertIn("couldn't read the screen to look for Battery", err.getvalue())
+        self.assertNotIn("doesn't move", err.getvalue())
+        # the list's end still loading (a feed's spinner): a moment, a swipe
+        # again, and what came is searched (review of Oct 7)
+        loading = pc.ET.fromstring('<hierarchy><node text="Apps" package="com.android.settings" '
+                                   'bounds="[0,100][1080,300]"/><node text="" class="android.widget.ProgressBar" '
+                                   'package="com.android.settings" bounds="[500,2000][580,2080]"/></hierarchy>')
+        self.allow("ui_dump", return_value=loading)
+        steps = self.allow("_scroll_step", return_value=loading)
+        reads = [loading, below]
+        self.allow("_settled_dump", side_effect=lambda: reads.pop(0))
+        settle = self.allow("settle_only")
+        adb.reset_mock()
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=2, to="Battery", quiet=True))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual((adb.call_count, settle.call_count), (2, 1))
+        self.assertTrue(pc.still_loading(pc.walk(loading)))
+        for xml in ('<hierarchy><node text="25.0" class="android.widget.ProgressBar" bounds="[0,0][9,9]"/></hierarchy>',
+                    '<hierarchy><node text="Loading dock" bounds="[0,0][9,9]"/></hierarchy>'):
+            self.assertFalse(pc.still_loading(pc.walk(pc.ET.fromstring(xml))), xml)
+        self.assertTrue(pc.still_loading(pc.walk(pc.ET.fromstring(
+            '<hierarchy><node text="Loading more\u2026" bounds="[0,0][9,9]"/></hierarchy>'))))
+
+    def test_scroll_to_names_the_alternative_found(self):
+        # `--to "Nope || Next"` said `found: Nope || Next` (review of Oct 7)
+        xml = '<hierarchy><node text="Next page" bounds="[0,0][10,10]"/></hierarchy>'
+        self.allow("ui_dump", return_value=pc.ET.fromstring(xml))
+        with self.cap() as (out, err):
+            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to="Nope || Next", quiet=True))
+        self.assertEqual((rc, out.getvalue()), (0, 'found: Next (in "Next page")\n'))
+        self.assertEqual(pc.holding_which(pc.walk(pc.ET.fromstring(xml)), "Nope"), (None, []))
 
     def test_scrcpy_ping_sends_nothing_to_the_phone(self):
         # ping used to send a BACK key-up, which pressed Back on the phone

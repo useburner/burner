@@ -1211,16 +1211,35 @@ def field_named(sel, n, focused_ok=False):
 
 
 def rows_holding(nodes, text):
-    """The rows `scroll --to` stops on: those reading the words exactly
-    (the first "a || b" alternative that has one), else those holding them
-    ("Delivered" in "Delivered Oct 5"); never a status bar icon. Pure."""
+    """The rows `scroll --to` stops on (see holding_which). Pure."""
+    return holding_which(nodes, text)[1]
+
+
+def holding_which(nodes, text):
+    """(alternative, rows): the rows `scroll --to` stops on, those reading
+    the words exactly (the first "a || b" alternative that has one), else
+    those holding them ("Delivered" in "Delivered Oct 5"), never a status
+    bar icon, and the alternative they hold; (None, []) for none. Pure."""
     sels = [s.strip() for s in (text or "").split("||") if s.strip()]
     for exact in (True, False):
         for sel in sels:
             hits = find_nodes(nodes, sel, exact=exact)
             if hits:
-                return hits
-    return []
+                return sel, hits
+    return None, []
+
+
+def still_loading(nodes):
+    """Whether the screen shows something still loading: a spinner (a
+    progress bar with no value) or a row saying so ("Loading…", "Loading
+    more", "Please wait"; not "Loading dock"). Pure."""
+    for n in nodes:
+        words = (n.get("text") or n.get("desc") or "").strip()
+        if "ProgressBar" in (n.get("class") or "") and not re.search(r"\d", words):
+            return True
+        if re.match(r"^(loading( more)?|please wait)\s*(\.{1,3}|…)?$", words, re.I):
+            return True
+    return False
 
 
 def find_nodes(nodes, text, exact=True):
@@ -4991,11 +5010,12 @@ def cmd_scroll(args):
     pkg = dump_package(root)
     before = visible_lines(walk(root))
     for i in range(times + 1):
-        hits = rows_holding(walk(root), args.to)
+        sel, hits = holding_which(walk(root), args.to)
         if hits:
             words = _row_words(hits[0])
-            # the row that holds the words, when it reads more than them
-            print("found: {}{}".format(args.to, "" if plain_words(words).lower() == plain_words(args.to).lower()
+            # the alternative found, and the row that holds it when that
+            # row reads more than its words
+            print("found: {}{}".format(sel, "" if plain_words(words).lower() == plain_words(sel).lower()
                                        else ' (in "{}")'.format(words[:LABEL_MAX])))
             if not quiet:
                 print_screen(root)
@@ -5019,11 +5039,25 @@ def cmd_scroll(args):
             # (right after `burner update` ten swipes moved nothing and the
             # search said "not found", Oct 7): one swipe over adb tells
             _trace("the screen didn't move; one swipe over adb")
-            _scroll_swipe(args.direction)
-            again = _settled_dump()
-            if again is not None:
+            for attempt in range(2):
+                if attempt:
+                    if not still_loading(walk(root)):
+                        break
+                    # the end of the list is still loading more (a feed's
+                    # spinner): a moment for it, and a swipe again; one
+                    # swipe called a loading feed's end (review of Oct 7)
+                    _trace("the list's end shows something loading; waiting for it")
+                    settle_only(idle_ms=2000, delay=0.5)
+                _scroll_swipe(args.direction)
+                again = _settled_dump()
+                if again is None:
+                    print("scrolled {} x{}; couldn't read the screen to look for {}"
+                          .format(args.direction, i + 1, args.to), file=sys.stderr)
+                    return 1
                 root = again
                 after = visible_lines(walk(root))
+                if after != before:
+                    break
             if after == before:
                 print("not found: {} (the list doesn't move any further {} after {} scroll{})".format(
                     args.to, args.direction, i + 1, "" if i == 0 else "s"), file=sys.stderr)
