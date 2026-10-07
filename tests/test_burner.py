@@ -4329,7 +4329,9 @@ class NotificationsTests(OfflineTestCase):
         self.assertIn("3 notifications", out.getvalue())
         self.assertEqual(sum(1 for c in sc.call_args_list if c[0][0].startswith("swipe")), 1)
         adb_swipe.assert_not_called()
-        settle.assert_called_once()
+        # the shade drawn first, then the page after the swipe
+        self.assertEqual([c.kwargs for c in settle.call_args_list],
+                         [{"idle_ms": pc.IDLE_ACT_MS, "delay": 0.2}, {"idle_ms": pc.IDLE_SCROLL_MS, "delay": 0.15}])
         # a scrcpy swipe that brought nothing new: once more over adb
         sc.reset_mock()
         pages[:] = [[("Muse: done", 400), ("Amazon: shipped", 2300)],
@@ -4342,6 +4344,7 @@ class NotificationsTests(OfflineTestCase):
 
     def test_the_shade_opens_and_closes_through_the_scrcpy_helper(self):
         sc = self.allow("scrcpy_send", return_value=True)
+        settle = self.allow("settle_only")  # the shade drawn to its end first (Oct 7)
         adb = self.allow("adb_or_ensure")
         self.allow("u2_invalidate")
         self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
@@ -4354,6 +4357,7 @@ class NotificationsTests(OfflineTestCase):
         adb.assert_not_called()
         self.assertIn("Wispr Flow: dictation ready", out.getvalue())
         self.assertTrue(all(c.kwargs.get("fresh") for c in pc.ui_dump.call_args_list))  # never the cache
+        settle.assert_called_once()  # before the first read: a read 0.6s in caught the shade opening
         # the helper is away: adb opens and closes the shade, as before
         sc.side_effect = RuntimeError("no scrcpy")
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):

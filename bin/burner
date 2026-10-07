@@ -5134,6 +5134,10 @@ def cmd_notifications(args):
     if not _shade("shade"):
         adb_or_ensure("shell", "input keyevent 224; cmd statusbar expand-notifications")
     u2_invalidate()  # a dump cached before the shade opened would show no rows
+    # the shade drawn to its end before the first read: a read 0.6s in
+    # caught it still opening, one notification of eighteen, and the list
+    # was taken as read (Oct 7)
+    settle_only(idle_ms=IDLE_ACT_MS, delay=0.2)
     lines = []
     via_scrcpy, retried = False, False
     try:
