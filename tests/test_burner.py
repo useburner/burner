@@ -4354,12 +4354,14 @@ class LabelTapTests(OfflineTestCase):
         def batch_miss(calls, timeout=45.0):
             sent.append(calls)
             if isinstance(calls[1][1][0], dict):
-                return [None, 0, RuntimeError("UiObjectNotFoundException")] + [None] * (len(calls) - 4) + [tapped]
+                # the miss: nothing tapped, and the batch's read after it is
+                # the screen as it is
+                return [None, 0, RuntimeError("UiObjectNotFoundException")] + [None] * (len(calls) - 4) + [SAMPLE_XML]
             return [None] * (len(calls) - 1) + [tapped]
         dm._batch = batch_miss
         dm.cmd_act(json.dumps({"tap_label": "OK"}))
         self.assertEqual(sent[-1][1], ("click", [250, 450]))
-        self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])  # one fresh read, which agreed
+        self.assertEqual(dm.d.calls, [])  # the miss's own read: no read of its own (a trip, YouTube, Oct 7)
         # any other error from the click may have come after the touch went
         # in (a NullPointerException on a web node, Oct 4): no second tap
         def batch_npe(calls, timeout=45.0):
@@ -4463,6 +4465,110 @@ class LabelTapTests(OfflineTestCase):
         dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()
         self.assertEqual(dm.cmd_act(json.dumps({"tap_label": "OK", "quiet": True, "idle": 1200})), b"ok")
         self.assertEqual((dm._last_xml, dm._last_xml_t), (SAMPLE_XML, 0.0))
+
+
+PLAYER_SHOWN_XML = '<hierarchy rotation="0"><node text="" class="android.widget.FrameLayout" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[0,0][1080,2400]"><node text="" class="android.widget.FrameLayout" package="com.google.android.youtube" content-desc="Video player" clickable="false" enabled="true" bounds="[0,250][1080,858]"><node text="" class="android.widget.FrameLayout" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[0,250][1080,858]"><node text="" class="android.widget.ImageView" package="com.google.android.youtube" content-desc="Pause video" clickable="true" enabled="true" bounds="[459,474][619,634]"/><node text="" class="android.widget.ImageView" package="com.google.android.youtube" content-desc="Next video" clickable="true" enabled="true" bounds="[800,474][900,634]"/><node text="0:12 / 2:31" class="android.widget.TextView" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[40,780][300,830]"/></node></node><node text="What It Takes" class="android.widget.TextView" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[40,900][1040,980]"/><node text="NASA" class="android.widget.TextView" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[40,1000][1040,1060]"/><node text="" class="android.widget.FrameLayout" package="com.google.android.youtube" content-desc="Comments" clickable="true" enabled="true" bounds="[0,1100][1080,1300]"/></node></hierarchy>'
+PLAYER_HIDDEN_XML = '<hierarchy rotation="0"><node text="" class="android.widget.FrameLayout" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[0,0][1080,2400]"><node text="" class="android.widget.FrameLayout" package="com.google.android.youtube" content-desc="Video player" clickable="false" enabled="true" bounds="[0,250][1080,858]"></node><node text="What It Takes" class="android.widget.TextView" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[40,900][1040,980]"/><node text="NASA" class="android.widget.TextView" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[40,1000][1040,1060]"/><node text="" class="android.widget.FrameLayout" package="com.google.android.youtube" content-desc="Comments" clickable="true" enabled="true" bounds="[0,1100][1080,1300]"/></node></hierarchy>'
+PLAYER_PAUSED_XML = '<hierarchy rotation="0"><node text="" class="android.widget.FrameLayout" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[0,0][1080,2400]"><node text="" class="android.widget.FrameLayout" package="com.google.android.youtube" content-desc="Video player" clickable="false" enabled="true" bounds="[0,250][1080,858]"><node text="" class="android.widget.FrameLayout" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[0,250][1080,858]"><node text="" class="android.widget.ImageView" package="com.google.android.youtube" content-desc="Play video" clickable="true" enabled="true" bounds="[459,474][619,634]"/><node text="" class="android.widget.ImageView" package="com.google.android.youtube" content-desc="Next video" clickable="true" enabled="true" bounds="[800,474][900,634]"/><node text="0:12 / 2:31" class="android.widget.TextView" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[40,780][300,830]"/></node></node><node text="What It Takes" class="android.widget.TextView" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[40,900][1040,980]"/><node text="NASA" class="android.widget.TextView" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[40,1000][1040,1060]"/><node text="" class="android.widget.FrameLayout" package="com.google.android.youtube" content-desc="Comments" clickable="true" enabled="true" bounds="[0,1100][1080,1300]"/></node></hierarchy>'
+
+
+class HiddenControlTests(OfflineTestCase):
+    def test_a_control_that_hid_itself_is_where_a_touch_brings_it_back(self):
+        # YouTube, Oct 7: "Pause video" was on the screen the assistant
+        # read, and the player hid its controls before the tap came (three
+        # taps missed)
+        mod = _u2mux()
+        node, _ = mod.label_node(PLAYER_SHOWN_XML, "Pause video")
+        self.assertEqual(mod.hid_itself(PLAYER_SHOWN_XML, PLAYER_HIDDEN_XML, node), "Video player")
+        # a button in its place would take the touch ("Play video")
+        took = PLAYER_HIDDEN_XML.replace(
+            'content-desc="Video player" clickable="false" enabled="true" bounds="[0,250][1080,858]">',
+            'content-desc="Video player" clickable="false" enabled="true" bounds="[0,250][1080,858]">'
+            '<node text="" class="android.widget.ImageView" package="com.google.android.youtube" '
+            'content-desc="Play video" clickable="true" enabled="true" bounds="[459,474][619,634]"/>')
+        self.assertIsNone(mod.hid_itself(PLAYER_SHOWN_XML, took, node))
+        # something outside the player changed too: not the controls hiding
+        self.assertIsNone(mod.hid_itself(PLAYER_SHOWN_XML, PLAYER_HIDDEN_XML.replace("What It Takes", "Next up"), node))
+        # a screen the app moved to: its own words, none of the player's
+        moved = PLAYER_HIDDEN_XML.replace("What It Takes", "Library").replace('text="NASA"', 'text="History"') \
+            .replace('content-desc="Comments"', 'content-desc="Playlists"').replace("Video player", "Banner")
+        self.assertIsNone(mod.hid_itself(PLAYER_SHOWN_XML, moved, node))
+        # the control still there, or never on the read: not this case
+        self.assertIsNone(mod.hid_itself(PLAYER_HIDDEN_XML, PLAYER_HIDDEN_XML, node))
+
+    def _daemon(self, mod, batches):
+        EmptyScreenTests.no_sleep(self, mod)
+        mod.log = lambda *a: None
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([], screen_on=True)
+        dm._last_xml, dm._last_xml_t = PLAYER_SHOWN_XML, mod._time.monotonic()
+        dm._page = lambda *a, **k: None
+        sent = []
+
+        def batch(calls, timeout=45.0):
+            sent.append(calls)
+            return batches.pop(0)(calls)
+        dm._batch = batch
+        return dm, sent
+
+    def test_the_tap_brings_it_back_and_taps_it_in_one_trip(self):
+        mod = _u2mux()
+
+        def miss(calls):  # the phone finds no "Pause video": nothing tapped
+            return [None, 0, RuntimeError("UiObjectNotFoundException")] + [None] * (len(calls) - 4) + [PLAYER_HIDDEN_XML]
+
+        def back(calls):  # the touch, the control back, its tap, the read
+            return [None, None, True, 1, None, None, PLAYER_PAUSED_XML]
+        dm, sent = self._daemon(mod, [miss, back])
+        xml = dm.cmd_act(json.dumps({"tap_label": "Pause video", "idle": 1200})).decode()
+        self.assertEqual([m for m, _ in sent[1]], ["wakeUp", "click", "waitForExists", "count", "click",
+                                                   "waitForIdle", "dumpWindowHierarchy"])
+        self.assertEqual(sent[1][1], ("click", [539, 554]))  # where the control was
+        self.assertEqual(sent[1][2][1], [{"mask": 64, "childOrSibling": [], "childOrSiblingSelector": [],
+                                          "description": "Pause video"}, mod.REVEAL_WAIT_MS])
+        self.assertEqual(dm.d.calls, [])  # no read of its own: the miss's read said it all
+        self.assertIn('<hierarchy revealed="Video player"', xml)
+        self.assertIn("Play video", xml)
+        # the CLI says it with the screen
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30: xml)
+        self.allow("_update_screen_from_dump")
+        status, root, note = pc.act_and_read({"tap_label": "Pause video"})
+        self.assertEqual(status, "ok")
+        self.assertIn('it had hidden itself, as a video\'s controls do; a touch on "Video player" brought it back',
+                      note)
+
+    def test_a_control_the_touch_did_not_bring_back_is_said(self):
+        mod = _u2mux()
+
+        def miss(calls):
+            return [None, 0, RuntimeError("UiObjectNotFoundException")] + [None] * (len(calls) - 4) + [PLAYER_HIDDEN_XML]
+
+        def gone(calls):  # touched; the control never came back
+            return [None, None, False, 0, RuntimeError("UiObjectNotFoundException"), None, PLAYER_HIDDEN_XML]
+        dm, sent = self._daemon(mod, [miss, gone])
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"tap_label": "Pause video", "idle": 1200}))
+        self.assertEqual(str(cm.exception), "act failed after sending: 'Pause video' had hidden itself, and a "
+                                            "touch where it was (on 'Video player') didn't bring it back")
+        self.assertEqual(dm._last_xml, PLAYER_HIDDEN_XML)
+        # a button took its place: no touch, "not on the last read" as before
+        took = PLAYER_HIDDEN_XML.replace(
+            'content-desc="Video player" clickable="false" enabled="true" bounds="[0,250][1080,858]">',
+            'content-desc="Video player" clickable="false" enabled="true" bounds="[0,250][1080,858]">'
+            '<node text="" class="android.widget.ImageView" package="com.google.android.youtube" '
+            'content-desc="Play video" clickable="true" enabled="true" bounds="[459,474][619,634]"/>')
+
+        def miss_took(calls):
+            return [None, 0, RuntimeError("UiObjectNotFoundException")] + [None] * (len(calls) - 4) + [took]
+        dm, sent = self._daemon(mod, [miss_took])
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"tap_label": "Pause video", "idle": 1200}))
+        self.assertEqual(str(cm.exception), "act not sent: not on the last read")
+        self.assertEqual(len(sent), 1)
+
+    def test_media_keys_have_names(self):
+        self.assertEqual((pc.key_code("MEDIA_PAUSE"), pc.key_code("media_play"), pc.key_code("KEYCODE_MEDIA_PLAY_PAUSE")),
+                         (127, 126, 85))
 
 
 class HelperStalenessTests(OfflineTestCase):

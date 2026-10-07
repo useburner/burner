@@ -144,7 +144,7 @@ Act (each prints the screen it ends on)
   burner tap "Text"                 tap by label (--index N, --fuzzy, "A || B", @e3 from snap)
   burner tap --xy 0.5,0.8           tap a spot (0 to 1 across and down)
   burner type "text"                type into the focused field (--field "Hint", --clear, --enter)
-  burner press BACK|HOME|ENTER      press a key (--repeat N)
+  burner press BACK|HOME|ENTER      press a key (--repeat N; MEDIA_PAUSE, MEDIA_PLAY for a video or music)
   burner scroll [down|up|left|right|top|bottom]   scroll the open app (--times N, --to "Text")
   burner wait "Text"                wait for text (--timeout 30, "A || B" for either, --absent to wait for it to go, --exact for the whole label only;
                                     above 30s it comes back every 30s with what the screen shows: tell the user, run it again)
@@ -175,6 +175,11 @@ Details that save a step:
 - `burner tap` refuses to guess: two matches for a label fails and lists them
   (`--index N` picks one). `"A || B"` tries labels in order. A label behind a
   dialog is refused: `burner dismiss` or `burner press BACK` first.
+- A video's controls hide a few seconds after they show. `burner press
+  MEDIA_PAUSE` (or `MEDIA_PLAY`) pauses and plays with them hidden. A
+  control on the last screen burner printed that its app hid since is
+  brought back by a touch where it was and tapped in the same command;
+  the screen's note says so.
 - `burner type` replaces the field's content, so `--clear` is rarely needed.
   Apps that ignore it get the text as key presses instead, automatically.
 - `burner wait` polls on the phone every quarter second; a tap right after it

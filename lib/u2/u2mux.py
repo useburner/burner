@@ -106,7 +106,13 @@ class U2NotFound(Exception):
 
 
 class _NotThere(Exception):
-    """A tap by words found no control on the phone: nothing was tapped."""
+    """A tap by words found no control on the phone: nothing was tapped.
+    `xml`: the read its batch took after the miss (the screen as it is),
+    or None."""
+
+    def __init__(self, msg, xml=None):
+        super().__init__(msg)
+        self.xml = xml
 
 
 try:
@@ -1433,6 +1439,86 @@ def loose_label_node(nodes, alts):
     return None
 
 
+NEW_WORDS_MAX = 2  # rows with words new on a read where controls hid themselves (a
+                   # player's thin progress bar); a screen the app moved to has more
+
+
+def hid_itself(before, now, node):
+    """Whether the control `node` of `before` (the read the assistant was
+    shown), not on `now`, was hidden by its own app, as a video's controls
+    hide a few seconds after a touch: the assistant's turn is longer, and
+    three taps on "Pause video" missed (YouTube, Oct 7). So when, the
+    system UI aside:
+    - a box around it is on `now` as it was: the nearest that has words
+      or holds rows with words on both reads, not a window's root (a
+      screen the app moved to keeps no words but its bars');
+    - every row gone from `before` was in that box, every row new on
+      `now` is in it, and NEW_WORDS_MAX of them at most have words;
+    - nothing that takes a tap is at the control's point on `now` but the
+      box or what holds it (a button that took the control's place, "Play
+      video", would take the touch).
+    Then a touch where the control was brings it back. Returns the box's
+    words (its class when it has none), or None. Pure."""
+    try:
+        old, new = list(iter_nodes(before or "")), list(iter_nodes(now or ""))
+    except Exception:
+        return None
+
+    def key(n):
+        return n["cls"], n["text"], n["desc"], n["rect"]
+
+    def chain(nodes, i):
+        """i and the indices of what holds nodes[i], nearest first."""
+        while i is not None:
+            yield i
+            i = nodes[i]["parent"]
+
+    def worded(n):
+        return n["pkg"] != SYSTEM_UI and bool((n["text"] or n["desc"]).strip())
+
+    at = next((i for i, n in enumerate(old) if key(n) == key(node)), None)
+    if at is None:
+        return None
+    where, was = {key(n): i for i, n in enumerate(new)}, {key(n) for n in old}
+    kept = [i for i, n in enumerate(new) if worded(n) and key(n) in was]
+    box = None
+    for i in chain(old, old[at]["parent"]):
+        j = where.get(key(old[i]))
+        if j is not None and new[j]["parent"] is not None and (
+                worded(new[j]) or any(j in chain(new, k) for k in kept)):
+            box = i, j
+            break
+    if box is None:
+        return None
+    cx, cy = old[at]["center"]
+    x1, y1, x2, y2 = old[box[0]]["rect"]
+    if not (x1 <= cx <= x2 and y1 <= cy <= y2):
+        return None
+    if any(n["pkg"] != SYSTEM_UI and key(n) not in where and box[0] not in chain(old, n["parent"])
+           for n in old):
+        return None  # gone from outside the box
+    fresh = [n for n in new if n["pkg"] != SYSTEM_UI and key(n) not in was]
+    if (any(box[1] not in chain(new, n["parent"]) for n in fresh)
+            or sum(1 for n in fresh if worded(n)) > NEW_WORDS_MAX):
+        return None  # new outside the box, or a screen of its own
+    holds = set(chain(new, box[1]))
+    for i, n in enumerate(new):
+        x1, y1, x2, y2 = n["rect"]
+        if (x1 <= cx <= x2 and y1 <= cy <= y2 and (n["clickable"] or n["field"])
+                and i not in holds):
+            return None
+    b = new[box[1]]
+    return b["text"] or b["desc"] or b["cls"].split(".")[-1]
+
+
+def marked_revealed(xml, box):
+    """A read after a tap on a control that had hidden itself (see
+    hid_itself), marked with the box a touch brought it back from:
+    revealed="..." (the CLI says it). Pure."""
+    from xml.sax.saxutils import quoteattr
+    return re.sub(r"<hierarchy\b", lambda m: "<hierarchy revealed=" + quoteattr(box), xml, count=1)
+
+
 def loose_words(node, alt):
     """The row's own words when `alt` only names it (see
     loose_label_node), else None. Pure."""
@@ -1451,6 +1537,7 @@ def marked_named(xml, words):
 
 BY_WORDS_S = 20.0  # a read this young still says what the screen is: a tap
                    # by words on it needs no read first
+REVEAL_WAIT_MS = 1500  # a control a touch brings back (see hid_itself) is given this long
 
 
 def act_calls(spec):
@@ -1468,6 +1555,12 @@ def act_calls(spec):
     sent another way), unless it is the read after a launch (`wake`). Pure."""
     calls = []
     if "tap_selector" in spec:
+        if "reveal" in spec:
+            # a control its app hid since the assistant's read (see
+            # hid_itself): a touch where it was, and the wait for it
+            x, y = spec["reveal"]
+            calls.append(("click", [int(x), int(y)]))
+            calls.append(("waitForExists", [spec["tap_selector"], REVEAL_WAIT_MS]))
         # how many controls carry the words now (the check after the tap),
         # then the click, by its words at tap time
         calls.append(("count", [spec["tap_selector"]]))
@@ -3043,7 +3136,7 @@ class U2Daemon:
             label = spec.pop("tap_label")
             spec["tapped_label"] = label  # remembered once the tap is done (see _type_into_field)
             before = self._last_xml
-            tried = None
+            tried = shown = None
             if before and _time.monotonic() - self._last_xml_t < BY_WORDS_S:
                 try:
                     # a row the words only name, too ("Search, Tab 2 of 4"
@@ -3058,6 +3151,7 @@ class U2Daemon:
                     # "lofi" got the tap, the review of Oct 6)
                     if selector_matches(before, sel) == 1:
                         spec["tap_selector"] = tried = sel
+                        shown = node
                         # the row's own words when the tap's only name it: a
                         # `type --field Search` after it is not about a box
                         # this tab opened (see _type_into_field)
@@ -3065,22 +3159,36 @@ class U2Daemon:
                         spec["words"] = spec["tapped_label"] = spec["named"] or label
                 except RuntimeError:
                     pass
+            xml = None
             if "tap_selector" in spec:
                 try:
                     return self._act_batch(spec)
                 except _NotThere as e:
                     spec.pop("tap_selector")
-                    log("%r not found by its words (%s); reading afresh" % (label, e))
-            try:
-                with _t("tap read"):
-                    xml = self._dump(fresh=True)
-            except Exception as e:
-                raise ActNotSent("act not sent: the read before it failed (%s)"
-                                 % err_text(e, 100))
+                    xml = e.xml
+                    log("%r not found by its words (%s); %s" % (
+                        label, e, "on the read after it" if xml else "reading afresh"))
+            if xml is not None:
+                self._remember(xml)
+            else:
+                try:
+                    with _t("tap read"):
+                        xml = self._dump(fresh=True)
+                except Exception as e:
+                    raise ActNotSent("act not sent: the read before it failed (%s)"
+                                     % err_text(e, 100))
             try:
                 node, alt = label_node(xml, label, loose=True)
             except RuntimeError as e:
-                raise RuntimeError("act not sent: %s" % e)
+                box = hid_itself(before, xml, shown) if shown is not None and str(e) == "not on the last read" else None
+                if box is None:
+                    raise RuntimeError("act not sent: %s" % e)
+                # on the assistant's screen a moment ago, hidden by its app
+                # since (a video's controls): a touch where it was brings it
+                # back, and it is tapped by its words, in one trip
+                log("%r hid itself since the last read (in %r); a touch where it was brings it back" % (label, box))
+                spec.update(tap_selector=tried, reveal=list(shown["center"]), reveal_on=box)
+                return self._act_batch(spec)
             spec["inert"] = inert_row(xml, node)
             spec["named"] = loose_words(node, alt)
             spec["tapped_label"] = spec["named"] or label
@@ -3333,6 +3441,7 @@ class U2Daemon:
         (nothing was tapped), RuntimeError otherwise."""
         calls = act_calls(spec)
         acted = [i for i, (m, _) in enumerate(calls) if m in ACTION_METHODS]
+        touch = acted.pop(0) if "reveal" in spec else None  # the touch that brings a control back
         timeout = int(spec.get("idle", 2000)) / 1000.0 + 20
         last, last_t = getattr(self, "_last_xml", ""), getattr(self, "_last_xml_t", 0.0)
         before = last if last and _time.monotonic() - last_t < BY_WORDS_S else None
@@ -3351,10 +3460,25 @@ class U2Daemon:
                     raise RuntimeError("act failed after sending: %s" % str(e)[:120])
                 except Exception as e:
                     raise RuntimeError("act failed after sending: %s" % str(e)[:120])
+            if touch is not None:
+                after = results[-1]
+                if isinstance(results[touch], Exception):
+                    raise RuntimeError("act failed after sending: the touch to bring %r back failed (%s)"
+                                       % (spec.get("words"), err_text(results[touch], 80)))
+                if results[touch + 1] is not True or isinstance(results[acted[0]], Exception):
+                    if isinstance(after, str) and has_words(after):
+                        self._remember(after)
+                    raise RuntimeError("act failed after sending: %r had hidden itself, and a touch where "
+                                       "it was (on %r) didn't bring it back" % (spec.get("words"), spec["reveal_on"]))
             if acted and isinstance(results[acted[0]], Exception):
                 err = results[acted[0]]
                 if "tap_selector" in spec and ("UiObjectNotFound" in str(err) or "-32002" in str(err)):
-                    raise _NotThere(err_text(err, 80))  # no such control: nothing was tapped
+                    # no such control: nothing was tapped; the batch's read
+                    # after it is the screen as it is (a read of its own
+                    # cost a trip more, YouTube, Oct 7)
+                    after = results[-1]
+                    raise _NotThere(err_text(err, 80), after if isinstance(after, str) and has_words(after)
+                                    and not chrome_in(after) else None)
                 # any other error (a NullPointerException on a web node, Oct
                 # 4) may have come after the touch went in: no second tap
                 raise RuntimeError("act failed after sending: %s" % err)
@@ -3480,6 +3604,8 @@ class U2Daemon:
                 xml = marked_unchanged(xml, spec.get("inert"))
             if spec.get("named"):
                 xml = marked_named(xml, spec["named"])
+            if spec.get("reveal_on"):
+                xml = marked_revealed(xml, spec["reveal_on"])
         return xml.encode()
 
     def _relook(self, xml):
