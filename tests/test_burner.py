@@ -4931,9 +4931,14 @@ class StartAndSettingsTests(OfflineTestCase):
             rc = pc.cmd_settings(self.parse(["settings", "app", "com.tinder"]))
         self.assertEqual(rc, 0)
         self.assertIn("APPLICATION_DETAILS_SETTINGS -d 'package:com.tinder'", adb.call_args[0][1])
-        with self.cap() as (out, err):
+        # alone: the Settings app, on its main page, the page names after its
+        # screen (it opened nothing and the next tap missed, Oct 7)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             self.assertEqual(pc.cmd_settings(self.parse(["settings"])), 0)
-        self.assertIn("bluetooth", out.getvalue())
+        self.assertIn("am start --activity-clear-top -a 'android.settings.SETTINGS'", adb.call_args[0][1])
+        self.assertIn("opened settings: home", out.getvalue())
+        self.assertIn("screen: com.example", out.getvalue())
+        self.assertIn("(pages by name: `burner settings <page>`: about, accessibility", out.getvalue())
         with self.cap() as (out, err):
             self.assertEqual(pc.cmd_settings(self.parse(["settings", "nope"])), 1)
         self.assertIn("no settings page called", err.getvalue())

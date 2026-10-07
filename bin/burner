@@ -5647,9 +5647,12 @@ def cmd_settings(args):
     instead of tapping through the Settings menus. `app <package>` opens
     that app's info page (permissions, storage, notifications)."""
     page = (args.page or "").strip().lower()
-    if not page:
-        print("pages: " + ", ".join(sorted(SETTINGS_PAGES)) + ", app <package>")
-        return 0
+    listed = not page
+    if listed:
+        # "settings" alone is the Settings app: it printed the page names
+        # and opened nothing, and the tap after it was looked for on the
+        # home screen (Oct 7); its main page, the names after its screen
+        page = "home"
     if page == "app":
         if not args.package:
             print("settings app needs a package, e.g. burner settings app com.tinder",
@@ -5670,6 +5673,9 @@ def cmd_settings(args):
     u2_invalidate()
     print("opened settings: {}".format(page if page != "app" else "app " + args.package))
     launch_read(getattr(args, "quiet", False))
+    if listed:
+        print("(pages by name: `burner settings <page>`: " + ", ".join(sorted(SETTINGS_PAGES))
+              + ", app <package>)")
     return 0
 
 
