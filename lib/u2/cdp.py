@@ -297,6 +297,7 @@ class Page:
         self.lock = threading.RLock()  # one thread on the stream (a wait polls while a tap acts)
         self.visible_at = 0.0  # when a probe last said the page was visible
         self.loading = False
+        self.window_opened = None  # the address of a window (a tab) the page opened, once heard
         self.main_frame = None
         self.url = ""
         # bounded like a visibility probe (probe_s, PROBE_S by default, plus
@@ -334,7 +335,11 @@ class Page:
 
     def _event(self, m):
         method, p = m.get("method", ""), m.get("params") or {}
-        if method == "Page.frameStartedLoading" and p.get("frameId") == self.main_frame:
+        if method == "Page.windowOpen":
+            # a link or a script opened a window: on a phone, a new tab that
+            # Chrome brings to the front (weather.gov, Oct 7)
+            self.window_opened = p.get("url") or "about:blank"
+        elif method == "Page.frameStartedLoading" and p.get("frameId") == self.main_frame:
             self.loading = True
         elif method == "Page.frameNavigated":
             frame = p.get("frame") or {}
@@ -1586,6 +1591,7 @@ def tap(page, label, index=None, idle_ms=1200):
         time.sleep(0.15)
         return {"found": True, "count": 1, "label": hit.get("label"),
                 "how": "chose" if hit.get("chose") else "focus", "screen": read(page)}
+    page.window_opened = None
     how, after = touch_hit(page, hit, then=[_evaluate(_later(_js(READ_JS, 600), READ_LATER_MS))])
     screen, ready = None, "complete"
     if after and not page.loading:
@@ -1593,6 +1599,14 @@ def tap(page, label, index=None, idle_ms=1200):
             screen = _value(after[0])
         except RuntimeError:
             screen = None  # the document went away under the read: a load
+    if page.window_opened:
+        # the touch opened a new tab: this page isn't going anywhere, and
+        # it isn't the screen any more (the caller reads the new tab)
+        return {"found": True, "count": 1, "label": hit.get("label"), "how": how,
+                "screen": screen or {}, "ready": "complete", "new_tab": page.window_opened,
+                "at": [hit.get("x"), hit.get("y")], "tag": hit.get("tag") or "",
+                "over": hit.get("over") or "", "moved": bool(hit.get("moved")),
+                "covered": bool(hit.get("covered"))}
     if screen is not None and not page.loading and leaves_for(hit, screen):
         # a link to another page, and the page not going there yet a
         # moment after the touch: its load is given LINK_LOAD_S to start
@@ -1632,7 +1646,7 @@ def touch_at(page, x, y, screen, top, idle_ms=1200):
     load is waited out and read afresh. {"screen", "ready", "how"}."""
     k = float(screen.get("vs") or 1) * float(screen.get("dpr") or 1)
     cx, cy = x / k, (y - top) / k
-    page.loading = False
+    page.loading, page.window_opened = False, None
     how, after = touch(page, cx, cy, then=[_evaluate(_later(_js(READ_JS, 600), READ_LATER_MS))])
     shot, ready = None, "complete"
     if after and not page.loading:
@@ -1640,6 +1654,9 @@ def touch_at(page, x, y, screen, top, idle_ms=1200):
             shot = _value(after[0])
         except RuntimeError:
             shot = None  # the document went away under the read: a load
+    if page.window_opened:
+        # a new tab: the caller reads it (see tap)
+        return {"screen": shot or {}, "ready": "complete", "how": how, "new_tab": page.window_opened}
     if shot is None or page.loading:
         probe = after_touch(page, None, idle_ms)
         shot, ready = read(page), probe.get("ready")

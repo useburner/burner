@@ -7342,6 +7342,48 @@ class WebPathTests(OfflineTestCase):
         self.assertNotIn("moved=", cdp.page_xml(r["screen"], 283, 2400))
         self.assertEqual(pc.page_stuck(ET.fromstring(cdp.page_xml(r["screen"], 283, 2400))), "")
 
+    def test_a_tap_that_opens_a_new_tab_follows_it(self):
+        # weather.gov, Oct 7: 'Get Detailed info' opened a new tab; the tap
+        # waited 1s for the old page, printed it, and `text` read it again
+        cdp = _cdp()
+        page = _ScriptedPage(cdp, {"FIND_JS": {"found": True, "count": 1, "label": "Get Detailed info", "x": 100,
+                                               "y": 400, "tag": "a", "url": "https://www.weather.gov/",
+                                               "href": "https://forecast.weather.gov/MapClick.php?x=1"},
+                                   "READ_JS": WEB_SCREEN})
+        page.loading = False
+
+        # the page's session hears it (Page.windowOpen, sent before the touch's read comes back)
+        heard = SimpleNamespace(main_frame="F1", loading=False, url="", window_opened=None)
+        cdp.Page._event(heard, {"method": "Page.windowOpen", "params": {"url": "https://forecast.weather.gov/x"}})
+        self.assertEqual(heard.window_opened, "https://forecast.weather.gov/x")
+
+        def touch_hit(pg, hit, then=()):
+            pg.window_opened = "https://forecast.weather.gov/MapClick.php?x=1"
+            return "touch", [{"result": {"value": WEB_SCREEN}}]
+        waits = []
+        page.wait_loading = lambda s: waits.append(s)
+        with mock.patch.object(cdp, "touch_hit", touch_hit):
+            r = cdp.tap(page, "Get Detailed info")
+        self.assertEqual((r["new_tab"], waits), ("https://forecast.weather.gov/MapClick.php?x=1", []))
+        # a link in the same tab: no new tab
+        page.window_opened = None
+        with mock.patch.object(cdp, "touch_hit", lambda pg, hit, then=(): ("touch", [{"result": {"value": WEB_SCREEN}}])):
+            self.assertNotIn("new_tab", cdp.tap(page, "Get Detailed info"))
+        # the helper: the page in hand dropped, the new tab read as the screen
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        old = _FakePage()
+        old.visible_at = 1e9
+        dm._web = old
+        read_with = []
+        dm._page_read = lambda hint=None, **kw: read_with.append(hint) or "<hierarchy rotation=\"0\" page=\"1\"/>"
+        xml = dm._new_tab_read({"new_tab": "https://forecast.weather.gov/MapClick.php?x=1"})
+        self.assertEqual((xml, read_with, dm._web, old.visible_at),
+                         ('<hierarchy rotation="0" page="1"/>', ["https://forecast.weather.gov/MapClick.php?x=1"],
+                          None, 0.0))
+
     def test_a_page_scroll_says_how_far_the_page_moved(self):
         cdp = _cdp()
         page = _ScriptedPage(cdp, {"SCROLL_JS": {"moved": 0, "scroller": None, "held": True}, "READ_JS": WEB_SCREEN})

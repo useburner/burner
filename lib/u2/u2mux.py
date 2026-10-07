@@ -1994,6 +1994,25 @@ class U2Daemon:
                 xml = read_screen(self.d)
         return xml
 
+    NEW_TAB_S = 0.3  # a tab a touch opened: this long for Chrome to bring it up
+
+    def _new_tab_read(self, r):
+        """The screen after a touch that opened a new tab (see cdp.tap's
+        "new_tab"): the page in hand is dropped (it is behind the new tab
+        now: its text was read as the screen's, weather.gov, Oct 7), and
+        the new tab, found by its address, read; the screen reader's read
+        when it can't be reached yet."""
+        log("web tap: the touch opened a new tab (%s); reading it" % str(r["new_tab"])[:100])
+        if self._web is not None:
+            self._web.visible_at = 0.0
+        self._web = None
+        _time.sleep(self.NEW_TAB_S)
+        xml = self._page_read(hint=r["new_tab"])
+        if xml is None:
+            with _t("dump rpc (new tab)"):
+                xml = read_screen(self.d)
+        return xml
+
     def _page_read(self, assume_chrome=False, hint=None, loaded=False):
         """The page in Chrome as a screen read, or None (see _page). The
         screen reader's tree lags a finger scroll on a heavy page by
@@ -2750,7 +2769,7 @@ class U2Daemon:
                 if r.get("count", 1) != 1:
                     raise RuntimeError("act not sent: %d rows read %r%s" % (
                         r["count"], label, " (%s)" % ", ".join(r["tags"]) if r.get("tags") else ""))
-                xml = self._after_page(r["screen"])
+                xml = self._new_tab_read(r) if r.get("new_tab") else self._after_page(r["screen"])
                 self._remember(xml)
             return xml.encode()
         if "set_text" in spec and spec.get("field") and self._page() is not None:
@@ -2834,7 +2853,7 @@ class U2Daemon:
                         self._remember(xml)
                         raise RuntimeError("act failed after sending: a window over the page (%s %r) "
                                            "has the screen; the touch went under it" % over)
-                    xml = self._after_page(r["screen"])
+                    xml = self._new_tab_read(r) if r.get("new_tab") else self._after_page(r["screen"])
                     self._remember(xml)
                 if spec.get("quiet"):
                     return b"ok"
