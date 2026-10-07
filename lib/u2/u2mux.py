@@ -1898,6 +1898,17 @@ class U2Daemon:
             raise RuntimeError("the phone's screen is off and wakeUp failed (%s)" % err_text(e, 80))
         _time.sleep(0.4)
 
+    def _wake_quietly(self):
+        """The screen on before the CLI launches something: one wakeUp (a
+        no-op with the screen on; 500ms on the phone when it wakes it). A
+        failure is logged, not raised: the look after the launch wakes
+        an off screen then."""
+        try:
+            with self._lock:
+                self.d.jsonrpc.wakeUp()
+        except Exception as e:
+            log("the wake before a launch failed (%s)" % err_text(e, 80))
+
     def _front_read(self):
         """One read of what is in front now, the screen woken first when it
         is off (a blank read, and the phone says so); remembered when it
@@ -2295,6 +2306,12 @@ class U2Daemon:
                     else self._page())
             if page is None:
                 self._opened, self._opened_at = link, _time.monotonic()
+                if not spec.get("launched"):
+                    # the CLI brings Chrome up next: the screen woken first
+                    # (Chrome came up behind an off screen; the look after
+                    # found it off and woke it, and the tab refused DevTools
+                    # for a try more: an 11s open, Oct 7)
+                    self._wake_quietly()
                 raise RuntimeError("act not sent: not a page")
             with self._lock:
                 self.invalidate()

@@ -5696,7 +5696,17 @@ class WebPathTests(OfflineTestCase):
         xml = dm.cmd_act(json.dumps({"open": "https://www.espn.com/nfl/", "idle": 1000})).decode()
         self.assertEqual(calls[-1], ("open", "https://www.espn.com/nfl/", 1000))
         self.assertIn('text="Box Score"', xml)
+        woke = []
+        dm.d.jsonrpc.wakeUp = lambda: woke.append(1)
         dm._last_xml = SAMPLE_XML  # not Chrome: launched by the CLI instead
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"open": "https://example.com"}))
+        self.assertEqual(str(cm.exception), "act not sent: not a page")
+        # the screen woken for the launch that follows (Chrome came up
+        # behind an off screen: an 11s open, Oct 7)
+        self.assertEqual(woke, [1])
+        # a wake that fails says so in the log, and the answer stands
+        dm.d.jsonrpc.wakeUp = mock.Mock(side_effect=OSError("link down"))
         with self.assertRaises(RuntimeError) as cm:
             dm.cmd_act(json.dumps({"open": "https://example.com"}))
         self.assertEqual(str(cm.exception), "act not sent: not a page")
