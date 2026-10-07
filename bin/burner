@@ -3478,8 +3478,12 @@ def cmd_type(args):
     # label in one op (found by its label, the value set on that element:
     # a color field takes no focus on Android, and typed text went to the
     # last text field). Elsewhere: focus the field first, then type.
+    page_fields = ""
     if args.field and not args.slow and not quiet:
         status, root, note = act_and_read({"set_text": args.text, "field": args.field})
+        if status == "unsent" and "; its fields: " in _u2_status:
+            # the page's own fields, said if nothing else has the label
+            page_fields = _u2_status.split("; its fields: ", 1)[1]
         if status == "ok":
             print("typed {} chars into {}".format(len(args.text), args.field))
             return typed(status, root, note)
@@ -3497,7 +3501,8 @@ def cmd_type(args):
     if args.field:
         got = focus_field(args.field)
         if got == "missing":
-            print('field "{}" not found'.format(args.field), file=sys.stderr)
+            print('field "{}" not found{}'.format(
+                args.field, "; the page's fields: " + page_fields if page_fields else ""), file=sys.stderr)
             return 1
         if got == "unsure":
             print("burner: the UI helper didn't confirm the tap on the field, "

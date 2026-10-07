@@ -2933,7 +2933,9 @@ class U2Daemon:
                         % (spec["field"], {"tap+focus": "that took the focus", "tap+label": "with that label",
                                            "tap+only": "in view"}.get(r["how"], "found")))
                 if not r.get("found"):
-                    raise RuntimeError("act not sent: no field labelled %r on the page" % spec["field"])
+                    fields = r.get("fields") or []
+                    raise RuntimeError("act not sent: no field labelled %r on the page%s" % (
+                        spec["field"], "; its fields: " + ", ".join(repr(f) for f in fields) if fields else ""))
                 if r.get("count", 1) != 1:
                     raise RuntimeError("act not sent: %d fields read %r%s" % (
                         r["count"], spec["field"], " (%s)" % ", ".join(r["tags"]) if r.get("tags") else ""))

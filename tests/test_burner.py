@@ -6711,6 +6711,38 @@ class WebPathTests(OfflineTestCase):
         self.assertIn("typed 7 chars", out.getvalue())
         self.assertNotIn("into Password", out.getvalue())
 
+    def test_type_names_the_page_s_fields_when_none_has_the_label(self):
+        # duckduckgo.com, Oct 7: `type --field 'Search the web without being
+        # tracked'` (a placeholder the box doesn't have) failed, and a read
+        # of the page found the box's own name
+        self.allow("u2_invalidate")
+        self.allow("nav_record")
+        self.allow("focus_field", return_value="missing")
+
+        def u2(cmd, arg="", timeout=30):
+            pc._u2_status = ("err act not sent: no field labelled 'Search the web' on the page; "
+                             "its fields: 'Search with DuckDuckGo'")
+            return None
+        self.allow("u2sock", side_effect=u2)
+        with self.cap() as (out, err):
+            rc = pc.cmd_type(self.parse(["type", "--field", "Search the web", "minneapolis weather"]))
+        self.assertEqual(rc, 1)
+        self.assertIn("""field "Search the web" not found; the page's fields: 'Search with DuckDuckGo'""",
+                      err.getvalue())
+        # the helper: the page's fields with its answer
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = WebPathTests._fake_cdp(self, mod, calls)
+        fake.fill = lambda page, label, text, index=None: {"found": False, "fields": ["Search with DuckDuckGo"]}
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"set_text": "x", "field": "Search the web"}))
+        self.assertEqual(str(cm.exception), "act not sent: no field labelled 'Search the web' on the page; "
+                                            "its fields: 'Search with DuckDuckGo'")
+
     def test_type_with_enter_submits_in_the_same_command(self):
         # Play Store, Oct 7: `type --field 'Search or ask Play' duolingo`,
         # then `press enter`, an agent's turn apart

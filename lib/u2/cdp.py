@@ -816,11 +816,18 @@ FIND_JS = r"""
     // look (0.7s and a round trip for nothing, Oct 7). A first find on a
     // page watches it a moment first: a change just before it isn't known
     // otherwise (a list growing, review of Oct 7)
+    // a field to fill not found: the page's own fields named, so that the
+    // next try names one of them (a search box guessed by a placeholder it
+    // doesn't have took a read of the page to find, Oct 7)
+    const fieldNames = () => !fill ? undefined : Array.from(document.querySelectorAll(FIELDS)).filter(el => visible(el))
+      .map(el => attr(el) || labelOf(el) || el.getAttribute('name') || '').filter(Boolean)
+      .filter((n, i, a) => a.indexOf(n) === i).slice(0, 6).map(n => n.slice(0, 40));
     const decide = () => {
       const now = performance.now(), at = window.__burnerChangedAt;
       let moving = false;
       try { moving = document.getAnimations().some(a => a.playState === 'running'); } catch (e) {}
-      return {found: false, quiet: document.readyState === 'complete' && now > 5000 && !moving && (at === undefined || now - at > 1000)};
+      return {found: false, quiet: document.readyState === 'complete' && now > 5000 && !moving && (at === undefined || now - at > 1000),
+              fields: fieldNames()};
     };
     return fresh ? new Promise(done => setTimeout(() => done(decide()), 250)) : decide();
   }
@@ -2127,7 +2134,9 @@ def fill(page, label, text, index=None):
     # checkbox, picks an option): "failed after sending", not "not sent"
     hit = _value(res[0])
     if not hit or not hit.get("found"):
-        return {"found": False}  # nothing filled; the caller says so (no read for it, Oct 7)
+        # nothing filled; the caller says so (no read for it, Oct 7), with
+        # the page's own fields
+        return {"found": False, "fields": list((hit or {}).get("fields") or [])}
     if hit.get("count", 1) != 1:
         return hit
     how = "fill"
