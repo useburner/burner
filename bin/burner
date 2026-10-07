@@ -3419,6 +3419,14 @@ def type_via_adbkeyboard(text, field_xy=None, clear=False, clear_keys=20):
     return 0
 
 
+def _enter_after_typing(args):
+    """`type --enter`: the Enter key after the text, in the same command (a
+    search typed and submitted: `type` then `press enter` cost an agent's
+    turn, Oct 7), and the screen it ends on (see cmd_press)."""
+    return cmd_press(argparse.Namespace(key="ENTER", quiet=getattr(args, "quiet", False), force=False,
+                                        repeat=1, delay=120, ctrl=False, shift=False, alt=False, meta=False))
+
+
 def cmd_type(args):
     # Nav memory: record that a field was filled (NEVER the content).
     # The action string is "type" or "type <field-hint>", never the actual text.
@@ -3437,6 +3445,13 @@ def cmd_type(args):
     else:
         use_unicode = needs_unicode_route(args.text)
     quiet = getattr(args, "quiet", False)
+    enter = getattr(args, "enter", False)
+
+    def typed(status, root, note):
+        # the typing's screen; with --enter, the key's instead
+        if enter and status == "ok":
+            return _enter_after_typing(args)
+        return print_act(status, root, note, "typing")
     if use_unicode:
         nodes = walk(ui_dump())
         xy = None
@@ -3453,6 +3468,8 @@ def cmd_type(args):
                     break
         rc = type_via_adbkeyboard(args.text, xy, clear=args.clear,
                                   clear_keys=args.clear_keys)
+        if enter and rc == 0:
+            return _enter_after_typing(args)
         read_after(quiet=quiet)
         return rc
     # --field: on a page in Chrome the UI helper fills the field with this
@@ -3463,7 +3480,7 @@ def cmd_type(args):
         status, root, note = act_and_read({"set_text": args.text, "field": args.field})
         if status == "ok":
             print("typed {} chars into {}".format(len(args.text), args.field))
-            return print_act(status, root, note, "typing")
+            return typed(status, root, note)
         if status == "lost" or (status.startswith("failed") and "no editable field" not in status):
             # the helper had it: its word on what happened, no claim of typing
             return print_act(status, root, note, "typing")
@@ -3495,7 +3512,7 @@ def cmd_type(args):
         status, root, note = act_and_read({"set_text": args.text})
         if status == "ok":
             print("typed {} chars".format(len(args.text)))
-            return print_act(status, root, note, "typing")
+            return typed(status, root, note)
         if status == "lost" or (status.startswith("failed") and "no editable field" not in status
                                 and "UiObjectNotFound" not in status):
             return print_act(status, root, note, "typing")  # the helper's word; no claim of typing
@@ -3504,6 +3521,8 @@ def cmd_type(args):
         out = u2sock("set_text", json.dumps({"text": args.text}), timeout=40)
         if out is not None:
             print("typed {} chars".format(len(args.text)))
+            if enter:
+                return _enter_after_typing(args)
             read_after(quiet=quiet)
             return 0
         if _u2_status == "lost":
@@ -3538,6 +3557,8 @@ def cmd_type(args):
     if no_focus:
         how += "; no text field had the focus, so check the screen"
     print("typed {} chars ({})".format(len(args.text), how))
+    if enter:
+        return _enter_after_typing(args)
     read_after(quiet=quiet)
     return 0
 
@@ -6103,6 +6124,8 @@ def build_parser():
                    help="force the ADBKeyboard route even for ASCII text")
     p.add_argument("--ascii", action="store_true",
                    help="force the legacy path even for non-ASCII text")
+    p.add_argument("--enter", action="store_true",
+                   help="press Enter after the text (a search), and print that screen")
     p.add_argument("--quiet", "-q", action="store_true",
                    help="don't print the screen afterwards")
     p.set_defaults(fn=cmd_type)

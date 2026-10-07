@@ -48,9 +48,10 @@ Every step you take costs a round trip, so the fewer steps, the faster.
 7. **Type into the focused field:** `burner type "text"` (`--field "Search"`
    finds that field by its label; when the label is on a button, such as a
    site's search icon, it taps the button and types into the box that opens).
-   With nothing focused, the one text box on screen takes the text. It prints
-   the screen, so check the text there before any Send, Post, Buy or Submit
-   tap, and only tap it with the user's go-ahead.
+   With nothing focused, the one text box on screen takes the text. For a
+   search, `--enter` submits it in the same command (never where Enter sends
+   or posts something). It prints the screen, so check the text there before
+   any Send, Post, Buy or Submit tap, and only tap it with the user's go-ahead.
 8. A command that fails or hangs: run `burner ensure` once and try again. If it
    still fails, tell the user plainly what it printed (it says what is wrong).
    When the user asks why something was slow, `burner log --last 20` shows
@@ -142,7 +143,7 @@ Look
 Act (each prints the screen it ends on)
   burner tap "Text"                 tap by label (--index N, --fuzzy, "A || B", @e3 from snap)
   burner tap --xy 0.5,0.8           tap a spot (0 to 1 across and down)
-  burner type "text"                type into the focused field (--field "Hint", --clear)
+  burner type "text"                type into the focused field (--field "Hint", --clear, --enter)
   burner press BACK|HOME|ENTER      press a key (--repeat N)
   burner scroll [down|up|left|right|top|bottom]   scroll the open app (--times N, --to "Text")
   burner wait "Text"                wait for text (--timeout 30, "A || B" for either, --absent to wait for it to go, --exact for the whole label only;

@@ -6711,6 +6711,37 @@ class WebPathTests(OfflineTestCase):
         self.assertIn("typed 7 chars", out.getvalue())
         self.assertNotIn("into Password", out.getvalue())
 
+    def test_type_with_enter_submits_in_the_same_command(self):
+        # Play Store, Oct 7: `type --field 'Search or ask Play' duolingo`,
+        # then `press enter`, an agent's turn apart
+        self.allow("u2_invalidate")
+        self.allow("nav_record")
+        self.allow("_enter_has_a_field", return_value=True)
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append(json.loads(arg) if cmd == "act" else cmd)
+            return SAMPLE_XML
+        self.allow("u2sock", side_effect=u2)
+        with self.cap() as (out, err):
+            rc = pc.cmd_type(self.parse(["type", "--field", "Search or ask Play", "duolingo", "--enter"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual([(c.get("set_text"), c.get("key")) for c in calls], [("duolingo", None), (None, 66)])
+        lines = out.getvalue().splitlines()
+        self.assertEqual(lines[:2], ["typed 8 chars into Search or ask Play", "pressed ENTER"])
+        self.assertEqual(sum(1 for l in lines if l.startswith("screen: ")), 1)  # the key's screen only
+        # a typing that failed presses nothing
+        calls.clear()
+
+        def u2_failed(cmd, arg="", timeout=30):
+            calls.append(json.loads(arg) if cmd == "act" else cmd)
+            pc._u2_status = "err act failed after sending: the box didn't take the text"
+            return None
+        self.allow("u2sock", side_effect=u2_failed)
+        with self.cap() as (out, err):
+            self.assertEqual(pc.cmd_type(self.parse(["type", "--field", "Search", "duolingo", "--enter"])), 1)
+        self.assertNotIn(66, [c.get("key") for c in calls if isinstance(c, dict)])
+
     def test_type_with_a_field_tapped_a_moment_ago_does_not_tap_it_again(self):
         # the review of Oct 7: the helper had no box yet for the bar just
         # tapped, and the CLI's fallback tapped the bar a second time
