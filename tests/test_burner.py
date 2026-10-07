@@ -4311,6 +4311,33 @@ class HelperStalenessTests(OfflineTestCase):
 
 
 class NotificationsTests(OfflineTestCase):
+    def test_a_shade_that_draws_nothing_is_reset_once(self):
+        # Oct 7: the shade window held the focus and drew nothing; neither
+        # the command nor a finger opened it until quick settings opened
+        # and closed
+        self.allow("scrcpy_send", return_value=True)
+        self.allow("u2_invalidate")
+        self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
+        self.allow("screen_dims", return_value=(1080, 2400))
+        self.allow("settle_only")
+        adb = self.allow("adb_or_ensure")
+        pages = [[], [], [("Muse: done", 400)]]
+        self.allow("notification_rows", side_effect=lambda root: pages.pop(0))
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_notifications(self.parse(["notifications"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertIn("1 notification", out.getvalue())
+        self.assertEqual([c[0][1] for c in adb.call_args_list],
+                         ["cmd statusbar expand-settings; sleep 0.5; cmd statusbar collapse; "
+                          "sleep 0.3; cmd statusbar expand-notifications"])
+        # still nothing after the reset: "no notifications", one reset only
+        adb.reset_mock()
+        pages[:] = [[], [], [], []]
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_notifications(self.parse(["notifications"]))
+        self.assertIn("no notifications", out.getvalue())
+        self.assertEqual(adb.call_count, 1)
+
     def test_the_shade_pages_over_the_scrcpy_helper(self):
         # Oct 7: twelve notifications took 5.5s, two adb swipes and pauses
         sc = self.allow("scrcpy_send", return_value=True)

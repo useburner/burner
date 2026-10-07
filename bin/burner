@@ -5139,9 +5139,9 @@ def cmd_notifications(args):
     # was taken as read (Oct 7)
     settle_only(idle_ms=IDLE_ACT_MS, delay=0.2)
     lines = []
-    via_scrcpy, retried = False, False
+    via_scrcpy, retried, reset = False, False, False
     try:
-        for i in range(4):
+        for i in range(5):
             # afresh every time: the shade opens in milliseconds now, and a
             # read served from the helper's cache showed the screen before it
             rows = notification_rows(ui_dump(fresh=True))
@@ -5149,6 +5149,17 @@ def cmd_notifications(args):
                 i, len(rows), max([y for _t, y in rows] or [0])))
             if not rows and i == 0:
                 time.sleep(0.6)  # shade still opening: look once more
+                continue
+            if not rows and not reset:
+                # the shade drew nothing: SystemUI can stick with its shade
+                # window focused and nothing on it (Oct 7: neither the
+                # command nor a finger's pull opened it, until quick
+                # settings opened and closed); that, once, and a new look
+                reset = True
+                _trace("the shade showed nothing; quick settings open and closed, and the shade again")
+                adb_or_ensure("shell", "cmd statusbar expand-settings; sleep 0.5; cmd statusbar collapse; "
+                                       "sleep 0.3; cmd statusbar expand-notifications")
+                settle_only(idle_ms=IDLE_ACT_MS, delay=0.2)
                 continue
             fresh = [t for t, _y in rows if t not in lines]
             if not fresh:
