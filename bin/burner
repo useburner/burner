@@ -5129,10 +5129,17 @@ def cmd_notifications(args):
     place the words are."""
     # The scrcpy helper's open connection wakes the screen and pulls the
     # shade down in a few milliseconds; else one adb call does both (about
-    # a second over the link). The first dump takes about as long as the
-    # shade does to open, so there is no sleep.
-    if not _shade("shade"):
-        adb_or_ensure("shell", "input keyevent 224; cmd statusbar expand-notifications")
+    # a second over the link). Closed first: SystemUI can keep a stale
+    # "open" shade, its window focused and nothing drawn, and an expand
+    # then does nothing, while a collapse and an expand open it (Oct 7).
+    if _shade("collapse"):
+        time.sleep(0.15)  # the collapse lands before the expand
+        opened = _shade("shade")
+    else:
+        opened = False
+    if not opened:
+        adb_or_ensure("shell", "input keyevent 224; cmd statusbar collapse; sleep 0.15; "
+                               "cmd statusbar expand-notifications")
     u2_invalidate()  # a dump cached before the shade opened would show no rows
     # the shade drawn to its end before the first read: a read 0.6s in
     # caught it still opening, one notification of eighteen, and the list
@@ -5153,12 +5160,11 @@ def cmd_notifications(args):
             if not rows and not reset:
                 # the shade drew nothing: SystemUI can stick with its shade
                 # window focused and nothing on it (Oct 7: neither the
-                # command nor a finger's pull opened it, until quick
-                # settings opened and closed); that, once, and a new look
+                # command nor a finger's pull opened it, until it was
+                # closed and opened again); that, once, and a new look
                 reset = True
-                _trace("the shade showed nothing; quick settings open and closed, and the shade again")
-                adb_or_ensure("shell", "cmd statusbar expand-settings; sleep 0.5; cmd statusbar collapse; "
-                                       "sleep 0.3; cmd statusbar expand-notifications")
+                _trace("the shade showed nothing; closed and opened again")
+                adb_or_ensure("shell", "cmd statusbar collapse; sleep 0.4; cmd statusbar expand-notifications")
                 settle_only(idle_ms=IDLE_ACT_MS, delay=0.2)
                 continue
             fresh = [t for t, _y in rows if t not in lines]

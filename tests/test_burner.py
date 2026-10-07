@@ -4328,8 +4328,7 @@ class NotificationsTests(OfflineTestCase):
         self.assertEqual(rc, 0, err.getvalue())
         self.assertIn("1 notification", out.getvalue())
         self.assertEqual([c[0][1] for c in adb.call_args_list],
-                         ["cmd statusbar expand-settings; sleep 0.5; cmd statusbar collapse; "
-                          "sleep 0.3; cmd statusbar expand-notifications"])
+                         ["cmd statusbar collapse; sleep 0.4; cmd statusbar expand-notifications"])
         # still nothing after the reset: "no notifications", one reset only
         adb.reset_mock()
         pages[:] = [[], [], [], []]
@@ -4380,7 +4379,8 @@ class NotificationsTests(OfflineTestCase):
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_notifications(self.parse(["notifications"]))
         self.assertEqual(rc, 0, err.getvalue())
-        self.assertEqual([c[0][0] for c in sc.call_args_list], ["wake", "shade", "collapse"])
+        # closed first (a stale "open" shade ignores an expand, Oct 7), then opened
+        self.assertEqual([c[0][0] for c in sc.call_args_list], ["collapse", "wake", "shade", "collapse"])
         adb.assert_not_called()
         self.assertIn("Wispr Flow: dictation ready", out.getvalue())
         self.assertTrue(all(c.kwargs.get("fresh") for c in pc.ui_dump.call_args_list))  # never the cache
@@ -4391,7 +4391,8 @@ class NotificationsTests(OfflineTestCase):
             rc = pc.cmd_notifications(self.parse(["notifications"]))
         self.assertEqual(rc, 0, err.getvalue())
         self.assertEqual([c[0] for c in adb.call_args_list],
-                         [("shell", "input keyevent 224; cmd statusbar expand-notifications"),
+                         [("shell", "input keyevent 224; cmd statusbar collapse; sleep 0.15; "
+                                    "cmd statusbar expand-notifications"),
                           ("shell", "cmd", "statusbar", "collapse")])
 
 
