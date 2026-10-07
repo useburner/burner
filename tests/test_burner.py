@@ -1925,7 +1925,18 @@ class SetupWizardTests(OfflineTestCase):
         # whole parts of the name first: Google Home's package holds
         # "chromecast", which listed it for "google chrome" (Oct 7)
         home = ["com.android.chrome", "com.google.android.apps.chromecast.app", "com.wispr.flowapp"]
-        self.assertEqual(pc.app_match(home, "google chrome"), (["com.android.chrome"], ["chrome"]))
+        # both, and no note: which one is meant is the user's to say
+        self.assertEqual(pc.app_match(home, "google chrome"),
+                         (["com.android.chrome", "com.google.android.apps.chromecast.app"], None))
+        # review, Oct 7: Microsoft's authenticator alone, with "no app holds
+        # every word", while Google's was installed (authenticator2)
+        auth = ["com.azure.authenticator", "com.google.android.apps.authenticator2"]
+        self.assertEqual(pc.app_match(auth, "google authenticator"),
+                         (["com.azure.authenticator", "com.google.android.apps.authenticator2"], None))
+        self.assertEqual(pc.app_match(["com.android.vending", "com.example.store"], "google play store"),
+                         (["com.android.vending"], None))  # "play store" as one phrase
+        self.assertEqual(pc.app_match(["com.wallet.crypto.trustapp"], "google wallet"),
+                         (["com.wallet.crypto.trustapp"], ["wallet"]))  # no Google one: said
         self.assertEqual(pc.app_matches(home, "chrome"), ["com.android.chrome"])
         self.assertEqual(pc.app_matches(home, "chromecast"), ["com.google.android.apps.chromecast.app"])
         self.assertEqual(pc.app_matches(home, "wispr flow"), ["com.wispr.flowapp"])  # inside a part, after
@@ -5960,6 +5971,17 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(len(batches), 2)
         self.assertEqual(mod.words_changed(SAMPLE_XML, results), [("-", "Hello"), ("+", "Search results")])
         self.assertEqual(mod.words_changed(SAMPLE_XML, moved), [])
+        # typed text never goes into the log with a failed act's arguments
+        # (review, Oct 7)
+        self.assertEqual(mod.log_arg('{"set_text": "hunter2-secret", "field": "Password"}'),
+                         '{"set_text": "<14 characters>", "field": "Password"}')
+        self.assertEqual(mod.log_arg("cached"), "cached")
+        lines = []
+        failing = mock.Mock(side_effect=RuntimeError("act failed after sending: the field was tapped"))
+        with mock.patch.object(mod, "log", lambda *a: lines.append(" ".join(str(x) for x in a))),                 mock.patch.object(dm, "cmd_act", failing), self.assertRaises(RuntimeError):
+            dm.handle('act {"set_text": "hunter2-secret", "field": "Password", "idle": 1200}')
+        self.assertIn("<14 characters>", " ".join(lines))
+        self.assertNotIn("hunter2", " ".join(lines))
         # a field's words never: a password its eye button shows (review, Oct 7)
         pw = SAMPLE_XML.replace('content-desc="Search"', 'content-desc="Password"')
         shown = pw.replace('text="" resource-id="com.example:id/q"', 'text="hunter2" resource-id="com.example:id/q"')
@@ -6947,6 +6969,16 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(lines[0], "page: T (u), 40 characters")
         self.assertEqual(lines[1:], ["ab" + chr(0xFFFD) + "c[2Jd", "e"])
         self.assertIn("(cut at 9 of 40: `burner text --from 9` for the rest)", err.getvalue())
+        # Chrome in front, its page out of reach a moment ago ("not a
+        # page"): its rows, and why (review, Oct 7)
+        answers.append(pc.U2_NOT_FOUND)
+        self.allow("ui_dump", return_value=ET.fromstring(CHROME_XML))
+        self.allow("screen_dims", return_value=(1080, 2400))
+        with self.cap() as (out, err):
+            self.assertEqual(pc.cmd_text(self.parse(["text"])), 0)
+        self.assertIn("the page's own text couldn't be read; the screen's rows instead", err.getvalue())
+        # C1 controls and direction marks: out
+        self.assertEqual(pc._readable("a" + chr(0x9B) + "2Jb" + chr(0x202E) + "c" + chr(0x2066) + "d"), "a2Jbcd")
         # the page couldn't be read in Chrome: its rows, and why
         answers.append(None)
         self.allow("ui_dump", return_value=ET.fromstring(CHROME_XML))

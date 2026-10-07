@@ -53,6 +53,22 @@ LOG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
 LOG_CAP = 1 << 20  # the log starts over past this size
 
 
+def log_arg(arg):
+    """A command's argument as the log shows it: typed text as its length
+    (a failed act logged its arguments, a password sent to a field with
+    them, review Oct 7), cut to 80 characters. Pure."""
+    try:
+        spec = json.loads(arg)
+    except ValueError:
+        return arg[:80]
+    if isinstance(spec, dict):
+        for k in ("set_text", "text"):
+            if isinstance(spec.get(k), str):
+                spec[k] = "<%d characters>" % len(spec[k])
+        return json.dumps(spec)[:80]
+    return arg[:80]
+
+
 def own_log(path, mode="a"):
     """`path` opened to write, readable by its owner alone: it holds what
     the screens said (review, Oct 7). An older file is made so too."""
@@ -3180,7 +3196,7 @@ class U2Daemon:
             if cmd in NO_RETRY and not isinstance(e, ActNotSent):
                 # The phone may already have acted (the reply was lost, not
                 # the request). Replaying would tap or type twice.
-                log("%s %s: %s" % (cmd, arg[:80], err_text(e, 160)))
+                log("%s %s: %s" % (cmd, log_arg(arg), err_text(e, 160)))
                 raise
             if cmd in NO_RETRY:
                 # an act that never went out (its stream wasn't opened, or
@@ -3188,7 +3204,7 @@ class U2Daemon:
                 # once more, which can't make it happen twice (right after
                 # `burner update` the server wasn't listening, "AdbError:
                 # closed", and a start's reads went the slow way, Oct 6)
-                log("%s %s: %s; sending it once more" % (cmd, arg[:80], err_text(e, 160)))
+                log("%s %s: %s; sending it once more" % (cmd, log_arg(arg), err_text(e, 160)))
             # Maybe the on-device server died — reconnect once and retry.
             # The RLock makes concurrent handlers queue behind one reconnect.
             with self._lock:

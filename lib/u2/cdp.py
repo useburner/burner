@@ -1003,8 +1003,11 @@ SCROLL_JS = r"""
     box = best;
     if (!best) return {moved: 0, scroller: null, held: held};
     // a box that scrolls in the page's place is its layout, not a hold
-    // (html hidden, body the scroller: "held" for nothing, review Oct 7)
-    return {moved: go(best, false), scroller: best.tagName.toLowerCase(), held: false};
+    // (html hidden, body the scroller: "held" for nothing); one inside a
+    // fixed box is a pop-up's, over a page it holds (review, Oct 7)
+    let popup = false;
+    for (let a = best; a && a !== de && !popup; a = a.parentElement) popup = getComputedStyle(a).position === 'fixed';
+    return {moved: go(best, false), scroller: best.tagName.toLowerCase(), held: held && popup};
   };
   const r = once();
   if (r.moved !== 0 || !grow || where || dy <= 0) return r;
@@ -1051,20 +1054,28 @@ SCROLL_TO_JS = r"""
   // where the words are drawn: cut by every box around them that clips (a
   // carousel's slide off to the side, a list's row scrolled out of it);
   // null where such a box hides them for good (a 1px box for screen
-  // readers, a closed section)
+  // readers, a closed section). Not by an element's own box when it is
+  // named so (its aria-label, alt or title); not by the boxes between an
+  // absolutely placed element and the box it is placed in (a dropdown
+  // out of an overflow:hidden bar); none above a fixed one, which no
+  // scroll moves (c.fixed)
   const drawn = c => {
     if (c.drawn !== undefined) return c.drawn;
     const r = c.rect;
-    let t = r.top, b = r.bottom, l = r.left, rt = r.right;
-    for (let a = c.range ? c.el : c.el.parentElement; a && a !== de; a = a.parentElement) {
+    let t = r.top, b = r.bottom, l = r.left, rt = r.right, until = null;
+    c.fixed = false;
+    for (let a = c.el; a && a !== de; a = a.parentElement) {
       const s = getComputedStyle(a);
-      if ((s.overflowX !== 'visible' || s.overflowY !== 'visible') && (a !== document.body || bodyClips)) {
+      if (a === until) until = null;
+      if (!until && (a !== c.el || c.range) && (s.overflowX !== 'visible' || s.overflowY !== 'visible')
+          && (a !== document.body || bodyClips)) {
         const k = a.getBoundingClientRect();
         if (k.width < 2 || k.height < 2) return (c.drawn = null);
         if (s.overflowX !== 'visible') { l = Math.max(l, k.left); rt = Math.min(rt, k.right); }
         if (s.overflowY !== 'visible') { t = Math.max(t, k.top); b = Math.min(b, k.bottom); }
       }
-      if (s.position === 'fixed') break;  // the boxes above it don't hold it
+      if (s.position === 'fixed') { c.fixed = true; break; }
+      if (s.position === 'absolute' && !until) until = a.offsetParent;
     }
     return (c.drawn = {top: t, bottom: b, left: l, right: rt});
   };
@@ -1085,40 +1096,44 @@ SCROLL_TO_JS = r"""
     return null;
   };
   const measure = c => { c.rect = (c.range || c.el).getBoundingClientRect(); c.drawn = undefined; return c; };
+  // the start of what holds the words, as drawn (not a hidden copy's
+  // words); an element named so, by that name
   const say = c => {
-    const s = (c.el.textContent || c.el.getAttribute('aria-label') || c.el.getAttribute('alt')
-      || c.el.getAttribute('title') || '').replace(/\s+/g, ' ').trim();
+    const name = c.el.getAttribute('aria-label') || c.el.getAttribute('alt') || c.el.getAttribute('title');
+    const s = ((c.range ? c.el.innerText || c.el.textContent : name || c.el.innerText) || '').replace(/\s+/g, ' ').trim();
     return s.length > 80 ? s.slice(0, 79) + '\u2026' : s;
   };
   let other = null, hidden = null;
   for (const want of label.split('||').map(squash).filter(Boolean)) {
-    // the elements whose own text holds the words, or whose inline parts
-    // do ("Pre<b>heat</b> oven"), each looked at once; and those named so
-    const hits = new Set(), checked = new Set(), named = new Set();
+    // the elements whose own text holds the words (own), or whose parts
+    // do ("Pre<b>heat</b> oven", "<span>Chocolate</span> <span>Cake</span>":
+    // joined), each looked at once; and those named so
+    const own = new Set(), joined = new Set(), checked = new Set(), named = new Set();
     const tw = texts(document.body);
     for (let t = tw.nextNode(); t; t = tw.nextNode()) {
       const p = t.parentElement;
-      if (!p || !t.nodeValue.trim()) continue;
-      if (squash(t.nodeValue).includes(want)) hits.add(p);
+      if (!p) continue;
+      if (t.nodeValue.trim() && squash(t.nodeValue).includes(want)) own.add(p);
       else if (!checked.has(p)) {
         checked.add(p);
         const all = p.textContent;
-        if (all.length < 1000 && squash(all).includes(want)) hits.add(p);
+        if (all.length < 1000 && squash(all).includes(want)) joined.add(p);
       }
     }
     for (const el of document.body.querySelectorAll('[aria-label],[alt],[title]'))
-      if (squash(el.getAttribute('aria-label') || el.getAttribute('alt') || el.getAttribute('title')).includes(want)) {
-        hits.add(el);
+      if (squash(el.getAttribute('aria-label') || el.getAttribute('alt') || el.getAttribute('title')).includes(want))
         named.add(el);
-      }
-    // the innermost: a box holding one that holds the words is not where they are
+    // those shown; of them, a box around another is not where the words
+    // are, unless its own text holds them (a hidden copy inside, a 1px
+    // label for screen readers, leaves the words of the box itself)
+    const hits = new Set([...own, ...joined, ...named].filter(shown));
     const outer = new Set();
     for (const h of hits) for (let a = h.parentElement; a && !outer.has(a); a = a.parentElement) outer.add(a);
     const cands = [];
     for (const el of hits) {
-      if (outer.has(el) || !shown(el)) continue;
+      if (outer.has(el) && !own.has(el)) continue;
       let n = 0;
-      if (!named.has(el)) {
+      if (own.has(el) || joined.has(el)) {
         // the words themselves: a long paragraph on the screen can hold them far below it
         const nodes = [];
         let all = '';
@@ -1146,13 +1161,16 @@ SCROLL_TO_JS = r"""
     if (!cands.length) continue;
     const here = cands.find(inView);
     if (here) return {found: true, moved: 0, used: want, text: say(here)};
-    // beside the screen (a slide off to the side, a row a list holds out
-    // of view), else the nearest ahead
-    const go = cands.find(c => c.rect.bottom > 0 && c.rect.top < vh && drawn(c))
-      || cands.filter(c => up ? c.rect.bottom <= 0 : c.rect.top >= vh)
-        .sort((a, b) => up ? b.rect.bottom - a.rect.bottom : a.rect.top - b.rect.top).find(drawn);
-    if (!go) {
-      const back = cands.find(c => (up ? c.rect.top >= vh : c.rect.bottom <= 0) && drawn(c));
+    // what a scroll can bring: beside the screen (a slide off to the
+    // side, a row a list holds out of view), then the nearest ahead; not
+    // what a box hides for good or what is fixed to the screen (a closed
+    // menu off its edge)
+    const can = c => drawn(c) && !c.fixed;
+    const tries = cands.filter(c => c.rect.bottom > 0 && c.rect.top < vh && can(c)).concat(
+      cands.filter(c => (up ? c.rect.bottom <= 0 : c.rect.top >= vh) && can(c))
+        .sort((a, b) => up ? b.rect.bottom - a.rect.bottom : a.rect.top - b.rect.top));
+    if (!tries.length) {
+      const back = cands.find(c => (up ? c.rect.top >= vh : c.rect.bottom <= 0) && can(c));
       if (back && !other) {
         // only on the other side; and how far the page goes on this way
         // (one that ends close by may load more as it is scrolled: a feed)
@@ -1163,19 +1181,25 @@ SCROLL_TO_JS = r"""
       } else if (!back && !hidden) hidden = {found: false, hidden: true, used: want};
       continue;
     }
-    const top = go.rect.top;
-    go.el.scrollIntoView({block: go.rect.top < vh && go.rect.bottom > 0 ? 'nearest' : 'center',
-                          inline: 'nearest', behavior: 'instant'});
-    if (!inView(measure(go))) {
-      // a box taller than the screen: the words themselves to its middle
-      const sc = scrollerOf(go.range ? go.el : go.el.parentElement || go.el);
-      const box = sc ? sc.getBoundingClientRect() : {top: 0, height: vh};
-      (sc || window).scrollBy({top: go.rect.top + go.rect.height / 2 - (box.top + box.height / 2), behavior: 'instant'});
-      measure(go);
+    // each in turn, the page put back after one no scroll brought into view
+    const x0 = scrollX, y0 = scrollY;
+    for (const go of tries.slice(0, 4)) {
+      const top = go.rect.top, sc = scrollerOf(go.range ? go.el : go.el.parentElement || go.el);
+      const at = sc && [sc.scrollLeft, sc.scrollTop];
+      go.el.scrollIntoView({block: go.rect.top < vh && go.rect.bottom > 0 ? 'nearest' : 'center',
+                            inline: 'nearest', behavior: 'instant'});
+      if (!inView(measure(go))) {
+        // a box taller than the screen: the words themselves to its middle
+        const box = sc ? sc.getBoundingClientRect() : {top: 0, height: vh};
+        (sc || window).scrollBy({top: go.rect.top + go.rect.height / 2 - (box.top + box.height / 2), behavior: 'instant'});
+        measure(go);
+      }
+      if (inView(go)) return {found: true, moved: Math.round(top - go.rect.top), used: want, text: say(go)};
+      window.scrollTo({left: x0, top: y0, behavior: 'instant'});
+      if (at) sc.scrollTo({left: at[0], top: at[1], behavior: 'instant'});
+      for (const c of tries) measure(c);
     }
-    const moved = Math.round(top - go.rect.top);
-    if (inView(go)) return {found: true, moved: moved, used: want, text: say(go)};
-    if (!hidden) hidden = {found: false, hidden: true, used: want, moved: moved};
+    if (!hidden) hidden = {found: false, hidden: true, used: want};
   }
   return other || hidden || {found: false};
 })

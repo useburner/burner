@@ -5648,21 +5648,37 @@ def app_match(pkgs, name):
     (review, Oct 7). The rules look for the words as whole parts of the
     package's name first, then inside them ("flow" in com.wispr.flowapp):
     "chrome" inside com.google.android.apps.chromecast.app listed Google
-    Home for "google chrome" (Oct 7). Pure."""
+    Home for "google chrome" (Oct 7). When the rule without the maker's
+    word decides, the apps holding every word inside their parts come
+    with it, and which one is meant is the user's to say ("google
+    authenticator": Microsoft's com.azure.authenticator, and Google's
+    com.google.android.apps.authenticator2, review Oct 7); the words
+    returned are None then. Pure."""
     words = name.lower().split()
     if not words:
         return [], None
-    rules = [[APP_WORDS.get(" ".join(words), "".join(words))]]
+    rules, known = [[APP_WORDS.get(" ".join(words), "".join(words))]], False
     if len(words) > 1:
         rules.append([APP_WORDS.get(w, w) for w in words])
-        rest = [APP_WORDS.get(w, w) for w in words if w not in APP_MAKER_WORDS]
-        if rest and rest != rules[-1]:
+        kept = [w for w in words if w not in APP_MAKER_WORDS]
+        # the words left as one phrase first ("google play store": "play
+        # store", the Play Store for sure: nothing to say of it)
+        known = " ".join(kept) in APP_WORDS
+        rest = [APP_WORDS[" ".join(kept)]] if known else [APP_WORDS.get(w, w) for w in kept]
+        if kept and rest != rules[-1]:
             rules.append(rest)
-    for part_of in (lambda n, p: "." + n + "." in "." + p + ".", lambda n, p: n in p):
+
+    def holding(need, part_of):
+        return [p for p in pkgs if all(part_of(n, p.lower()) for n in need)]
+    inside = lambda n, p: n in p
+    for part_of in (lambda n, p: "." + n + "." in "." + p + ".", inside):
         for i, need in enumerate(rules):
-            hits = [p for p in pkgs if all(part_of(n, p.lower()) for n in need)]
+            hits = holding(need, part_of)
+            if hits and i == 2:
+                every = [p for p in holding(rules[1], inside) if p not in hits]
+                return hits + every, (None if every or known else need)
             if hits:
-                return hits, (need if i == 2 else None)
+                return hits, None
     return [], None
 
 
@@ -7750,11 +7766,14 @@ TEXT_MAX = 20000  # characters `burner text` prints at a time (--max)
 
 def _readable(s):
     """`s` safe to print: line ends as newlines, other control characters
-    out, and a lone half of a two-part character (a broken page's text)
-    as the replacement mark, since it can't be written as UTF-8. Pure."""
+    out (C0 and C1, which some terminals act on, and the marks that turn
+    the direction of the text after them, review Oct 7), and a lone half
+    of a two-part character (a broken page's text) as the replacement
+    mark, since it can't be written as UTF-8. Pure."""
     s = s.replace("\r\n", "\n").replace("\r", "\n")
     return "".join(chr(0xFFFD) if 0xD800 <= ord(c) <= 0xDFFF else c for c in s
-                   if c in "\n\t" or not (ord(c) < 32 or ord(c) == 127))
+                   if c in "\n\t" or not (ord(c) < 32 or 127 <= ord(c) <= 159
+                                          or 0x202A <= ord(c) <= 0x202E or 0x2066 <= ord(c) <= 0x2069))
 
 
 def screen_text(nodes, h):
@@ -7812,8 +7831,10 @@ def cmd_text(args):
     root = ui_dump()
     _w, h = screen_dims()
     pkg = dump_package(root)
-    if out is None and pkg in WEB_APPS:
-        # the helper couldn't read the page: its rows, cut as rows are
+    if pkg in WEB_APPS:
+        # Chrome in front, and the helper couldn't read its page (failed,
+        # or out of reach a moment ago: "not a page", review Oct 7): its
+        # rows, cut as rows are
         print("burner: the page's own text couldn't be read; the screen's rows instead", file=sys.stderr)
     rows = screen_text(walk(root), h)
     text = _readable("\n".join(rows))
