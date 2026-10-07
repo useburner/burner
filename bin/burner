@@ -3419,11 +3419,13 @@ def type_via_adbkeyboard(text, field_xy=None, clear=False, clear_keys=20):
     return 0
 
 
-def _enter_after_typing(args):
+def _enter_after_typing(args, into_field=False):
     """`type --enter`: the Enter key after the text, in the same command (a
     search typed and submitted: `type` then `press enter` cost an agent's
-    turn, Oct 7), and the screen it ends on (see cmd_press)."""
-    return cmd_press(argparse.Namespace(key="ENTER", quiet=getattr(args, "quiet", False), force=False,
+    turn, Oct 7), and the screen it ends on (see cmd_press). into_field:
+    a text field just took the text, so the key goes without the look for
+    one (a read of its own, about 1s, Oct 7)."""
+    return cmd_press(argparse.Namespace(key="ENTER", quiet=getattr(args, "quiet", False), force=into_field,
                                         repeat=1, delay=120, ctrl=False, shift=False, alt=False, meta=False))
 
 
@@ -3450,7 +3452,7 @@ def cmd_type(args):
     def typed(status, root, note):
         # the typing's screen; with --enter, the key's instead
         if enter and status == "ok":
-            return _enter_after_typing(args)
+            return _enter_after_typing(args, into_field=True)
         return print_act(status, root, note, "typing")
     if use_unicode:
         nodes = walk(ui_dump())
@@ -3522,7 +3524,7 @@ def cmd_type(args):
         if out is not None:
             print("typed {} chars".format(len(args.text)))
             if enter:
-                return _enter_after_typing(args)
+                return _enter_after_typing(args, into_field=True)
             read_after(quiet=quiet)
             return 0
         if _u2_status == "lost":

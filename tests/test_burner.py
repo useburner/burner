@@ -6716,7 +6716,7 @@ class WebPathTests(OfflineTestCase):
         # then `press enter`, an agent's turn apart
         self.allow("u2_invalidate")
         self.allow("nav_record")
-        self.allow("_enter_has_a_field", return_value=True)
+        looked = self.allow("_enter_has_a_field", return_value=True)
         calls = []
 
         def u2(cmd, arg="", timeout=30):
@@ -6730,6 +6730,7 @@ class WebPathTests(OfflineTestCase):
         lines = out.getvalue().splitlines()
         self.assertEqual(lines[:2], ["typed 8 chars into Search or ask Play", "pressed ENTER"])
         self.assertEqual(sum(1 for l in lines if l.startswith("screen: ")), 1)  # the key's screen only
+        looked.assert_not_called()  # a field just took the text: no look for one (a read of its own)
         # a typing that failed presses nothing
         calls.clear()
 
