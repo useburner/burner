@@ -6385,6 +6385,46 @@ class WebPathTests(OfflineTestCase):
         keys.assert_not_called()
         self.assertNotIn("typed", out.getvalue())
 
+    def test_type_field_on_a_bar_taps_it_and_types_in_one_trip(self):
+        # Play Store, Oct 7: `type --field 'Search or ask Play'` took 5.9s,
+        # the CLI's tap, read and typing
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        bar = ('<hierarchy rotation="0"><node text="" class="android.widget.FrameLayout" package="com.android.vending" '
+               'bounds="[0,0][1080,2400]"><node text="" class="android.view.View" package="com.android.vending" '
+               'bounds="[50,450][1030,560]" clickable="true"><node text="Search or ask Play" '
+               'class="android.widget.TextView" package="com.android.vending" bounds="[150,470][900,540]"/></node>'
+               '<node text="Sign in" class="android.widget.Button" package="com.android.vending" '
+               'bounds="[50,700][500,800]" clickable="true"/></node></hierarchy>')
+        sent = []
+        dm._act_batch = lambda spec: sent.append(spec) or bar.encode()
+        dm._last_xml, dm._last_xml_t = bar, mod._time.monotonic()
+        dm._dump = lambda fresh=False, **kw: bar
+        dm.cmd_act(json.dumps({"set_text": "espn", "field": "Search or ask Play", "idle": 1200}))
+        self.assertEqual((sent[0]["tap_first"], sent[0]["field_selector"], sent[0]["opens_box"]),
+                         ([525, 505], mod.focused_field_selector(), "Search or ask Play"))
+        # a secret's label, a row that takes no tap, a field with the focus: the CLI's way
+        self.assertIsNone(dm._bar_named(bar.replace("Search or ask Play", "Password"), "Password"))
+        self.assertIsNone(dm._bar_named(bar.replace('clickable="true"><node', 'clickable="false"><node'),
+                                        "Search or ask Play"))
+        self.assertIsNone(dm._bar_named(bar.replace("</node></hierarchy>", '<node text="" class="android.widget.'
+                                                    'EditText" package="com.android.vending" bounds="[50,900][900,980]" '
+                                                    'focused="true"/></node></hierarchy>'), "Search or ask Play"))
+        # no box after the tap: said in words that don't send the CLI to tap again
+        dm2 = EmptyScreenTests._daemon(self, mod)
+        dm2.d = _FakeServer([])
+        dm2._last_xml, dm2._last_xml_t = bar, mod._time.monotonic()
+        dm2._batch = lambda calls, timeout=45.0: [
+            RuntimeError("UiObjectNotFoundException") if m == "setText" else bar if m == "dumpWindowHierarchy" else True
+            for m, _p in calls]
+        with self.assertRaises(RuntimeError) as cm:
+            dm2._act_batch({"set_text": "espn", "tap_first": [525, 505], "field_selector": mod.focused_field_selector(),
+                            "opens_box": "Search or ask Play", "idle": 1200})
+        self.assertIn("'Search or ask Play' was tapped, and no text box had the focus after it", str(cm.exception))
+        self.assertNotIn("no editable field", str(cm.exception))
+
     def test_a_field_is_named_by_its_resource_id_last(self):
         # Google Maps, Oct 7: the search box read the query before, so
         # `type --field Search` found no field and took the slow way (9.2s)

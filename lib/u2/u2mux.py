@@ -3013,7 +3013,34 @@ class U2Daemon:
             log("no row reads %r; typing into the one field, which has the focus (%s)"
                 % (label, lone.get("rid") or lone["cls"]))  # its id: its text is what was typed
             return self._type_at_once(spec, lone)
+        bar = self._bar_named(xml, label) if now is None else None
+        if bar is not None:
+            # a bar that opens its box when tapped (the Play Store's "Search
+            # or ask Play"): tapped, and the text into the field with the
+            # focus then, in one batch (the CLI's tap, read and typing took
+            # 5.9s, Oct 7)
+            spec["tap_first"] = list(bar["center"])
+            spec["field_selector"] = focused_field_selector()
+            spec["opens_box"] = label
+            return self._act_batch(spec)
         raise RuntimeError(self.NO_FIELD_TAP)
+
+    @staticmethod
+    def _bar_named(xml, label):
+        """The one row on a read that reads `label`, takes a tap (itself or
+        a box around it) and isn't a field, when no field has the focus
+        and the label isn't a secret's; None otherwise."""
+        if any(w in SECRET_WORDS for w in re.findall(r"[a-z]+", plain_words(label).lower())):
+            return None
+        try:
+            if any(n["field"] and n["focused"] for n in iter_nodes(xml)):
+                return None
+            node, _alt = label_node(xml, label)
+        except Exception:
+            return None
+        if node["field"] or inert_row(xml, node):
+            return None
+        return node
 
     def _type_at_once(self, spec, node):
         """The text into this focused field in one batch: "not sent" when
@@ -3083,9 +3110,18 @@ class U2Daemon:
                 # by its label first; a second tap on a field is harmless)
                 err = later[0]
                 gone = "UiObjectNotFound" in str(err) or "-32002" in str(err)
+                if spec.get("opens_box"):
+                    # a bar was tapped, not a field: said so, in words the CLI
+                    # doesn't take for "type another way" (no second tap)
+                    raise RuntimeError("act failed after sending: %r was tapped, and %s (%s)" % (
+                        spec["opens_box"], "no text box had the focus after it" if gone else "the typing failed",
+                        err_text(err, 120)))
                 raise RuntimeError("act failed after sending: the field was tapped; %s (%s)"
                                    % ("no editable field had the focus" if gone else "the typing failed",
                                       err_text(err, 120)))
+            if spec.get("opens_box") and any(calls[i][0] == "setText" and results[i] is False for i in acted):
+                raise RuntimeError("act failed after sending: %r was tapped, and the box after it didn't "
+                                   "take the text" % spec["opens_box"])
             if any(calls[i][0] == "setText" and results[i] is False for i in acted):
                 # the phone's setText answers false when the field didn't take
                 # the text: nothing was typed, and the CLI types another way
