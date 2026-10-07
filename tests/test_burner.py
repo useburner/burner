@@ -5239,6 +5239,7 @@ class WebPathTests(OfflineTestCase):
             front_page=lambda dev, current=None, **kw: _FakePage(), visible=lambda page, timeout=1.5: True,
             QUICK_PROBE_S=0.7,
             read=lambda page, cap=160: calls.append(("read",)) or WEB_SCREEN,
+            read_loaded=lambda page, screen, **kw: calls.append(("read_loaded",)) or screen,
             tap=tap, scroll=scroll)
         mod._CDP = fake
         self.addCleanup(setattr, mod, "_CDP", None)
@@ -6024,6 +6025,55 @@ class WebPathTests(OfflineTestCase):
         waits.clear()
         page = Late(cdp, {"FIND_JS": dict(found, href=""), "READ_JS": old})
         self.assertEqual((cdp.tap(page, "guest suite")["screen"], waits), (old, []))
+
+    def test_a_read_waits_for_rows_that_say_loading(self):
+        # Coinbase's Bitcoin page (Oct 7): the open's read had the price
+        # still "Loading", and the assistant took a screenshot to see it
+        cdp = _cdp()
+        row = lambda text, desc="": {"text": text, "desc": desc, "kind": "text", "l": 0, "t": 100, "w": 50, "h": 20}
+        price = dict(WEB_SCREEN, rows=WEB_SCREEN["rows"] + [row("$84,047.70")])
+        loading = dict(WEB_SCREEN, rows=WEB_SCREEN["rows"] + [row("Loading"), row("Loading\u2026"),
+                                                                row("", "Loading price chart")])
+        self.assertEqual(cdp.placeholders(loading), 3)
+        for words in ("Loading", "loading...", "Please wait", "Loading \u2026"):
+            self.assertEqual(cdp.placeholders({"rows": [row(words)]}), 1, words)
+        # words about loading are content, and a label beside words is not a skeleton's
+        for text, desc in (("Loading dock for sale", ""), ("Bitcoin", "Loading"), ("", "Download"),
+                           ("Loadings", ""), ("", "Loadings")):
+            self.assertEqual(cdp.placeholders({"rows": [row(text, desc)]}), 0, (text, desc))
+        self.assertEqual(cdp.placeholders({}), 0)
+        clock = [0.0]
+
+        def sleep(s):
+            clock[0] += s
+        with mock.patch.object(cdp.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(cdp.time, "sleep", side_effect=sleep):
+            # the open: read again until the rows are filled; a read
+            # between documents (no rows) doesn't stand
+            page = _ScriptedPage(cdp, {"READ_JS": [loading, dict(loading, rows=[]), loading, price]})
+            r = cdp.navigate(page, "https://www.coinbase.com/price/bitcoin")
+            self.assertEqual(r["screen"]["rows"], price["rows"])
+            self.assertEqual(r["screen"]["busy"][:2], [3, 0])
+            self.assertEqual([c for c in page.calls if c == ("eval", "READ_JS")], [("eval", "READ_JS")] * 4)
+            # filled at once: one read, nothing added
+            page = _ScriptedPage(cdp, {"READ_JS": price})
+            self.assertEqual(cdp.navigate(page, "https://example.com")["screen"], price)
+            # never filled: BUSY_CAP_S at most, the last read printed
+            clock[0] = 0.0
+            page = _ScriptedPage(cdp, {"READ_JS": loading})
+            t0 = clock[0]
+            r = cdp.navigate(page, "https://example.com")
+            self.assertEqual(r["screen"]["busy"][:2], [3, 3])
+            self.assertLessEqual(clock[0] - t0, cdp.BUSY_CAP_S + 0.2 + cdp.BUSY_POLL_S + 0.01)
+            # a tap's read waits the same way
+            found = {"found": True, "count": 1, "label": "price", "x": 300, "y": 400, "url": "u"}
+            page = _ScriptedPage(cdp, {"FIND_JS": found, "READ_JS": [loading, price]})
+            r = cdp.tap(page, "Price")
+            self.assertEqual(r["screen"]["rows"], price["rows"])
+            # a read again that fails leaves the last one standing
+            page = _ScriptedPage(cdp, {"READ_JS": loading})
+            page.eval = mock.Mock(side_effect=RuntimeError("the document went away"))
+            self.assertEqual(cdp.read_loaded(page, loading)["rows"], loading["rows"])
 
     def test_tap_reads_the_page_in_the_touch_round_trip(self):
         cdp = _cdp()
@@ -8270,7 +8320,8 @@ class CoordinateTapTests(OfflineTestCase):
         dm._web_retry_at = mod._time.monotonic() + 100  # a cooldown that a launch overrides
         xml = dm.cmd_dump("page https://www.espn.com/nfl/").decode()
         self.assertIn('text="Box Score"', xml)
-        self.assertEqual(calls, [("front_page", True, "https://www.espn.com/nfl/"), ("read",)])  # quick: short bounds, no sweep
+        # quick: short bounds, no sweep; the link's rows that say "Loading" waited for
+        self.assertEqual(calls, [("front_page", True, "https://www.espn.com/nfl/"), ("read",), ("read_loaded",)])
         self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])
         # a Chrome still starting: the launcher in front twice (no tab asked),
         # then Chrome refusing once, then the page; Chrome's bar is the hint

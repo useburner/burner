@@ -1007,6 +1007,14 @@ def window_over(windows_xml, rect, front_pkg):
     return None
 
 
+def _log_busy(screen):
+    """Say in the log that a page read waited on its rows that said
+    "Loading" (see cdp.read_loaded): how many, how long, how many left."""
+    busy = (screen or {}).get("busy")
+    if busy:
+        log("web read: %d rows said Loading; read again for %.2fs, %d left" % (busy[0], busy[2], busy[1]))
+
+
 class _Look(threading.Thread):
     """A read of the phone's windows alone (WINDOWS_DEPTH deep: small and
     quick on the phone), taken while the page is asked, so that a window
@@ -1777,20 +1785,23 @@ class U2Daemon:
         hidden now (the action opened another app or tab). A window the
         action opened over the page (a permission dialog) is not seen
         here; the next read of the screen sees it (see _page_read)."""
+        _log_busy(screen)
         xml = self._page_xml(screen)
         if xml is None:
             with _t("dump rpc (page hidden)"):
                 xml = read_screen(self.d)
         return xml
 
-    def _page_read(self, assume_chrome=False, hint=None):
+    def _page_read(self, assume_chrome=False, hint=None, loaded=False):
         """The page in Chrome as a screen read, or None (see _page). The
         screen reader's tree lags a finger scroll on a heavy page by
         seconds and comes back empty for a while (espn.com, Oct 4); the
         page itself has the current layout. Not with a window of another
         app over the page (see _Look and window_over: the notification
         shade, a permission dialog): the page can't see it, and the
-        screen reader's read is the screen then."""
+        screen reader's read is the screen then. loaded: a link just
+        opened, read once its rows that say "Loading" are filled (see
+        cdp.read_loaded)."""
         page = self._page(assume_chrome, hint)
         if page is None:
             return None
@@ -1801,10 +1812,13 @@ class U2Daemon:
         try:
             with _t("web read"):
                 screen = _cdp().read(page)
+                if loaded:
+                    screen = _cdp().read_loaded(page, screen)
         except Exception as e:
             self._web = None
             log("reading the page failed (%s); reading the screen" % err_text(e, 100))
             return None
+        _log_busy(screen)
         over = look.over()
         if over is not None:
             log("a window over the page (%s %r): the screen reader's read" % over)
@@ -1841,7 +1855,7 @@ class U2Daemon:
         with self._lock:
             gen, t0 = self._gen, _time.monotonic()
             self._front_look = None
-            xml = self._page_read(assume_chrome=page_first, hint=hint)
+            xml = self._page_read(assume_chrome=page_first, hint=hint, loaded=page_first)
             if xml is None and page_first:
                 return ""
             if xml is None:

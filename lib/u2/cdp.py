@@ -1109,6 +1109,10 @@ def page_xml(screen, top, screen_h=0, pkg="com.android.chrome"):
 QUIET_CAP_S = 0.5  # a wait for a quiet DOM, at most: a live page never stops changing
 LOAD_CAP_S = 1.8   # a wait for a page that is loading, at most (the caller
                    # reads again when the screen looks half drawn)
+BUSY_CAP_S = 3.0   # a read whose rows still stand in for content coming is
+                   # read again this long at most (a skeleton that never fills
+                   # costs no more)
+BUSY_POLL_S = 0.25
 VISIBLE_FOR_S = 45.0  # a page's read says whether its document is visible: that proof
                       # holds this long without another (no question of its own), and a
                       # read that says hidden ends it
@@ -1148,6 +1152,49 @@ def settle(page, idle_ms=1200, poll_s=0.15, quiet_s=0.3, url=None, loading=False
         if now - t0 >= limit:
             return probe
         time.sleep(poll_s)
+
+
+# The words of a row that stands in for content still coming: a
+# skeleton's or a spinner's ("Loading", "Loading…", "Please wait"), and a
+# label of one on a row with no words of its own ("Loading price chart").
+_BUSY_WORDS = re.compile(r"^(loading|please wait)\s*(\.{1,3}|\u2026)?$", re.I)
+_BUSY_LABEL = re.compile(r"^loading\b", re.I)
+
+
+def placeholders(screen):
+    """How many rows of a page read (see read) stand in for content still
+    coming (see _BUSY_WORDS). Pure."""
+    n = 0
+    for r in (screen or {}).get("rows") or []:
+        text, desc = (r.get("text") or "").strip(), (r.get("desc") or "").strip()
+        if _BUSY_WORDS.match(text) or (not text and _BUSY_LABEL.match(desc)):
+            n += 1
+    return n
+
+
+def read_loaded(page, screen, cap_s=BUSY_CAP_S, poll_s=BUSY_POLL_S):
+    """`screen`, a read just taken; or, when rows of it stand in for
+    content still coming (see placeholders), the page read again until
+    they are gone, `cap_s` at most. Coinbase's price page was read with
+    its price still "Loading" (Oct 7), and the assistant took a
+    screenshot to see the price. A read again that fails, or holds no
+    rows (the page between documents), leaves the last one standing. The
+    read returned carries "busy": [such rows at first, rows left, seconds
+    waited] when it waited."""
+    first = placeholders(screen)
+    if not first:
+        return screen
+    t0, left = time.monotonic(), first
+    while left and time.monotonic() - t0 < cap_s:
+        time.sleep(poll_s)
+        try:
+            again = read(page)
+        except Exception:
+            break
+        if again.get("rows"):
+            screen, left = again, placeholders(again)
+    screen = dict(screen, busy=[first, left, round(time.monotonic() - t0, 2)])
+    return screen
 
 
 def touch(page, x, y, then=()):
@@ -1275,6 +1322,7 @@ def tap(page, label, index=None, idle_ms=1200):
     if screen is None or page.loading:
         probe = after_touch(page, hit.get("url"), idle_ms)
         screen, ready = read(page), probe.get("ready")
+    screen = read_loaded(page, screen)
     return {"found": True, "count": 1, "label": hit.get("label"), "how": how,
             "screen": screen, "ready": ready,
             # where the touch went, for the helper's log: a failed tap
@@ -1315,7 +1363,7 @@ def touch_at(page, x, y, screen, top, idle_ms=1200):
     if shot is None or page.loading:
         probe = after_touch(page, None, idle_ms)
         shot, ready = read(page), probe.get("ready")
-    return {"screen": shot, "ready": ready, "how": how}
+    return {"screen": read_loaded(page, shot), "ready": ready, "how": how}
 
 
 def touch_hit(page, hit, then=()):
@@ -1347,7 +1395,8 @@ def touch_hit(page, hit, then=()):
 
 def navigate(page, url, idle_ms=1000):
     """Load `url` in this page (Chrome's current tab), wait for it to be
-    parsed and quiet (LOAD_CAP_S at most), read. Raises NotSent when the
+    parsed and quiet (LOAD_CAP_S at most), read (once its rows that say
+    "Loading" are filled, see read_loaded). Raises NotSent when the
     page can't be asked to load it (nothing was sent: the caller opens
     the link its own way; sent twice, a one-time link is used up)."""
     try:
@@ -1361,7 +1410,7 @@ def navigate(page, url, idle_ms=1000):
               # server delays past the wait: the load is under way
     parsed = page.wait_parsed(max(LOAD_CAP_S, idle_ms / 1000.0))
     time.sleep(0.2)  # the first paint of a parsed page
-    return {"screen": read(page), "ready": "complete" if parsed else "loading"}
+    return {"screen": read_loaded(page, read(page)), "ready": "complete" if parsed else "loading"}
 
 
 # The focused field's content selected, so inserted text replaces it.
