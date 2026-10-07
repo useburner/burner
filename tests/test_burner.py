@@ -4107,6 +4107,12 @@ class LabelTapTests(OfflineTestCase):
         tc.assert_not_called()
         self.assertIn("tapped OK (label)", out.getvalue())
         self.assertIn("screen: com.example", out.getvalue())
+        # a row the words only named: the helper's read says its words
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30: SAMPLE_XML.replace(
+            '<hierarchy rotation="0">', '<hierarchy tapped="Search, Tab 2 of 4" rotation="0">'))
+        with self.cap() as (out, err):
+            self.assertEqual(pc.cmd_tap(self.parse(["tap", "Search"])), 0)
+        self.assertIn('tapped "Search, Tab 2 of 4" (label)', out.getvalue())
 
     def test_tap_reads_first_when_the_label_is_not_on_the_last_read(self):
         self.allow("wake_async", return_value=mock.Mock())
@@ -6102,6 +6108,68 @@ class WebPathTests(OfflineTestCase):
                                     ({"tap": [250, 450]}, SAMPLE_XML, "")):
             run(spec, after, before=before)
             self.assertEqual(len(batches), 1, spec)
+
+    def test_a_tap_by_words_takes_a_row_they_name_in_one_trip(self):
+        # Spotify, Oct 7: `tap Search`, with the tab described "Search, Tab
+        # 2 of 4", was "not on the last read" in the helper after a fresh
+        # read; the CLI planned it on that read and tapped by its place
+        mod = _u2mux()
+        tabs = """<hierarchy rotation="0">
+  <node text="" class="android.widget.FrameLayout" package="com.spotify.music" bounds="[0,0][1080,2400]" clickable="false" enabled="true">
+    <node text="Good evening" class="android.widget.TextView" package="com.spotify.music" bounds="[40,200][700,300]" clickable="false" enabled="true"/>
+    <node text="Search with your voice" class="android.widget.Button" package="com.spotify.music" bounds="[700,200][1040,300]" clickable="true" enabled="true"/>
+    <node text="" content-desc="Home, Tab 1 of 4" class="android.widget.FrameLayout" package="com.spotify.music" bounds="[0,2150][270,2300]" clickable="true" enabled="true" selected="true"/>
+    <node text="" content-desc="Search, Tab 2 of 4" class="android.widget.FrameLayout" package="com.spotify.music" bounds="[270,2150][540,2300]" clickable="true" enabled="true"/>
+    <node text="" content-desc="Your Library, Tab 3 of 4" class="android.widget.FrameLayout" package="com.spotify.music" bounds="[540,2150][810,2300]" clickable="true" enabled="true"/>
+  </node>
+</hierarchy>"""
+        with self.assertRaises(RuntimeError) as cm:
+            mod.label_node(tabs, "Search")  # exact words only, as a field's label or a bar's
+        self.assertEqual(str(cm.exception), "not on the last read")
+        node, alt = mod.label_node(tabs, "Search", loose=True)
+        self.assertEqual((node["desc"], alt, mod.loose_words(node, alt)),
+                         ("Search, Tab 2 of 4", "Search", "Search, Tab 2 of 4"))
+        self.assertEqual(mod.selector_for(node, alt)["description"], "Search, Tab 2 of 4")
+        self.assertEqual(mod.label_node(tabs, "Find || search", loose=True)[1], "search")
+        # the CLI's own plan names the same row
+        plan = pc.plan_tap(pc.walk(ET.fromstring(tabs)), 1080, 2400, text="Search")
+        self.assertEqual((plan["action"], plan["node"]["desc"]), ("tap", "Search, Tab 2 of 4"))
+        # an exact row first; a row the words only name it is not
+        exact = tabs.replace('text="Good evening"', 'text="Search"')
+        self.assertEqual(mod.label_node(exact, "Search", loose=True)[0]["text"], "Search")
+        self.assertIsNone(mod.loose_words(*mod.label_node(exact, "Search", loose=True)))
+        # anything less is the CLI's to plan: two rows named, no row named
+        # ("Search with your voice" is not), a field holding the words
+        for screen in (tabs.replace("Your Library, Tab 3 of 4", "Search, Tab 3 of 4"),
+                       tabs.replace("Search, Tab 2 of 4", "Browse, Tab 2 of 4"),
+                       tabs.replace('text="" content-desc="Search, Tab 2 of 4" class="android.widget.FrameLayout"',
+                                    'text="Search, Tab 2 of 4" class="android.widget.EditText"').replace(
+                           "Search with your voice", "Voice")):
+            with self.assertRaises(RuntimeError) as cm:
+                mod.label_node(screen, "Search", loose=True)
+            self.assertEqual(str(cm.exception), "not on the last read")
+        # a row with its words as text: its text is the selector
+        inbox = tabs.replace('text="" content-desc="Home, Tab 1 of 4"', 'text="Inbox, 3 unread"')
+        node, alt = mod.label_node(inbox, "Inbox", loose=True)
+        sel = mod.selector_for(node, alt)
+        self.assertEqual((sel["text"], sel["mask"]), ("Inbox, 3 unread", 1))
+        # in a tap: by its words at tap time, in the one trip, and the read
+        # says which row it was; the CLI says it
+        EmptyScreenTests.no_sleep(self, mod)
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([tabs], screen_on=True)
+        sent = []
+        after = tabs.replace("Good evening", "Browse all")
+        dm._batch = lambda calls, timeout=45.0: sent.append(calls) or [None, 1] + [None] * (len(calls) - 3) + [after]
+        dm._last_xml, dm._last_xml_t = tabs, mod._time.monotonic()
+        out = dm.cmd_act(json.dumps({"tap_label": "Search"}))
+        self.assertEqual([m for m, _ in sent[-1]], ["wakeUp", "count", "click", "waitForIdle", "dumpWindowHierarchy"])
+        self.assertEqual(sent[-1][2][1][0]["description"], "Search, Tab 2 of 4")
+        self.assertEqual(dm.d.calls, [])  # no read first
+        self.assertEqual(ET.fromstring(out).get("tapped"), "Search, Tab 2 of 4")
+        # a `type --field Search` next is not about a box this tab opened
+        self.assertEqual(dm._last_tap[0], "Search, Tab 2 of 4")
+        self.assertIsNone(ET.fromstring(dm.cmd_act(json.dumps({"tap_label": "Home, Tab 1 of 4"}))).get("tapped"))
 
     def test_a_tap_by_words_needs_one_row_with_those_exact_words(self):
         # the review of Oct 6: label_node picks a row by rules the phone's

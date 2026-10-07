@@ -1247,20 +1247,24 @@ def row_over(nodes, control, center, size=None):
     return cover
 
 
-def label_target(xml, label):
+def label_target(xml, label, loose=False):
     """The centre (x, y) of the one control on this read whose text or
-    description is `label` (see label_node)."""
-    node, _ = label_node(xml, label)
+    description is `label` (see label_node; with `loose`, a row the words
+    name)."""
+    node, _ = label_node(xml, label, loose)
     return tuple(node["center"])
 
 
 def selector_for(node, label):
     """The phone's own selector for this control: its exact text, else
-    its exact description (whichever carries `label`); the phone finds
-    it at tap time, so a read need not come first. The shape is
-    uiautomator2's Selector (text: mask 1, description: mask 64), built
-    here so that no import is needed. Pure."""
-    if plain_words(node["text"]).lower() == plain_words(label).lower():
+    its exact description (whichever carries `label`; for a row the
+    words only name, see loose_label_node, the one they were found in:
+    its text when it has any); the phone finds it at tap time, so a read
+    need not come first. The shape is uiautomator2's Selector (text: mask
+    1, description: mask 64), built here so that no import is needed.
+    Pure."""
+    low = plain_words(label).lower()
+    if plain_words(node["text"]).lower() == low or (node["text"] and plain_words(node["desc"]).lower() != low):
         key, value, mask = "text", node["text"], 1  # its own words: the phone matches them exactly
     else:
         key, value, mask = "description", node["desc"], 64
@@ -1305,22 +1309,24 @@ def selector_matches(xml, sel):
         return 0
 
 
-def label_node(xml, label):
+def label_node(xml, label, loose=False):
     """The one control on this read whose text or description is `label`
     (case-insensitive exact; "A || B" tries each): (its first row, the
     alternative that matched). A control drawn twice (see same_control)
     is one control, its first row's centre the tap point. A tap by
     coordinates injects a touch and looks nothing up: the server's click
     by selector threw a NullPointerException on a web node in Chrome
-    (espn.com, Oct 4). Raises RuntimeError when there is no such control,
-    more than one, its words are cut off at an edge (see cut_off), or
-    another row sits over it (see row_over), or the read can't be
-    parsed (empty, or cut)."""
+    (espn.com, Oct 4). With `loose` (a tap), when no row reads the words
+    exactly, a row they name (see loose_label_node). Raises RuntimeError
+    when there is no such control, more than one, its words are cut off
+    at an edge (see cut_off), or another row sits over it (see row_over),
+    or the read can't be parsed (empty, or cut)."""
     try:
         nodes = list(iter_nodes(xml or ""))
     except Exception as e:
         raise RuntimeError("the read can't be parsed (%s)" % err_text(e, 60))
-    for alt in [p.strip() for p in label.split("||") if p.strip()]:
+    alts = [p.strip() for p in label.split("||") if p.strip()]
+    for alt in alts:
         low = plain_words(alt).lower()
         hits = [n for n in nodes
                 if low in (plain_words(n["text"]).lower(), plain_words(n["desc"]).lower())]
@@ -1357,7 +1363,68 @@ def label_node(xml, label):
         if over is not None:
             raise RuntimeError("%r is under %r" % (alt, (over["text"] or over["desc"])[:40]))
         return controls[0][0], alt
+    named = loose_label_node(nodes, alts) if loose else None
+    if named is not None:
+        return named
     raise RuntimeError("not on the last read")
+
+
+def loose_label_node(nodes, alts):
+    """For a tap whose words no row reads exactly (see label_node): (the
+    row, the alternative) for the first alternative whose words name a
+    row, found as the CLI's plan_tap finds it: rows whose words (their
+    text, else their description) hold the words, never a status or
+    navigation bar icon (see bar_icon); of those not fields, the ones
+    the words name (see fuzzy_ok: Spotify's tab "Search, Tab 2 of 4" for
+    `tap Search`, Oct 7). One control, whole, with nothing over it; None
+    for anything else (more than one, a field the words may name, cut
+    off, covered): the CLI plans that tap itself. Pure."""
+    h = max((n["rect"][3] for n in nodes), default=0)
+
+    def words(n):
+        return plain_words(n["text"] or n["desc"]).lower()
+
+    for alt in alts:
+        low = plain_words(alt).lower()
+        rows = [n for n in nodes if low and low in words(n) and not bar_icon(n, h)]
+        if not rows:
+            continue
+        rows_not_fields = [n for n in rows if not (n["field"] or "autocomplete" in n["cls"])]
+        hits = [n for n in rows_not_fields if fuzzy_ok(alt, n["text"] or n["desc"])]
+        if not hits:
+            if len(rows_not_fields) < len(rows):
+                return None  # a field holds the words: the CLI's plan decides whether they name it
+            continue
+        controls = []  # one control drawn twice reads the same words twice (see plan_tap)
+        for n in hits:
+            for c in controls:
+                if words(c[0]) == words(n) and same_control(c[0], n):
+                    c.append(n)
+                    break
+            else:
+                controls.append([n])
+        if len(controls) != 1 or any(cut_off(n) for n in controls[0]):
+            return None
+        if row_over(nodes, controls[0], tuple(controls[0][0]["center"]), screen_size(nodes)) is not None:
+            return None
+        return controls[0][0], alt
+    return None
+
+
+def loose_words(node, alt):
+    """The row's own words when `alt` only names it (see
+    loose_label_node), else None. Pure."""
+    low = plain_words(alt).lower()
+    if low in (plain_words(node["text"]).lower(), plain_words(node["desc"]).lower()):
+        return None
+    return node["text"] or node["desc"]
+
+
+def marked_named(xml, words):
+    """A read after a tap on a row that the tap's words only named,
+    marked with the row's words: tapped="..." (the CLI says them). Pure."""
+    from xml.sax.saxutils import quoteattr
+    return re.sub(r"<hierarchy\b", lambda m: "<hierarchy tapped=" + quoteattr(words), xml, count=1)
 
 
 BY_WORDS_S = 20.0  # a read this young still says what the screen is: a tap
@@ -2887,7 +2954,10 @@ class U2Daemon:
             tried = None
             if before and _time.monotonic() - self._last_xml_t < BY_WORDS_S:
                 try:
-                    node, alt = label_node(before, label)
+                    # a row the words only name, too ("Search, Tab 2 of 4"
+                    # for `tap Search`: the CLI found it on a read of its
+                    # own, then tapped, Spotify, Oct 7)
+                    node, alt = label_node(before, label, loose=True)
                     spec["inert"] = inert_row(before, node)
                     sel = selector_for(node, alt)
                     # the phone clicks the first row its selector finds:
@@ -2896,7 +2966,11 @@ class U2Daemon:
                     # "lofi" got the tap, the review of Oct 6)
                     if selector_matches(before, sel) == 1:
                         spec["tap_selector"] = tried = sel
-                        spec["words"] = label
+                        # the row's own words when the tap's only name it: a
+                        # `type --field Search` after it is not about a box
+                        # this tab opened (see _type_into_field)
+                        spec["named"] = loose_words(node, alt)
+                        spec["words"] = spec["tapped_label"] = spec["named"] or label
                 except RuntimeError:
                     pass
             if "tap_selector" in spec:
@@ -2912,10 +2986,12 @@ class U2Daemon:
                 raise ActNotSent("act not sent: the read before it failed (%s)"
                                  % err_text(e, 100))
             try:
-                node, alt = label_node(xml, label)
+                node, alt = label_node(xml, label, loose=True)
             except RuntimeError as e:
                 raise RuntimeError("act not sent: %s" % e)
             spec["inert"] = inert_row(xml, node)
+            spec["named"] = loose_words(node, alt)
+            spec["tapped_label"] = spec["named"] or label
             center = tuple(node["center"])
             fresh = selector_for(node, alt)
             if not node["web"] and fresh != tried and selector_matches(xml, fresh) == 1:
@@ -2923,14 +2999,14 @@ class U2Daemon:
                 # by its words at tap time, where it is then, with no
                 # second read to see it hold its place (2.7-3.1s for a tap
                 # whose row came after the assistant's read, Oct 6)
-                spec["tap_selector"], spec["words"] = fresh, label
+                spec["tap_selector"], spec["words"] = fresh, spec["tapped_label"]
                 try:
                     return self._act_batch(spec)
                 except _NotThere as e:
                     spec.pop("tap_selector")
                     log("%r not found by its words on the read just taken (%s)" % (label, e))
             try:
-                old = label_target(before, label)
+                old = label_target(before, label, loose=True)
             except RuntimeError:
                 old = None
             reads = 1
@@ -2942,7 +3018,7 @@ class U2Daemon:
                 try:
                     with _t("tap read (again)"):
                         xml = self._dump(fresh=True)
-                    center = label_target(xml, label)
+                    center = label_target(xml, label, loose=True)
                 except Exception as e:
                     raise RuntimeError("act not sent: %s" % err_text(e, 100))
                 reads += 1
@@ -3281,7 +3357,9 @@ class U2Daemon:
                 xml = page_xml
                 self._remember(xml)
             elif unchanged:
-                return marked_unchanged(xml, spec.get("inert")).encode()
+                xml = marked_unchanged(xml, spec.get("inert"))
+            if spec.get("named"):
+                xml = marked_named(xml, spec["named"])
         return xml.encode()
 
     def _relook(self, xml):

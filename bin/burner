@@ -2079,8 +2079,11 @@ def act_and_read(action, prev_root=None, idle_ms=IDLE_ACT_MS, rereads=2):
     # the helper's word that the action left the screen as it was (after
     # its second look): said, so the screen isn't read again to be sure
     unchanged, marked = root.get("unchanged"), root
+    named = root.get("tapped")  # the row a tap's words only named, in its own words
     root, note = settled_read(prev_root, idle_ms=idle_ms, rereads=rereads,
                               first_root=root)
+    if named and root is not None:
+        root.set("tapped", named)
     # said only with the read the helper marked: a re-read here can find
     # the new screen (a slow one), review Oct 7
     if unchanged and not note and root is marked:
@@ -2769,7 +2772,9 @@ def cmd_tap(args):
                 pass
             if status != "ok":
                 return print_act(status, root, note, "tap")  # the helper's word; no claim here
-            rc = _tap_ok(args, args.text, None, via="label")
+            # a row the words only named ("Search, Tab 2 of 4"): its words
+            named = root.get("tapped") if root is not None else None
+            rc = _tap_ok(args, '"{}"'.format(named) if named else args.text, None, via="label")
             if args.quiet:
                 return rc
             return print_act(status, root, note, "tap") or rc
