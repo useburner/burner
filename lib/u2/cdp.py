@@ -797,6 +797,10 @@ FIND_JS = r"""
     return n.filter(Boolean).map(s => s.toLowerCase()); };
   window.__burnerTarget = null;
   window.__burnerGuard = null;
+  // when the page last changed, watched from its first find on (see the
+  // answer for words not on it)
+  if (!window.__burnerWatch) { window.__burnerWatch = true;
+    try { new MutationObserver(() => { window.__burnerChangedAt = performance.now(); }).observe(document, {childList: true, subtree: true, characterData: true}); } catch (e) {} }
   const alts = label.split('||').map(squash).filter(Boolean);
   let used = '';
   const find = test => { for (const alt of alts) { const want = alt.toLowerCase(); const h = [];
@@ -804,7 +808,13 @@ FIND_JS = r"""
     if (h.length) { used = alt; return h; } } return []; };
   let hits = find((n, w) => n === w);
   if (!hits.length && !exact) hits = find((n, w) => n.includes(w));
-  if (!hits.length) return {found: false};
+  if (!hits.length) {
+    // a page that finished loading a while ago and hasn't changed lately
+    // won't show the words a moment later: no second look (0.7s and a
+    // round trip for nothing, Oct 7)
+    const now = performance.now(), at = window.__burnerChangedAt;
+    return {found: false, quiet: document.readyState === 'complete' && now > 5000 && (at === undefined || now - at > 1000)};
+  }
   // the words typed into a field are not its label when something else
   // carries them (a search box holding "Pixel 7" beside that suggestion)
   if (hits.length > 1) {
@@ -1393,16 +1403,6 @@ def read(page, cap=600):
     return page.eval(_js(READ_JS, cap)) or {}
 
 
-def _read_untouched(page):
-    """A read for an answer that touched nothing (words not on the page,
-    several controls): when it fails, nothing was sent, and the caller
-    takes the other way, rather than "the action failed"."""
-    try:
-        return read(page)
-    except Exception as e:
-        raise NotSent(str(e)[:120])
-
-
 def _read_or_again(page, res):
     """The page read that rode in a round trip (its result from
     call_many), or a read of its own when that one failed."""
@@ -1718,16 +1718,17 @@ def tap(page, label, index=None, idle_ms=1200):
     any touch."""
     try:
         hit = _find_to_touch(page, label, index)
-        if not hit or not hit.get("found"):
+        if (not hit or not hit.get("found")) and not (hit or {}).get("quiet"):
             time.sleep(0.7)  # a page still drawing shows the words a moment later
             hit = _find_to_touch(page, label, index)
     except Exception as e:
         raise NotSent(str(e)[:120])
     if not hit or not hit.get("found"):
-        return {"found": False, "screen": _read_untouched(page)}
+        # nothing touched, and no read of the page: the caller looks for
+        # the words among Chrome's own rows (a read for nothing, Oct 7)
+        return {"found": False}
     if hit.get("count", 1) != 1:
-        hit["screen"] = _read_untouched(page)
-        return hit
+        return hit  # several rows: nothing touched (the caller says so)
     if hit.get("chose") or hit.get("focused"):
         # a dropdown's option picked, or a dropdown focused: no touch
         time.sleep(0.15)
@@ -2007,9 +2008,8 @@ def fill(page, label, text, index=None):
     # checkbox, picks an option): "failed after sending", not "not sent"
     hit = _value(res[0])
     if not hit or not hit.get("found"):
-        return {"found": False, "screen": _read_untouched(page)}
+        return {"found": False}  # nothing filled; the caller says so (no read for it, Oct 7)
     if hit.get("count", 1) != 1:
-        hit["screen"] = _read_untouched(page)
         return hit
     how = "fill"
     if hit.get("notField"):

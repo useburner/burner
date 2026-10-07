@@ -6931,16 +6931,24 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(page.calls, [("many", ["FIND_JS", "FILL_JS", "GUARD_JS"]),
                                       ("many", ["Input.insertText", "FILLED_JS", "READ_JS"])])
 
-    def test_a_read_that_fails_after_an_untouched_answer_is_not_sent(self):
+    def test_a_find_that_touches_nothing_reads_nothing_more(self):
+        # Oct 7: words not on the page, or on two rows, cost a page read the
+        # helper never used, and a second look 0.7s later on a page done
+        # loading long before
         cdp = _cdp()
         page = _ScriptedPage(cdp, {"FIND_JS": {"found": False}})
-        page.eval = mock.Mock(side_effect=[OSError("stream closed")])  # the read after the two finds
-        with mock.patch.object(cdp.time, "sleep"), self.assertRaises(cdp.NotSent):
-            cdp.tap(page, "Nope")
+        with mock.patch.object(cdp.time, "sleep") as slept:
+            self.assertEqual(cdp.tap(page, "Nope"), {"found": False})
+        self.assertEqual(page.calls, [("many", ["FIND_JS", "GUARD_JS"])] * 2)  # a page still drawing: looked at again
+        slept.assert_called_once_with(0.7)
+        page = _ScriptedPage(cdp, {"FIND_JS": {"found": False, "quiet": True}})
+        with mock.patch.object(cdp.time, "sleep") as slept:
+            self.assertEqual(cdp.tap(page, "Nope"), {"found": False})
+        self.assertEqual(page.calls, [("many", ["FIND_JS", "GUARD_JS"])])  # done loading, unchanged: once
+        slept.assert_not_called()
         page = _ScriptedPage(cdp, {"FIND_JS": {"found": True, "count": 2, "labels": ["a", "b"]}})
-        page.eval = mock.Mock(side_effect=[OSError("stream closed")])
-        with self.assertRaises(cdp.NotSent):
-            cdp.tap(page, "Twice")
+        self.assertEqual(cdp.tap(page, "Twice")["count"], 2)
+        self.assertEqual(page.calls, [("many", ["FIND_JS", "GUARD_JS"])])
 
     def test_page_text_is_cleaned_of_what_xml_cannot_carry(self):
         cdp = _cdp()
