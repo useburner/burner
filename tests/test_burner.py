@@ -5184,6 +5184,45 @@ class WebPathTests(OfflineTestCase):
             self.assertEqual(str(cm.exception), dm.NO_FIELD_TAP)
             self.assertEqual(sent, [])
 
+    def test_a_field_named_by_its_own_hint_takes_the_text(self):
+        # Play Store, Oct 6: the search box is an empty field under the
+        # words "Search apps & games", a TextView of their own; a type by
+        # them took a tap and two more trips (4.7s)
+        mod = _u2mux()
+        field = SAMPLE_XML.replace('content-desc="Search"', 'content-desc=""')
+        edit = 'bounds="[100,600][900,700]"/>'
+
+        def hint(clickable="false", bounds="[150,620][560,680]"):
+            return ('<node text="Search apps &amp; games" class="android.widget.TextView" package="com.example" '
+                    'bounds="%s" clickable="%s" enabled="true" focused="false"/>' % (bounds, clickable))
+        box = field.replace(edit, edit + hint())
+        self.assertEqual(mod.field_node(box, "Search apps & games")["rid"], "com.example:id/q")
+        # the hint drawn before the field, which has words of its own: the field still
+        before = SAMPLE_XML.replace("<node index=\"2\"", hint() + "<node index=\"2\"")
+        self.assertEqual(mod.field_node(before, "Search apps & games")["rid"], "com.example:id/q")
+        # words that can be tapped (a button inside the box), words outside
+        # every field, two fields around them, a row over the field: none
+        second = ('<node text="" resource-id="com.example:id/q2" class="android.widget.EditText" '
+                  'package="com.example" bounds="[120,610][880,690]" clickable="true" enabled="true" focused="false"/>')
+        over = ('<node text="Sale!" class="android.widget.TextView" package="com.example" '
+                'bounds="[400,620][600,680]" clickable="false" enabled="true" focused="false"/>')
+        for xml in (field.replace(edit, edit + hint(clickable="true")),
+                    field.replace(edit, edit + hint(bounds="[150,500][560,560]")),
+                    field.replace(edit, edit + second + hint()),
+                    field.replace(edit, edit + hint() + over)):
+            self.assertIsNone(mod.field_node(xml, "Search apps & games"))
+        # in a type: at once, into that very field
+        EmptyScreenTests.no_sleep(self, mod)
+        dm = EmptyScreenTests._daemon(self, mod)
+        sent = []
+        dm._act_batch = lambda spec: sent.append(spec) or SAMPLE_XML.encode()
+        dm._last_xml, dm._last_xml_t = box, mod._time.monotonic()
+        dm._dump = mock.Mock(side_effect=AssertionError("no read: the field has the focus"))
+        self.assertEqual(dm.cmd_act(json.dumps({"set_text": "duolingo", "field": "Search apps & games", "idle": 1200})),
+                         SAMPLE_XML.encode())
+        self.assertEqual(sent[0]["field_selector"]["resourceId"], "com.example:id/q")
+        self.assertNotIn("tap_first", sent[0])
+
     def test_a_tap_then_type_batch(self):
         mod = _u2mux()
         calls = mod.act_calls({"set_text": "pudgy", "tap_first": [500, 650], "idle": 1200})

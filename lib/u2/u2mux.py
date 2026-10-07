@@ -1444,17 +1444,49 @@ def lone_focused_field(xml, label):
     return fields[0] if len(fields) == 1 and fields[0]["focused"] else None
 
 
+def hint_field(xml, label):
+    """The text field whose hint reads `label` when a view of its own
+    draws the hint: words that can't be tapped, inside the field (the Play
+    Store's search box is an empty field under the words "Search apps &
+    games"; a type by them took a tap and two more trips, 4.7s, Oct 6).
+    None unless one field holds such words, whole, with nothing over it
+    but its hint (see row_over). Pure."""
+    try:
+        nodes = list(iter_nodes(xml or ""))
+    except Exception:
+        return None
+    alts = [plain_words(p).lower() for p in label.split("||") if p.strip()]
+    hints = [n for n in nodes if not n["field"] and not n["clickable"]
+             and any(a in (plain_words(n["text"]).lower(), plain_words(n["desc"]).lower()) for a in alts)]
+    holders = []
+    for f in nodes:
+        if f["field"]:
+            x1, y1, x2, y2 = f["rect"]
+            mine = [h for h in hints if x1 <= h["center"][0] <= x2 and y1 <= h["center"][1] <= y2]
+            if mine:
+                holders.append([f] + mine)
+    if len(holders) != 1:
+        return None
+    field = holders[0][0]
+    if cut_off(field) or row_over(nodes, holders[0], tuple(field["center"]), screen_size(nodes)) is not None:
+        return None
+    return field
+
+
 def field_node(xml, label):
     """The text field with this label on a read (see label_node: once,
-    whole, nothing over it), or None (no such row, several, or a row that
-    isn't a text field). Pure."""
+    whole, nothing over it), or the one whose hint reads it (see
+    hint_field); None otherwise (no such row, several, or a row that is
+    neither). Pure."""
     if not xml:
         return None
     try:
         node, _ = label_node(xml, label)
     except RuntimeError:
-        return None
-    return node if node.get("field") else None
+        node = None
+    if node is not None and node.get("field"):
+        return node
+    return hint_field(xml, label)
 SLEEP_KEYS = (26, 223, 276)  # POWER, SLEEP, SOFT_SLEEP
 
 
