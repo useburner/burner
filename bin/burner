@@ -1947,6 +1947,7 @@ LAUNCH_SLOW_S = 9.0     # an installed app's cold start is given this long in al
 LAUNCH_TREE_S = 14.0    # a launch whose reads hold no app's window at all: read this long
                         # (a window not readable yet: the helper wakes an off screen, so
                         # this is a splash or a window still coming, Oct 6)
+THIN_LAUNCH_ROWS = 2    # a launch's read with this many rows or fewer is read again
 LAUNCH_REREADS = 4      # reads after a launch while another app is still in
                         # front (0.4s apart): the window takes a moment to come
 IDLE_SCROLL_MS = 500    # the read after a swipe: it stops dead, the content is
@@ -3981,6 +3982,14 @@ def launch_read(quiet, expect=None):
                 break
         _trace("{} in front, not {} yet; reading again".format(front, expect))
         time.sleep(0.4)
+    if front and len(screen_lines(walk(root), *screen_dims())[0]) <= THIN_LAUNCH_ROWS:
+        # a window still drawing: Settings' home read as its search bar
+        # alone, its list a moment later (Oct 7); once more, when quiet
+        _trace("the launch's read is thin; reading again")
+        again, again_note = read_after_root(idle_ms=IDLE_LAUNCH_MS, rereads=0)
+        if again is not None and (len(screen_lines(walk(again), *screen_dims())[0])
+                                  > len(screen_lines(walk(root), *screen_dims())[0])):
+            root, note = again, again_note
     if expect and front is None:
         note = "(no app's window readable yet; `burner shot` shows the screen)"
     print_screen(root, note=note)

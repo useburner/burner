@@ -1447,6 +1447,7 @@ def focused_field_selector(rid=""):
 
 
 TAP_OPENED_S = 30.0  # a control tapped this recently may have opened the box a `type --field` names
+FIELD_AGAIN_S = 0.4  # a field not (or not yet) where the typing wants it is looked for again this much later
 WAKE_RPC_S = 3.0     # the wake before a launch: a no-op, or 500ms on the phone
 
 
@@ -2707,6 +2708,22 @@ class U2Daemon:
         now = field_node(xml, label)
         if now is not None and now["focused"]:
             return self._type_at_once(spec, now)
+        if now is None or before is None or now["center"] != before["center"]:
+            # one more look a moment later: a box a tap opens can come after
+            # the reads (Settings' search: the tap's read showed the page
+            # before it, the read 0.5s later no box, and the CLI's own taps
+            # and typings took 6.2s, Oct 7); and a field seen on one read
+            # alone is tapped only once it is seen in the same place twice
+            _time.sleep(FIELD_AGAIN_S)
+            try:
+                with _t("field read (again)"):
+                    xml2 = self._dump(fresh=True)
+            except Exception as e:
+                raise ActNotSent("act not sent: the read before it failed (%s)" % err_text(e, 100))
+            again = field_node(xml2, label)
+            if again is not None and again["focused"]:
+                return self._type_at_once(spec, again)
+            before, now, xml = now, again, xml2
         if now is not None and before is not None and now["center"] == before["center"]:
             spec["tap_first"] = list(now["center"])
             spec["field_selector"] = focused_field_selector(now.get("rid", ""))

@@ -3966,6 +3966,31 @@ class OneRoundTripTests(OfflineTestCase):
                                  ("act", {"wake": True, "idle": 1000})])
         self.assertIn("screen: com.example", out.getvalue())
 
+    def test_a_thin_launch_read_is_read_again(self):
+        # Oct 7: `burner settings home` read Settings as its search bar
+        # alone; its list came a moment later
+        self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
+        self.allow("u2_invalidate")
+        thin = ('<hierarchy rotation="0"><node text="Search Settings" class="android.widget.TextView" '
+                'package="com.android.settings" bounds="[100,200][900,300]" clickable="true" enabled="true"/>'
+                '</hierarchy>')
+        full = thin.replace("</hierarchy>", "".join(
+            '<node text="%s" class="android.widget.TextView" package="com.android.settings" '
+            'bounds="[100,%d][900,%d]" clickable="true" enabled="true"/>' % (w, 400 + i * 150, 500 + i * 150)
+            for i, w in enumerate(("Network and internet", "Connected devices", "Apps", "Battery"))) + "</hierarchy>")
+        reads, calls = [thin, full], []
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30: calls.append(cmd) or reads.pop(0))
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_settings(self.parse(["settings", "home"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertIn("Battery", out.getvalue())
+        self.assertEqual(calls, ["act", "act"])
+        # a full read: once
+        reads[:], calls[:] = [full], []
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            pc.cmd_settings(self.parse(["settings", "home"]))
+        self.assertEqual(calls, ["act"])
+
     def test_helper_batch_results_and_act_calls(self):
         mod = _u2mux()
         res = mod.batch_results([{"id": 2, "result": "<x/>"}, {"id": 1, "error": {"code": -1}}], 2)
@@ -5676,6 +5701,10 @@ class WebPathTests(OfflineTestCase):
         # batch, the typing pinned to that field
         act(unfocused, unfocused)
         self.assertEqual((reads, sent[0]["tap_first"]), ([True], [500, 650]))
+        # moved since the assistant's read, and in its new place on a look
+        # 0.4s later: tapped there, and typed, in one batch (Oct 7)
+        act(unfocused, moved)
+        self.assertEqual((reads, sent[0]["tap_first"]), ([True, True], [500, 950]))
         self.assertEqual(sent[0]["field_selector"]["resourceId"], "com.example:id/q")
         # focused, but with no resource id to pin it: a read now first
         # (the focus may have moved since the assistant's read)
@@ -5688,14 +5717,26 @@ class WebPathTests(OfflineTestCase):
         bar = SAMPLE_XML.replace('class="android.widget.EditText"', 'class="android.widget.TextView"')
         act(bar, SAMPLE_XML)
         self.assertEqual((reads, sent[0].get("tap_first"), "field_selector" in sent[0]), ([True], None, True))
-        # moved since, gone, not a field, an old read: the CLI's way (it taps first)
-        for before, now, label, age in ((unfocused, moved, "Search", 0), (unfocused, TAP_XML, "Search", 0),
+        # gone, not a field, an old read: the CLI's way (it taps first),
+        # after one more look
+        for before, now, label, age in ((unfocused, TAP_XML, "Search", 0),
                                         (SAMPLE_XML, None, "OK", 0), (SAMPLE_XML, None, "Search", 60),
                                         (SAMPLE_XML, None, "Password", 0)):
             with self.assertRaises(RuntimeError) as cm:
                 act(before, now, label, age)
             self.assertEqual(str(cm.exception), dm.NO_FIELD_TAP)
-            self.assertEqual(sent, [])
+            self.assertEqual((sent, reads), ([], [True, True]))
+        # the box a tap opened, on the second look only: typed at once (Oct
+        # 7: Settings' search box came after the reads, 6.2s through the CLI)
+        sent.clear()
+        reads.clear()
+        later = iter([TAP_XML, SAMPLE_XML])
+        dm._last_xml, dm._last_xml_t = TAP_XML, mod._time.monotonic()
+        dm._dump = lambda fresh=False, **kw: reads.append(fresh) or next(later)
+        self.assertEqual(dm.cmd_act(json.dumps({"set_text": "battery", "field": "Search", "idle": 1200})),
+                         SAMPLE_XML.encode())
+        self.assertEqual((reads, sent[0].get("tap_first")), ([True, True], None))
+        self.assertEqual(sent[0]["field_selector"]["resourceId"], "com.example:id/q")
         # the field lost the focus before the typing (the phone found no
         # such field): nothing typed, so "not sent", and the CLI taps it
         dm._act_batch = mock.Mock(side_effect=RuntimeError(
@@ -5835,13 +5876,13 @@ class WebPathTests(OfflineTestCase):
         dm._last_xml, dm._last_xml_t = box, mod._time.monotonic()
         # never without that tap: a password named by a field that isn't
         # on the screen must not go into a search box
-        dm.d = _FakeServer([box])
+        dm.d = _FakeServer([box, box])
         with self.assertRaises(RuntimeError) as cm:
             dm.cmd_act(json.dumps({"set_text": "duolingo", "field": "Search or ask Play", "idle": 1200}))
         self.assertEqual((str(cm.exception), sent), (dm.NO_FIELD_TAP, []))
         # the button with those words tapped a moment ago
         dm._last_tap = ("Search or ask Play", mod._time.monotonic())
-        dm.d = _FakeServer([box])
+        dm.d = _FakeServer([box, box])
         self.assertEqual(dm.cmd_act(json.dumps({"set_text": "duolingo", "field": "Search or ask Play", "idle": 1200})),
                          SAMPLE_XML.encode())
         self.assertEqual(sent[0]["field_selector"]["resourceId"], "com.example:id/q")
@@ -5860,7 +5901,7 @@ class WebPathTests(OfflineTestCase):
                             "Search or ask Play"),
                            (box.replace('focused="true"', 'focused="false"'), "Search or ask Play")):
             sent.clear()
-            dm.d = _FakeServer([xml])
+            dm.d = _FakeServer([xml, xml])
             with self.assertRaises(RuntimeError) as cm:
                 dm.cmd_act(json.dumps({"set_text": "duolingo", "field": label, "idle": 1200}))
             self.assertEqual(str(cm.exception), dm.NO_FIELD_TAP)
@@ -5885,7 +5926,7 @@ class WebPathTests(OfflineTestCase):
         dm.cmd_act(json.dumps({"key": 4, "idle": 1200}))  # BACK
         self.assertIsNone(dm._last_tap)
         # a type naming that control is then the CLI's way, not the lone field
-        dm.d = _FakeServer([box])
+        dm.d = _FakeServer([box, box])
         with self.assertRaises(RuntimeError) as cm:
             dm.cmd_act(json.dumps({"set_text": "duolingo", "field": "Search or ask Play", "idle": 1200}))
         self.assertEqual(str(cm.exception), dm.NO_FIELD_TAP)
@@ -5992,7 +6033,8 @@ class WebPathTests(OfflineTestCase):
         mod = _u2mux()
         EmptyScreenTests.no_sleep(self, mod)
         dm = EmptyScreenTests._daemon(self, mod)
-        dm.d = _FakeServer([SAMPLE_XML])  # the read now: no "Password" field on it either
+        # the read now and a look again: no "Password" field on them either
+        dm.d = _FakeServer([SAMPLE_XML, SAMPLE_XML])
         dm._batch = mock.Mock(side_effect=AssertionError("setText must not go to the focused field"))
         dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()  # com.example, not Chrome
         with self.assertRaises(RuntimeError) as cm:
