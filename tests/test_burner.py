@@ -5304,6 +5304,13 @@ class WebPathTests(OfflineTestCase):
             self.assertTrue(opened[0].closed)
             self.assertEqual(opened[1].frames, ["Page.enable", "Page.getFrameTree", "Runtime.evaluate"])
             self.assertGreater(page.visible_at, 0)
+            # right after a launch: the commands wait for the handshake's
+            # answer from the start, one stream (Oct 7: every session after a
+            # launch took the second handshake)
+            opened.clear()
+            streams[:] = [Chrome(busy=True)]
+            page = cdp.Page(None, "T1", pipeline=False)
+            self.assertEqual((len(opened), page.handshake_again, page.main_frame), (1, False, "F1"))
             # any other refusal stands: one stream, no second handshake
             opened.clear()
             streams[:] = [Chrome(busy=False, refuse=b"HTTP/1.1 500 Internal Server Error\r\n\r\n")]
@@ -8794,7 +8801,7 @@ class CoordinateTapTests(OfflineTestCase):
         class Tab:
             """A tab's session: the current one (first) is busy loading and
             answers only when given long enough; the others are frozen."""
-            def __init__(self, dev, target, probe_s=None):
+            def __init__(self, dev, target, probe_s=None, pipeline=True):
                 probes.append((target, probe_s))
                 self.target, self.visible_at, self.closed = target, 0.0, False
                 if target == "A":
@@ -8816,7 +8823,7 @@ class CoordinateTapTests(OfflineTestCase):
         probes.clear()
 
         class Tab2(Tab):
-            def __init__(self, dev, target, probe_s=None):
+            def __init__(self, dev, target, probe_s=None, pipeline=True):
                 probes.append((target, probe_s))
                 self.target, self.visible_at, self.closed = target, (1.0 if target == "B" else 0.0), False
         with mock.patch.object(cdp, "Page", Tab2), \
@@ -8825,7 +8832,7 @@ class CoordinateTapTests(OfflineTestCase):
         self.assertEqual((page.target, probes), ("B", [("A", None), ("B", None)]))
         # none visible and the current tab refused (Chrome shows a native screen): no page
         class Refused(Tab):
-            def __init__(self, dev, target, probe_s=None):
+            def __init__(self, dev, target, probe_s=None, pipeline=True):
                 raise ConnectionError("refused")
         with mock.patch.object(cdp, "Page", Refused), \
                 mock.patch.object(cdp, "pages", lambda dev: [{"id": "A"}]):
@@ -9055,7 +9062,7 @@ class CoordinateTapTests(OfflineTestCase):
         probes = []
 
         class Tab:
-            def __init__(self, dev, target, probe_s=None):
+            def __init__(self, dev, target, probe_s=None, pipeline=True):
                 probes.append((target, probe_s))
                 self.target, self.visible_at = target, (1.0 if (target == "A" and probe_s) else 0.0)
                 if target != "A":
@@ -9205,7 +9212,7 @@ class AirbnbRoundTests(OfflineTestCase):
         probes = []
 
         class Tab:
-            def __init__(self, dev, target, probe_s=None):
+            def __init__(self, dev, target, probe_s=None, pipeline=True):
                 probes.append((target, probe_s))
                 # D is the one on screen (a link launched Chrome into it); the rest answer hidden
                 self.target, self.visible_at = target, (1.0 if target == "D" else 0.0)
@@ -9232,7 +9239,7 @@ class AirbnbRoundTests(OfflineTestCase):
         closed = []
 
         class Tab:
-            def __init__(self, dev, target, probe_s=None):
+            def __init__(self, dev, target, probe_s=None, pipeline=True):
                 self.target, self.visible_at = target, (1.0 if target == "D" else 0.0)
                 if target in ("B", "C"):
                     raise ConnectionError("")
@@ -9259,9 +9266,12 @@ class AirbnbRoundTests(OfflineTestCase):
         cdp = _cdp()
         probes = []
 
+        pipelined = []
+
         class Tab:
-            def __init__(self, dev, target, probe_s=None):
+            def __init__(self, dev, target, probe_s=None, pipeline=True):
                 probes.append((target, probe_s))
+                pipelined.append(pipeline)
                 self.target, self.visible_at = target, 0.0
                 if target == "A":
                     raise TimeoutError("timed out")  # busy: no answer in a probe's time
@@ -9274,6 +9284,9 @@ class AirbnbRoundTests(OfflineTestCase):
             with self.assertRaises(RuntimeError) as cm:
                 cdp.front_page(None, hint="airbnb.com/s/homes", quick=True)
         self.assertEqual(sorted(probes), [("A", None), ("B", None), ("C", None), ("E", None)])
+        # after a launch the commands wait for the handshake's answer (Chrome
+        # dropped every session that sent them with it, Oct 7)
+        self.assertEqual(set(pipelined), {False})
         self.assertEqual(str(cm.exception), "no visible page among Chrome's 4 tabs probed: "
                          "a.com: no answer (TimeoutError); b.com: hidden; c.com: hidden; airbnb.com/s/homes: hidden")
 
@@ -9286,7 +9299,7 @@ class AirbnbRoundTests(OfflineTestCase):
         probes, closed = [], []
 
         class Tab:
-            def __init__(self, dev, target, probe_s=None):
+            def __init__(self, dev, target, probe_s=None, pipeline=True):
                 probes.append((target, probe_s))
                 self.target, self.visible_at = target, 0.0
                 if target == "A":
@@ -9315,7 +9328,7 @@ class AirbnbRoundTests(OfflineTestCase):
         probes = []
 
         class Tab:
-            def __init__(self, dev, target, probe_s=None):
+            def __init__(self, dev, target, probe_s=None, pipeline=True):
                 probes.append((target, probe_s))
                 self.target, self.visible_at = target, (1.0 if target == "F" else 0.0)
 
@@ -9334,7 +9347,7 @@ class AirbnbRoundTests(OfflineTestCase):
         cdp = _cdp()
 
         class Tab:
-            def __init__(self, dev, target, probe_s=None):
+            def __init__(self, dev, target, probe_s=None, pipeline=True):
                 self.target, self.visible_at = target, 0.0
                 if target == "B":
                     raise TimeoutError("timed out")
@@ -9480,7 +9493,7 @@ class AirbnbRoundTests(OfflineTestCase):
         cdp = _cdp()
 
         class Tab:
-            def __init__(self, dev, target, probe_s=None):
+            def __init__(self, dev, target, probe_s=None, pipeline=True):
                 self.target, self.visible_at = target, 0.0
                 if target not in ("A", "F", "G"):
                     raise ConnectionError("")

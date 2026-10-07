@@ -286,7 +286,10 @@ class Page:
     # again, its commands sent once the handshake is answered.
     DROPPED = "websocket handshake: the stream closed"
 
-    def __init__(self, dev, target, probe_s=None):
+    def __init__(self, dev, target, probe_s=None, pipeline=True):
+        """pipeline: the first commands go with the handshake; False right
+        after a launch, when Chrome drops such a session (see DROPPED):
+        they wait for the handshake's answer from the start."""
         self.target = target
         self.handshake_again = False  # the session took a second handshake (see DROPPED)
         self.ws = WebSocket(open_stream(dev), "/devtools/page/" + target)
@@ -303,6 +306,8 @@ class Page:
         first = [("Page.enable", {}), ("Page.getFrameTree", {}), _evaluate("document.visibilityState")]
         try:
             try:
+                if not pipeline:
+                    self.ws.handshake(bound)
                 res = self.call_many(first, timeout=bound, raise_errors=False)
             except NothingSent as e:
                 if str(e) != self.DROPPED:
@@ -491,7 +496,7 @@ def _short(url):
     return (_address(url) or "(no address)")[:40]
 
 
-def _probe(dev, ids, first_probe_s=None, slow=()):
+def _probe(dev, ids, first_probe_s=None, slow=(), pipeline=True):
     """Each tab asked whether it is the one on screen, all at once (each
     on its own stream, so the wait is one probe's, not one per tab: three
     in a row cost 6s while a heavy page loaded, Oct 5), and the answer
@@ -507,7 +512,8 @@ def _probe(dev, ids, first_probe_s=None, slow=()):
 
     def probe(i):
         try:
-            p = Page(dev, ids[i], probe_s=first_probe_s if (i == 0 or ids[i] in slow) else None)
+            p = Page(dev, ids[i], probe_s=first_probe_s if (i == 0 or ids[i] in slow) else None,
+                     pipeline=pipeline)
         except Exception as e:
             p = e
         with lock:
@@ -605,7 +611,10 @@ def front_page(dev, current=None, first_probe_s=None, hint=None, quick=False):
                     break
     if not ids:
         raise RuntimeError("no page in Chrome")
-    found = _probe(dev, ids, None if quick else first_probe_s, slow=() if quick else hinted)
+    # right after a launch (quick), Chrome drops a session whose commands
+    # come with the handshake: they wait for its answer (see Page)
+    found = _probe(dev, ids, None if quick else first_probe_s, slow=() if quick else hinted,
+                   pipeline=not quick)
     page = _visible_one(found)
     if page is not None:
         _close_dead(dev, ids, found, urls, hint, page.target)
