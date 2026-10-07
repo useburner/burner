@@ -2378,8 +2378,11 @@ def cmd_snap(args):
 
     Handles resolve in `burner tap @eN` (exact coordinates, no re-matching).
     The snap file is deleted by any mutating action, so handles never
-    outlive the screen they were taken from."""
-    root = ui_dump()
+    outlive the screen they were taken from. Read afresh, as `state` is:
+    the helper's 2s-old read is the screen the last action printed, and
+    the handles would point where a player's controls were (17ms snaps
+    in YouTube's fullscreen, Oct 7)."""
+    root = ui_dump(fresh=True)
     nodes = walk(root)
     numbered = snap_save(nodes, include_all=args.all)
     if as_json(args):

@@ -11183,6 +11183,13 @@ class AirbnbRoundTests(OfflineTestCase):
             self.assertEqual(pc.cmd_state(self.parse(["state"])), 0)
         dump.assert_called_once_with(fresh=True)
         self.assertIn("Hello (300,250)", out.getvalue())
+        # `snap` too: its handles point where the rows are now
+        dump.reset_mock()
+        with mock.patch.object(pc, "SNAP_DIR", tempfile.mkdtemp()), \
+                mock.patch.object(pc, "SNAP_PATH", os.path.join(tempfile.mkdtemp(), "snap.json")), \
+                self.cap() as (out, err):
+            self.assertEqual(pc.cmd_snap(self.parse(["snap"])), 0)
+        dump.assert_called_once_with(fresh=True)
 
     def test_a_scroll_that_moved_nothing_says_so(self):
         # YouTube's Shorts, Oct 7: `scroll up` on the first Short printed the
