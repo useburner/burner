@@ -1491,6 +1491,31 @@ def words_changed(before, after):
     return [("-", w[:40]) for w in gone] + [("+", w[:40]) for w in came]
 
 
+def inert_row(xml, node):
+    """Whether a row (a node of iter_nodes on `xml`) and every box around
+    it take no click: a heading or a label, whose tap opens nothing
+    (About phone's "Device details", Oct 7). Pure."""
+    try:
+        nodes = list(iter_nodes(xml or ""))
+    except Exception:
+        return False
+    n, steps = node, 0
+    while n is not None and steps < 200:
+        if n.get("clickable"):
+            return False
+        p = n.get("parent")
+        n = nodes[p] if isinstance(p, int) and 0 <= p < len(nodes) else None
+        steps += 1
+    return True
+
+
+def marked_unchanged(xml, inert=False):
+    """A read marked as the screen from before the action (see
+    _act_batch): unchanged="1", or "inert" after a tap on a row that
+    takes no click. Pure."""
+    return re.sub(r"<hierarchy\b", '<hierarchy unchanged="%s"' % ("inert" if inert else "1"), xml, count=1)
+
+
 def focused_field(xml):
     """The text field with the focus on a read, as (resource id, centre),
     or None. Pure."""
@@ -2827,6 +2852,7 @@ class U2Daemon:
             if before and _time.monotonic() - self._last_xml_t < BY_WORDS_S:
                 try:
                     node, alt = label_node(before, label)
+                    spec["inert"] = inert_row(before, node)
                     sel = selector_for(node, alt)
                     # the phone clicks the first row its selector finds:
                     # only when that is the one row with these exact words
@@ -2853,6 +2879,7 @@ class U2Daemon:
                 node, alt = label_node(xml, label)
             except RuntimeError as e:
                 raise RuntimeError("act not sent: %s" % e)
+            spec["inert"] = inert_row(xml, node)
             center = tuple(node["center"])
             fresh = selector_for(node, alt)
             if not node["web"] and fresh != tried and selector_matches(xml, fresh) == 1:
@@ -3126,6 +3153,13 @@ class U2Daemon:
                              and find_node(xml, spec["tapped_label"], fuzzy=False) is not None))
             if again:
                 xml = self._relook(xml)
+            # the screen as it was before the action, after the second look:
+            # said with the read (an agent read it again twice to be sure,
+            # Oct 7); not on the read kept for later
+            unchanged = bool(looked and not sleeps_the_screen(spec) and not chrome_in(xml)
+                             and screen_sig(xml) == screen_sig(before))
+            if again:
+                pass
             elif looked:
                 # changed, and no second look: how (a tap that opened
                 # another app's screen read as the page before it, changed
@@ -3150,6 +3184,8 @@ class U2Daemon:
             if page_xml is not None:
                 xml = page_xml
                 self._remember(xml)
+            elif unchanged:
+                return marked_unchanged(xml, spec.get("inert")).encode()
         return xml.encode()
 
     def _relook(self, xml):

@@ -5969,7 +5969,7 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(batches[1], ["waitForIdle", "dumpWindowHierarchy"])
         self.assertEqual(dm._last_xml, results)
         # a key too; still the same after: kept as it is
-        self.assertEqual(run({"key": 4, "idle": 1200}, SAMPLE_XML, again=SAMPLE_XML), SAMPLE_XML)
+        self.assertEqual(run({"key": 4, "idle": 1200}, SAMPLE_XML, again=SAMPLE_XML), mod.marked_unchanged(SAMPLE_XML))
         self.assertEqual(len(batches), 2)
         # the same words in other places, or the focus moved: the tapped bar
         # slid before the screen it opened was drawn (Settings' search, Oct 7)
@@ -6026,6 +6026,33 @@ class WebPathTests(OfflineTestCase):
         self.assertNotEqual(mod.screen_words(toggled), mod.screen_words(before_toggle))
         run({"tap": [540, 1550], "idle": 1200}, toggled, before=before_toggle)
         self.assertEqual(len(batches), 1)
+        # the same after the second look: said with the read, not on the
+        # read kept (Oct 7: an agent read the screen twice to be sure)
+        out = run({"key": 4, "idle": 1200}, SAMPLE_XML, again=SAMPLE_XML)
+        self.assertIn('<hierarchy unchanged="1"', out)
+        self.assertNotIn("unchanged", dm._last_xml)
+        out = run({"tap": [100, 250], "inert": True, "idle": 1200}, SAMPLE_XML, again=SAMPLE_XML)
+        self.assertIn('<hierarchy unchanged="inert"', out)
+        self.assertNotIn("unchanged", run({"tap": [250, 450], "idle": 1200}, SAMPLE_XML))  # changed
+        # a heading, and nothing around it that takes a click; a row in a
+        # clickable box
+        heading = ('<hierarchy rotation="0"><node text="" class="android.widget.FrameLayout" package="com.x" '
+                   'bounds="[0,0][1080,2400]" clickable="false"><node text="Device details" '
+                   'class="android.widget.TextView" package="com.x" bounds="[50,300][600,360]" clickable="false"/>'
+                   '<node text="" class="android.widget.LinearLayout" package="com.x" bounds="[0,400][1080,560]" '
+                   'clickable="true"><node text="Model" class="android.widget.TextView" package="com.x" '
+                   'bounds="[50,420][600,480]" clickable="false"/></node></node></hierarchy>')
+        self.assertTrue(mod.inert_row(heading, mod.label_node(heading, "Device details")[0]))
+        self.assertFalse(mod.inert_row(heading, mod.label_node(heading, "Model")[0]))
+        # the CLI says it
+        self.allow("u2sock", return_value=mod.marked_unchanged(SAMPLE_XML, inert=True))
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (o, e):
+            status, root, note = pc.act_and_read({"tap_label": "Hello"})
+        self.assertEqual((status, note), ("ok", "(unchanged: the row tapped is a heading or a label, "
+                                                "which opens nothing)"))
+        self.allow("u2sock", return_value=mod.marked_unchanged(SAMPLE_XML))
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (o, e):
+            self.assertEqual(pc.act_and_read({"key": 4})[2], "(unchanged)")
         # nothing readable on the read again: that read, not the one from
         # before the action (the CLI reads a thin screen again)
         self.assertEqual(run({"tap": [250, 450], "idle": 1200}, SAMPLE_XML, again=BARS_XML), BARS_XML)

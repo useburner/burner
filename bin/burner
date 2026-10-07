@@ -2074,8 +2074,14 @@ def act_and_read(action, prev_root=None, idle_ms=IDLE_ACT_MS, rereads=2):
         return "failed unreadable screen", None, ""
     _update_screen_from_dump(root)
     _trace("act {:.2f}s".format(time.time() - t0))
+    # the helper's word that the action left the screen as it was (after
+    # its second look): said, so the screen isn't read again to be sure
+    unchanged = root.get("unchanged")
     root, note = settled_read(prev_root, idle_ms=idle_ms, rereads=rereads,
                               first_root=root)
+    if unchanged and not note:
+        note = ("(unchanged: the row tapped is a heading or a label, which opens nothing)"
+                if unchanged == "inert" else "(unchanged)")
     return "ok", root, note
 
 
