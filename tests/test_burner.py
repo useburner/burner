@@ -8582,11 +8582,22 @@ class AirbnbRoundTests(OfflineTestCase):
     def test_a_failed_tap_s_evidence_takes_no_screenshot(self):
         # Oct 6: a failed `tap Storage` took 3.3s, 1.45s of it a screenshot
         # the assistant never opened (it took its own with `burner shot`)
-        self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
-        with mock.patch.object(pc, "shot_fast", side_effect=AssertionError("no screenshot")):
+        dump = self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
+        with mock.patch.object(pc, "shot_fast", side_effect=AssertionError("no screenshot")), \
+                mock.patch.object(pc, "_cached_root", return_value=None):
             ev = pc._capture_evidence("tap-fail")
         self.assertIsNone(ev["screenshot"])
-        self.assertIn("Hello [TextView]", ev["screen"])
+        # the rows as the screen prints them (Oct 7: the first row listed
+        # was the status bar's clock)
+        self.assertEqual(ev["screen"], pc.screen_lines(pc.walk(ET.fromstring(SAMPLE_XML)), *pc.screen_dims())[0])
+        self.assertIn("Hello (300,250)", ev["screen"])
+        clock = SAMPLE_XML.replace("</hierarchy>", '<node text="8:14" class="android.widget.TextView" '
+                                   'package="com.android.systemui" bounds="[40,10][160,90]"/></hierarchy>')
+        dump.reset_mock()
+        with mock.patch.object(pc, "_cached_root", return_value=ET.fromstring(clock)):
+            ev2 = pc._capture_evidence("tap-fail")
+        self.assertFalse(any("8:14" in row for row in ev2["screen"]))
+        dump.assert_not_called()  # the newest read, not one more
         text = pc._format_evidence(ev)
         self.assertIn("screen was showing:", text)
         self.assertIn("(`burner state` lists it all; `burner shot` shows it)", text)

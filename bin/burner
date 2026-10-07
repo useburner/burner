@@ -2173,23 +2173,21 @@ def cmd_snap(args):
 
 
 def _capture_evidence(tag):
-    """Capture failure evidence: the screen's top rows, from the read just
-    taken. Returns a dict with 'screenshot' (None: a failed tap used to
-    take one, 1.45s, which the assistant didn't open and took again with
-    `burner shot`, Oct 6) and 'screen' (a list of top dump lines). `tag`
+    """Capture failure evidence: the screen's top rows as the screen
+    prints them (see screen_lines: the status bar and the keyboard's keys
+    left out; the first row listed was the status bar's clock, "8:14",
+    Oct 7), from the helper's newest read (the one the failure was decided
+    on), else a read now. Returns a dict with 'screenshot' (None: a failed
+    tap used to take one, 1.45s, which the assistant didn't open and took
+    again with `burner shot`, Oct 6) and 'screen' (a list of rows). `tag`
     names the failure (tap-fail, wait-fail). Best-effort: never raises,
     never blocks the error report."""
     ev = {"screenshot": None, "screen": []}
     try:
-        nodes = walk(ui_dump())
-        # Top 15 nodes with text/desc, compact one-line format.
-        for n in nodes[:50]:
-            label = n.get("text") or n.get("desc") or ""
-            if label:
-                cls = (n.get("class") or "").split(".")[-1]
-                ev["screen"].append("{} [{}]".format(label[:60], cls))
-            if len(ev["screen"]) >= 15:
-                break
+        root = _cached_root()
+        if root is None:
+            root = ui_dump()
+        ev["screen"] = screen_lines(walk(root), *screen_dims())[0][:15]
     except Exception:
         pass
     return ev
