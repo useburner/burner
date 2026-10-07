@@ -1501,20 +1501,22 @@ def hint_field(xml, label):
 
 # A label for a secret names only a password field loosely: a search box
 # holding "password manager" took a password for `--field Password`
-# (review of Oct 7).
-SECRET_WORDS = ("password", "passcode", "passphrase", "pin", "code", "cvv", "cvc", "otp")
+# (review of Oct 7). Not "code" or "otp": a verification code's, a zip
+# code's or a promo code's field is a plain text field.
+SECRET_WORDS = ("password", "passcode", "passphrase", "pin", "cvv", "cvc")
 
 
-def field_named(label, n):
+def field_named(label, n, focused_ok=False):
     """Whether text field `n` is named loosely by `label` (any "a || b"
     alternative): the head of its words, a leading symbol aside, is the
     label's as whole words ("Email or phone" for `Email`: an empty field
-    reads its hint); it doesn't have the focus (its words may be what is
-    being typed); a secret's label names only a password field. Pure."""
-    if not n.get("field") or n.get("focused"):
+    reads its hint); without the focus, unless `focused_ok` (a focused
+    field's words may be what is being typed: it is named only when no
+    other field is); a secret's label names only a password field. Pure."""
+    if not n.get("field") or (n.get("focused") and not focused_ok):
         return False
     for a in [plain_words(p).lower() for p in label.split("||") if p.strip()]:
-        if any(w in SECRET_WORDS for w in a.split()) and not n.get("password"):
+        if any(w in SECRET_WORDS for w in re.findall(r"[a-z]+", a)) and not n.get("password"):
             continue
         for s in (n.get("text"), n.get("desc")):
             head = re.sub(r"^[^\w]+", "", plain_words(s).lower())
@@ -1535,9 +1537,14 @@ def loose_field(xml, label):
     except Exception:
         return None
     size = screen_size(nodes)
-    hits = [n for n in nodes if field_named(label, n) and not cut_off(n)
-            and row_over(nodes, [n], tuple(n["center"]), size) is None]
-    return hits[0] if len(hits) == 1 else None
+    # a field with the focus only when no other is named (an auto-focused
+    # "Email or phone" reads its hint, review of Oct 7)
+    for focused_ok in (False, True):
+        hits = [n for n in nodes if field_named(label, n, focused_ok) and not cut_off(n)
+                and row_over(nodes, [n], tuple(n["center"]), size) is None]
+        if hits:
+            return hits[0] if len(hits) == 1 else None
+    return None
 
 
 def field_node(xml, label):
@@ -3089,22 +3096,28 @@ def find_node(xml, needle, fuzzy=True, names=False):
     nodes = list(iter_nodes(xml))
     h = max((n["rect"][3] for n in nodes), default=0)
 
-    def named(nl, n, labels):
+    def named(nl, n, labels, focused_ok=False):
         # for a tap: a row the words name, or a field they name with
         # nothing over it (a field only takes the focus; review of Oct 7)
         if any(fuzzy_ok(nl, l) for l in labels if nl in l):
             return True
-        return field_named(nl, n) and row_over(nodes, [n], tuple(n["center"]), screen_size(nodes)) is None
+        return (field_named(nl, n, focused_ok)
+                and row_over(nodes, [n], tuple(n["center"]), screen_size(nodes)) is None)
     for nl in needles:
+        focused_sub = None  # a field with the focus, when no other row is named
         for n in nodes:
             labels = (plain_words(n["text"]).lower(), plain_words(n["desc"]).lower())
             if nl in labels:
                 return n
-            if (fuzzy and first_sub is None and any(nl in l for l in labels)
-                    and not bar_icon(n, h) and (not names or named(nl, n, labels))):
-                first_sub = n
+            if fuzzy and first_sub is None and any(nl in l for l in labels) and not bar_icon(n, h):
+                if not names or named(nl, n, labels):
+                    first_sub = n
+                elif focused_sub is None and named(nl, n, labels, focused_ok=True):
+                    focused_sub = n
         if first_sub is not None:
             return first_sub
+        if focused_sub is not None:
+            return focused_sub
     return None
 
 

@@ -1475,6 +1475,31 @@ class AmbiguousTapTests(OfflineTestCase):
         two = email.replace('</node></hierarchy>', '<node text="Email again" class="android.widget.EditText" '
                             'bounds="[150,400][850,520]" clickable="true" enabled="true"/></node></hierarchy>')
         self.assertIsNone(mod.field_node(two, "Email"))  # two fields hold it
+        # an empty field reads its hint, focus or not: an auto-focused "Email
+        # or phone" is named by `Email` (review of Oct 7) ...
+        focused = email.replace('text="Email or phone"', 'text="Email or phone" focused="true"')
+        self.assertEqual(mod.field_node(focused, "Email")["text"], "Email or phone")
+        self.assertEqual(mod.find_node(focused, "Email", names=True)["text"], "Email or phone")
+        plan = pc.plan_tap(pc.walk(ET.fromstring(focused)), 1080, 2400, text="Email")
+        self.assertEqual((plan["action"], plan["node"]["text"]), ("tap", "Email or phone"))
+        # ... but a field without the focus comes first (the focused one's
+        # words may be what was typed)
+        both = focused.replace('text="Email or phone" focused="true"', 'text="Email updates" focused="true"').replace(
+            '</node></hierarchy>', '<node text="Email address" class="android.widget.EditText" '
+            'bounds="[150,400][850,520]" clickable="true" enabled="true"/></node></hierarchy>')
+        self.assertEqual(mod.field_node(both, "Email")["text"], "Email address")
+        self.assertEqual(mod.find_node(both, "Email", names=True)["text"], "Email address")
+        self.assertEqual(pc.plan_tap(pc.walk(ET.fromstring(both)), 1080, 2400, text="Email")["node"]["text"],
+                         "Email address")
+        # a code isn't a secret's word ("Verification code", "Zip code"); a
+        # secret's label is one whatever its marks ("PIN:")
+        code = email.replace('text="Email or phone"', 'text="Verification code, 6 digits"')
+        self.assertEqual(mod.field_node(code, "Verification code")["text"], "Verification code, 6 digits")
+        self.assertEqual(pc.plan_tap(pc.walk(ET.fromstring(code)), 1080, 2400, text="Verification code")["action"],
+                         "tap")
+        pin = email.replace('text="Email or phone"', 'text="PIN: 4 digits"')
+        self.assertIsNone(mod.field_node(pin, "PIN:"))
+        self.assertEqual(pc.plan_tap(pc.walk(ET.fromstring(pin)), 1080, 2400, text="PIN:")["action"], "nomatch")
         # rows named once each, in full; the advice quoted for the shell
         twice = voice.replace('</node></hierarchy>', '<node text="Search with your voice" '
                               'class="android.widget.TextView" bounds="[890,160][990,260]" clickable="false" '
@@ -3571,6 +3596,9 @@ def _u2mux():
         "u2mux_under_test", os.path.join(ROOT, "lib", "u2", "u2mux.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    # its log() writes run/u2mux.log: the tests' lines go elsewhere (they
+    # had read as the phone's, review of Oct 7)
+    mod.LOG_FILE = os.path.join(tempfile.gettempdir(), "burner-tests-u2mux.log")
     return mod
 
 
@@ -4247,6 +4275,24 @@ class HelperStalenessTests(OfflineTestCase):
         with mock.patch.object(pc, "helper_starting", return_value=False),                 mock.patch.object(pc, "_helper_waited", False),                 mock.patch.object(pc.os.path, "exists", return_value=False),                 mock.patch.object(pc, "u2_start_background", lambda force=False: started.append(2)),                 self.assertRaises(OSError):
             pc.connect_helper(Sock(), 5)
         self.assertEqual((len(attempts), started), (1, [True]))
+
+    def test_a_pid_that_came_back_as_another_process_is_no_helper(self):
+        # after a reboot the pid file's number can name another process: a
+        # refused socket then read as a busy helper, never started again
+        # (review of Oct 7)
+        pid_file = os.path.join(tempfile.mkdtemp(), "u2-mux.pid")
+        with open(pid_file, "w") as f:
+            f.write("4242")
+        with mock.patch.object(pc, "U2_PID", pid_file), mock.patch.object(pc.os, "kill") as kill:
+            for command, alive in (("python3 /home/hatch/burner/lib/u2/u2mux.py", True),
+                                   ("/usr/bin/vim notes.txt", False),
+                                   ("", True)):  # can't be read: taken for the helper
+                with mock.patch.object(pc, "_process_command", return_value=command):
+                    self.assertEqual(pc.helper_alive(), alive, command)
+            kill.side_effect = ProcessLookupError()
+            self.assertFalse(pc.helper_alive())  # no such process
+        with mock.patch.object(pc, "U2_PID", pid_file + ".none"):
+            self.assertFalse(pc.helper_alive())  # no pid file
 
     def test_a_busy_helper_is_waited_for_not_replaced(self):
         # Oct 7: a helper relinking the phone took no call for a moment; the
