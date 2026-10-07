@@ -1007,6 +1007,13 @@ def window_over(windows_xml, rect, front_pkg):
     return None
 
 
+def _log_handshake(page):
+    """Say in the log that the page's session took a second handshake
+    (Chrome dropped the first: see cdp.Page.DROPPED)."""
+    if getattr(page, "handshake_again", False):
+        log("the page's session took a second handshake (Chrome dropped the first, busy)")
+
+
 def _log_busy(screen):
     """Say in the log that a page read waited on its rows that said
     "Loading" (see cdp.read_loaded): how many, how long, how many left."""
@@ -1707,6 +1714,7 @@ class U2Daemon:
                     with _t("web page (after a launch)"):
                         self._web = _cdp().front_page(getattr(self.d, "_dev", None), current,
                                                       hint=bar or hint or None, quick=True)
+                    _log_handshake(self._web)
                     return self._web
                 except Exception as e:
                     current = None
@@ -1747,6 +1755,7 @@ class U2Daemon:
         try:
             with _t("web page"):
                 self._web = _cdp().front_page(getattr(self.d, "_dev", None), current, **hinted)
+            _log_handshake(self._web)
         except Exception as e:
             self._web = None
             # Chrome in front but no page answering (busy, or a native

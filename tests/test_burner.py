@@ -4906,6 +4906,90 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(ws.recv(), '{"id":1,"result":{"ok":true}}')
         self.assertIsNone(ws._handshake_key)
 
+    def test_a_session_chrome_drops_at_its_handshake_is_opened_again(self):
+        # Oct 7: Chrome's DevTools server takes no frame before it has
+        # accepted the handshake, and the accept waits on Chrome's main
+        # thread; just brought to the front, Chrome closed every session
+        # whose first commands came with the handshake, for 4-11s
+        import base64
+        import hashlib
+        cdp = _cdp()
+        opened = []
+
+        class Chrome:
+            """A stream to Chrome's DevTools socket: busy, a frame before
+            the handshake's answer closes it; the answer comes once the
+            client waits for it."""
+
+            def __init__(self, busy, refuse=b""):
+                self.busy, self.refuse, self.out, self.key = busy, refuse, b"", None
+                self.accepted = self.closed = False
+                self.frames = []
+                opened.append(self)
+
+            def settimeout(self, t):
+                pass
+
+            def close(self):
+                pass
+
+            def sendall(self, data):
+                data = bytes(data)
+                if data.startswith(b"GET "):
+                    self.key = data.split(b"Sec-WebSocket-Key: ", 1)[1].split(b"\r\n", 1)[0]
+                    if not self.busy:
+                        self._accept()
+                    return
+                if not self.accepted:
+                    self.closed = True  # a frame error: the connection closed
+                    return
+                n = data[1] & 0x7F
+                at = 2 if n < 126 else 4
+                n = n if n < 126 else int.from_bytes(data[2:4], "big")
+                msg = json.loads(cdp.xor_mask(data[at + 4:at + 4 + n], data[at:at + 4]).decode())
+                self.frames.append(msg["method"])
+                result = {"Page.getFrameTree": {"frameTree": {"frame": {"id": "F1", "url": "https://a/"}}},
+                          "Runtime.evaluate": {"result": {"type": "string", "value": "visible"}}}.get(msg["method"], {})
+                payload = json.dumps({"id": msg["id"], "result": result}).encode()
+                self.out += bytes([0x81, 126]) + len(payload).to_bytes(2, "big") + payload
+
+            def _accept(self):
+                if self.refuse:
+                    self.out += self.refuse
+                    return
+                self.accepted = True
+                accept = base64.b64encode(hashlib.sha1(self.key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+                self.out += b"HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+
+            def recv(self, n):
+                if not self.out and not self.closed and not self.accepted:
+                    self._accept()  # Chrome's main thread got to it while the client waited
+                got, self.out = self.out[:n], self.out[n:]
+                return got  # b"" once closed: what was sent before the close is read first
+        streams = []
+        with mock.patch.object(cdp, "open_stream", side_effect=lambda dev, timeout=6.0: streams.pop(0)):
+            # Chrome idle: one stream, the commands with the handshake
+            streams[:] = [Chrome(busy=False)]
+            page = cdp.Page(None, "T1")
+            self.assertEqual((len(opened), page.handshake_again, page.main_frame), (1, False, "F1"))
+            self.assertGreater(page.visible_at, 0)
+            # Chrome busy: the first stream dropped, the second's commands
+            # sent once the handshake is answered
+            opened.clear()
+            streams[:] = [Chrome(busy=True), Chrome(busy=True)]
+            page = cdp.Page(None, "T1")
+            self.assertEqual((len(opened), page.handshake_again, page.main_frame), (2, True, "F1"))
+            self.assertTrue(opened[0].closed)
+            self.assertEqual(opened[1].frames, ["Page.enable", "Page.getFrameTree", "Runtime.evaluate"])
+            self.assertGreater(page.visible_at, 0)
+            # any other refusal stands: one stream, no second handshake
+            opened.clear()
+            streams[:] = [Chrome(busy=False, refuse=b"HTTP/1.1 500 Internal Server Error\r\n\r\n")]
+            with self.assertRaises(cdp.NothingSent) as cm:
+                cdp.Page(None, "T1")
+            self.assertIn("500", str(cm.exception))
+            self.assertEqual(len(opened), 1)
+
     def test_a_direct_stream_is_kept_warm_with_a_ping(self):
         mod = _u2mux()
         ka = mod.KeepAliveHTTP()

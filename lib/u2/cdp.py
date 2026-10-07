@@ -99,6 +99,14 @@ class WebSocket:
         # is 0.4-0.75s from afar
         self._handshake_key = key
 
+    def handshake(self, timeout):
+        """Wait for Chrome's answer to the handshake, `timeout` at most,
+        before anything is sent (see Page: a busy Chrome drops a session
+        whose first commands come before that answer)."""
+        if self._handshake_key:
+            self.s.settimeout(timeout)
+            self._await_handshake()
+
     def _await_handshake(self):
         key, self._handshake_key = self._handshake_key, None
         resp = b""
@@ -269,8 +277,18 @@ class Page:
 
     lock = threading.RLock()  # a page built without __init__ (the tests) has this one
 
+    # A session's first commands go with its handshake (a round trip
+    # saved), but Chrome's DevTools server takes no frame before it has
+    # accepted the handshake (net/server/web_socket.cc: no encoder, a frame
+    # error, the connection closed), and the accept waits on Chrome's main
+    # thread: busy (Chrome just brought to the front), it closed every
+    # session for 4-11s after a launch (Oct 7). Then the session is opened
+    # again, its commands sent once the handshake is answered.
+    DROPPED = "websocket handshake: the stream closed"
+
     def __init__(self, dev, target, probe_s=None):
         self.target = target
+        self.handshake_again = False  # the session took a second handshake (see DROPPED)
         self.ws = WebSocket(open_stream(dev), "/devtools/page/" + target)
         self.n = 0
         self.lock = threading.RLock()  # one thread on the stream (a wait polls while a tap acts)
@@ -281,11 +299,19 @@ class Page:
         # bounded like a visibility probe (probe_s, PROBE_S by default, plus
         # the handshake's trip): a tab frozen in the background never
         # answers the question; a session that fails to open closes its stream
+        bound = (PROBE_S if probe_s is None else probe_s) + 0.6
+        first = [("Page.enable", {}), ("Page.getFrameTree", {}), _evaluate("document.visibilityState")]
         try:
-            res = self.call_many([("Page.enable", {}), ("Page.getFrameTree", {}),
-                                  _evaluate("document.visibilityState")],
-                                 timeout=(PROBE_S if probe_s is None else probe_s) + 0.6,
-                                 raise_errors=False)
+            try:
+                res = self.call_many(first, timeout=bound, raise_errors=False)
+            except NothingSent as e:
+                if str(e) != self.DROPPED:
+                    raise
+                self.ws.close()
+                self.handshake_again = True
+                self.ws = WebSocket(open_stream(dev), "/devtools/page/" + target)
+                self.ws.handshake(bound)
+                res = self.call_many(first, timeout=bound, raise_errors=False)
             for r in res[:2]:
                 if isinstance(r, Exception):
                     raise r
