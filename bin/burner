@@ -5641,7 +5641,10 @@ def app_match(pkgs, name):
     ("google chrome": com.android.chrome); and the words that matched when
     that last rule did (None otherwise). One word of several never decides
     alone: "calendar" took a third-party calendar for Google Calendar
-    (review, Oct 7). Pure."""
+    (review, Oct 7). The rules look for the words as whole parts of the
+    package's name first, then inside them ("flow" in com.wispr.flowapp):
+    "chrome" inside com.google.android.apps.chromecast.app listed Google
+    Home for "google chrome" (Oct 7). Pure."""
     words = name.lower().split()
     if not words:
         return [], None
@@ -5651,10 +5654,11 @@ def app_match(pkgs, name):
         rest = [APP_WORDS.get(w, w) for w in words if w not in APP_MAKER_WORDS]
         if rest and rest != rules[-1]:
             rules.append(rest)
-    for i, need in enumerate(rules):
-        hits = [p for p in pkgs if all(n in p.lower() for n in need)]
-        if hits:
-            return hits, (need if i == 2 else None)
+    for part_of in (lambda n, p: "." + n + "." in "." + p + ".", lambda n, p: n in p):
+        for i, need in enumerate(rules):
+            hits = [p for p in pkgs if all(part_of(n, p.lower()) for n in need)]
+            if hits:
+                return hits, (need if i == 2 else None)
     return [], None
 
 
@@ -7791,7 +7795,9 @@ def cmd_text(args):
         if text:
             print(_readable(text))
         if nxt < total:
-            # on stderr, so `burner text | grep ...` keeps it in sight
+            # on stderr, so `burner text | grep ...` keeps it in sight; after
+            # the text in a joined stream (2>&1 put it first, Oct 7)
+            sys.stdout.flush()
             print("(cut at {} of {}: `burner text --from {}` for the rest)".format(nxt, total, nxt),
                   file=sys.stderr)
         return 0
@@ -7809,6 +7815,7 @@ def cmd_text(args):
     if part:
         print(part)
     if start + len(part) < len(text):
+        sys.stdout.flush()
         print("(cut at {} of {}: `burner text --from {}` for the rest)".format(
             start + len(part), len(text), start + len(part)), file=sys.stderr)
     return 0

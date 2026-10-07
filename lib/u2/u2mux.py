@@ -800,19 +800,24 @@ def reconnect_device():
     handshake through the proxy often outlasts: 8-10s of tries, or "not
     online" (Oct 6)."""
     import adbutils
+    # each step timed: one "adb reconnect 7475ms" left no word which one
+    # took the time (ESPN, Oct 7)
     tunnel = os.path.join(ROOT, "tunnel.sh")
     if os.path.exists(tunnel):
         try:
-            subprocess.run(["bash", tunnel, "start"], stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=20)
+            with _t("tunnel start"):
+                subprocess.run(["bash", tunnel, "start"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=20)
         except Exception as e:
             log("the tunnel couldn't be started (%s)" % err_text(e, 80))
     try:
-        adbutils.adb.disconnect(TARGET)
+        with _t("adb disconnect"):
+            adbutils.adb.disconnect(TARGET)
     except Exception:
         pass
     try:
-        out = " ".join(str(adbutils.adb.connect(TARGET, timeout=ADB_CONNECT_S)).split())
+        with _t("adb connect"):
+            out = " ".join(str(adbutils.adb.connect(TARGET, timeout=ADB_CONNECT_S)).split())
     except Exception as e:
         out = "failed (%s)" % err_text(e, 100)
     log("adb connect %s: %s" % (TARGET, out[:80]))

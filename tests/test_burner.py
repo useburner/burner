@@ -1922,6 +1922,15 @@ class SetupWizardTests(OfflineTestCase):
         self.assertIn('no app holds every word of "Google Maps"; these hold "maps"', err.getvalue())
         self.assertEqual(pc.app_matches(["com.google.android.apps.maps", "com.here.app.maps"], "google maps"),
                          ["com.google.android.apps.maps"])
+        # whole parts of the name first: Google Home's package holds
+        # "chromecast", which listed it for "google chrome" (Oct 7)
+        home = ["com.android.chrome", "com.google.android.apps.chromecast.app", "com.wispr.flowapp"]
+        self.assertEqual(pc.app_match(home, "google chrome"), (["com.android.chrome"], ["chrome"]))
+        self.assertEqual(pc.app_matches(home, "chrome"), ["com.android.chrome"])
+        self.assertEqual(pc.app_matches(home, "chromecast"), ["com.google.android.apps.chromecast.app"])
+        self.assertEqual(pc.app_matches(home, "wispr flow"), ["com.wispr.flowapp"])  # inside a part, after
+        self.assertEqual(pc.app_matches(["com.google.android.apps.docs", "com.google.android.gm"], "drive"),
+                         ["com.google.android.apps.docs"])
         self.assertEqual(pc.app_matches(["com.example.notes"], "my notes"), [])
         self.assertEqual(pc.app_matches(["a.b"], "  "), [])
         with self.cap() as (out, err):
