@@ -1872,6 +1872,31 @@ class SetupWizardTests(OfflineTestCase):
         self.assertEqual(rc, 0)
         sw.assert_not_called()
 
+    def test_scroll_to_tells_the_list_s_end_from_a_dropped_swipe(self):
+        # Oct 7, right after `burner update`: ten swipes moved nothing and
+        # the search said "not found after 10 scrolls" (11.4s)
+        top = pc.ET.fromstring('<hierarchy><node text="Apps" package="com.android.settings" '
+                               'bounds="[0,100][1080,300]"/></hierarchy>')
+        below = pc.ET.fromstring('<hierarchy><node text="Battery" package="com.android.settings" '
+                                 'bounds="[0,100][1080,300]"/></hierarchy>')
+        self.allow("ui_dump", return_value=top)
+        steps = self.allow("_scroll_step", return_value=top)  # the swipe moved nothing
+        adb = self.allow("_scroll_swipe")
+        # the swipe over adb moves the list: the first was dropped, the search goes on
+        self.allow("_settled_dump", return_value=below)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to="Battery", quiet=True))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertIn("found: Battery", out.getvalue())
+        self.assertEqual((steps.call_count, adb.call_count), (1, 1))
+        # it doesn't move either: the list's end, said after one scroll, not ten
+        self.allow("_settled_dump", return_value=top)
+        steps.reset_mock()
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to="Battery", quiet=True))
+        self.assertEqual((rc, steps.call_count), (1, 1))
+        self.assertIn("not found: Battery (the list doesn't move any further down after 1 scroll)", err.getvalue())
+
     def test_scrcpy_ping_sends_nothing_to_the_phone(self):
         # ping used to send a BACK key-up, which pressed Back on the phone
         # whenever a command healed the helpers.

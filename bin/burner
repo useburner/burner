@@ -4967,6 +4967,7 @@ def cmd_scroll(args):
         return _scroll_plain(args.direction, times, quiet=quiet)
     root = ui_dump()  # also refreshes the screen size
     pkg = dump_package(root)
+    before = visible_lines(walk(root))
     for i in range(times + 1):
         hits = rows_holding(walk(root), args.to)
         if hits:
@@ -4990,6 +4991,24 @@ def cmd_scroll(args):
             print("scroll left {} (now in {}); stopped.".format(pkg, now),
                   file=sys.stderr)
             return 1
+        after = visible_lines(walk(root))
+        if after == before and pkg not in WEB_APPS:
+            # nothing moved: the list's end, or a swipe that was dropped
+            # (right after `burner update` ten swipes moved nothing and the
+            # search said "not found", Oct 7): one swipe over adb tells
+            _trace("the screen didn't move; one swipe over adb")
+            _scroll_swipe(args.direction)
+            again = _settled_dump()
+            if again is not None:
+                root = again
+                after = visible_lines(walk(root))
+            if after == before:
+                print("not found: {} (the list doesn't move any further {} after {} scroll{})".format(
+                    args.to, args.direction, i + 1, "" if i == 0 else "s"), file=sys.stderr)
+                if not quiet:
+                    print_screen(root)
+                return 1
+        before = after
     print("not found after {} scrolls: {}".format(times, args.to),
           file=sys.stderr)
     if not quiet:
