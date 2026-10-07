@@ -8370,6 +8370,27 @@ class AirbnbRoundTests(OfflineTestCase):
                           ("act", "hunter2", None, None)])
         self.assertIn("typed 7 chars", out.getvalue())
 
+    def test_a_fuzzy_label_never_means_a_bar_icon(self):
+        # the battery task, Oct 6: "Battery" below the fold; the fuzzy match
+        # found the status bar's "Battery 79 percent." and tapped it
+        icon = ('<node text="" content-desc="Battery 79 percent." class="android.widget.ImageView" '
+                'package="com.android.systemui" bounds="[900,30][1000,110]" clickable="false" enabled="true"/>')
+        screen = SAMPLE_XML.replace("</hierarchy>", icon + "</hierarchy>")
+        nodes = pc.walk(ET.fromstring(screen))
+        self.assertEqual(pc.find_nodes(nodes, "Battery", exact=False), [])
+        self.assertEqual(pc.plan_tap(nodes, 1080, 2400, text="Battery")["action"], "nomatch")
+        self.assertEqual(len(pc.find_nodes(nodes, "Battery 79 percent.")), 1)  # an exact match still finds it
+        # a row of the app with the words: found
+        row = screen.replace("</hierarchy>", '<node text="Battery saver" class="android.widget.TextView" '
+                             'package="com.android.settings" bounds="[100,1500][900,1600]" clickable="true" enabled="true"/></hierarchy>')
+        self.assertEqual([n["text"] for n in pc.find_nodes(pc.walk(ET.fromstring(row)), "Battery", exact=False)],
+                         ["Battery saver"])
+        # the helper's waits alike
+        mod = _u2mux()
+        self.assertIsNone(mod.find_node(screen, "Battery"))
+        self.assertEqual(mod.find_node(row, "Battery")["text"], "Battery saver")
+        self.assertEqual(mod.find_node(screen, "Battery 79 percent.", fuzzy=False)["desc"], "Battery 79 percent.")
+
     def test_a_failed_tap_s_evidence_takes_no_screenshot(self):
         # Oct 6: a failed `tap Storage` took 3.3s, 1.45s of it a screenshot
         # the assistant never opened (it took its own with `burner shot`)

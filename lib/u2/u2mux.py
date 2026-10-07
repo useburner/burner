@@ -2822,20 +2822,38 @@ def keyboard_in(xml):
     return False
 
 
+# The system UI's icons in the status bar and the navigation bar (the
+# battery, the signal, the clock) are never what a fuzzy label means:
+# `tap Battery`, with "Battery" below the fold, matched the status bar's
+# "Battery 79 percent." and tapped it (the battery task, Oct 6).
+BAR_FRACTION = 0.07  # the bars' height, as a share of the screen's
+
+
+def bar_icon(node, h):
+    """Whether a node (from iter_nodes) is one of the system UI's icons in
+    the status bar or the navigation bar, on a screen `h` pixels tall. Pure."""
+    if node.get("pkg") != SYSTEM_UI or not h:
+        return False
+    y1, y2 = node["rect"][1], node["rect"][3]
+    return y2 <= h * BAR_FRACTION or y1 >= h * (1 - BAR_FRACTION)
+
+
 def find_node(xml, needle, fuzzy=True):
     """First node whose text or content-desc matches needle: exact
-    (case-insensitive) match wins, then substring if fuzzy. "A || B"
-    matches any of the labels (the first found, in that order). None on
-    miss."""
+    (case-insensitive) match wins, then substring if fuzzy (never on a
+    status or navigation bar icon, see bar_icon). "A || B" matches any of
+    the labels (the first found, in that order). None on miss."""
     needles = [plain_words(p).lower() for p in needle.split("||") if p.strip()]
     first_sub = None
     nodes = list(iter_nodes(xml))
+    h = max((n["rect"][3] for n in nodes), default=0)
     for nl in needles:
         for n in nodes:
             labels = (plain_words(n["text"]).lower(), plain_words(n["desc"]).lower())
             if nl in labels:
                 return n
-            if fuzzy and first_sub is None and any(nl in l for l in labels):
+            if (fuzzy and first_sub is None and any(nl in l for l in labels)
+                    and not bar_icon(n, h)):
                 first_sub = n
         if first_sub is not None:
             return first_sub

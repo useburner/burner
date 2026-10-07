@@ -1056,6 +1056,35 @@ def plain_words(s):
     return " ".join((s or "").translate(_PLAIN).split())
 
 
+# The system UI's icons in the status bar and the navigation bar (the
+# battery, the signal, the clock) are never what a fuzzy label means:
+# `tap Battery`, with "Battery" below the fold, matched the status bar's
+# "Battery 79 percent." and tapped it (the battery task, Oct 6).
+BAR_FRACTION = 0.07  # the bars' height, as a share of the screen's
+
+
+def bar_icon(node, h):
+    """Whether a node is one of the system UI's icons in the status bar or
+    the navigation bar (see BAR_FRACTION), on a screen `h` pixels tall. Pure."""
+    if node.get("package") != "com.android.systemui" or not h:
+        return False
+    m = re.match(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]", node.get("bounds") or "")
+    if not m:
+        return False
+    y1, y2 = int(m.group(2)), int(m.group(4))
+    return y2 <= h * BAR_FRACTION or y1 >= h * (1 - BAR_FRACTION)
+
+
+def _screen_height(nodes):
+    """The bottom of the lowest node: the screen's height on a full read. Pure."""
+    best = 0
+    for n in nodes:
+        m = re.match(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]", n.get("bounds") or "")
+        if m:
+            best = max(best, int(m.group(4)))
+    return best
+
+
 def find_nodes(nodes, text, exact=True):
     def label(n):
         return plain_words(n["text"] or n["desc"] or "")
@@ -1063,7 +1092,8 @@ def find_nodes(nodes, text, exact=True):
     if exact:
         return [n for n in nodes if label(n) == text]
     tl = text.lower()
-    return [n for n in nodes if tl in label(n).lower()]
+    h = _screen_height(nodes)
+    return [n for n in nodes if tl in label(n).lower() and not bar_icon(n, h)]
 
 
 def as_json(args):
