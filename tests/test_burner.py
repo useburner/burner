@@ -5894,6 +5894,20 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(len(batches), 2)
         self.assertEqual(mod.words_changed(SAMPLE_XML, results), [("-", "Hello"), ("+", "Search results")])
         self.assertEqual(mod.words_changed(SAMPLE_XML, moved), [])
+        # a tap by words, its row still there and nothing new, rows gone (the
+        # page fading out for the screen it opened): a second look
+        fading = SAMPLE_XML.replace('text="Hello"', 'text=""')
+        self.assertTrue(mod.nothing_new(fading, SAMPLE_XML))
+        self.assertFalse(mod.nothing_new(results, SAMPLE_XML))
+        self.assertEqual(run({"tap": [500, 650], "tapped_label": "OK", "idle": 1200}, fading), results)
+        self.assertEqual(len(batches), 2)
+        # its row gone (a dialog's button that closed it): one trip
+        no_ok = fading.replace('text="OK"', 'text=""')
+        run({"tap": [500, 650], "tapped_label": "OK", "idle": 1200}, no_ok)
+        self.assertEqual(len(batches), 1)
+        # a tap by coordinates with rows gone: one trip, as before
+        run({"tap": [500, 650], "idle": 1200}, fading)
+        self.assertEqual(len(batches), 1)
         # a switch's state is no place: a toggle's read is kept, one trip
         toggled = SAMPLE_XML.replace("</hierarchy>", '<node text="Wi-Fi" checked="true" package="com.example" '
                                      'class="android.widget.Switch" bounds="[0,1500][1080,1600]"/></hierarchy>')

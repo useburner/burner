@@ -1423,6 +1423,21 @@ def screen_words(xml):
         return None
 
 
+def nothing_new(xml, before):
+    """Whether a read after an action shows no row the read before didn't
+    (see screen_words: the same rows, or fewer, places and focus aside):
+    a screen still fading out for the next one. Pure."""
+    a, b = screen_words(xml), screen_words(before)
+    if not a or b is None:
+        return False
+    pool = list(b)
+    for w in a:
+        if w not in pool:
+            return False
+        pool.remove(w)
+    return True
+
+
 def words_changed(before, after):
     """The rows' words in one read and not the other, as ("-" or "+", the
     words cut to 40 characters), switch states aside; None for a read that
@@ -2945,16 +2960,22 @@ class U2Daemon:
             if (before and acted and "set_text" not in spec and not sleeps_the_screen(spec)
                     and not chrome_in(xml)
                     and (screen_sig(xml) == screen_sig(before) or half_drawn_after(xml, before)
-                         or (screen_words(xml) is not None and screen_words(xml) == screen_words(before)))):
+                         or (screen_words(xml) is not None and screen_words(xml) == screen_words(before))
+                         # a tap by words that left its row there and brought
+                         # nothing new: the screen fading out for the next one
+                         # (Settings' search, Oct 7)
+                         or (spec.get("tapped_label") and nothing_new(xml, before)
+                             and find_node(xml, spec["tapped_label"], fuzzy=False) is not None))):
                 xml = self._relook(xml)
             elif before and acted and "set_text" not in spec:
-                # a few rows changed, and no second look: which (a tap that
-                # opened another app's screen read as the page before it with
-                # some words changed, and nothing said which, Oct 7)
+                # changed, and no second look: how (a tap that opened
+                # another app's screen read as the page before it, changed
+                # in some rows, and nothing said how, Oct 7)
                 changed = words_changed(before, xml)
-                if changed and len(changed) <= 4:
-                    log("act read: %d row%s changed: %s" % (len(changed), "" if len(changed) == 1 else "s",
-                                                            "; ".join("%s%r" % c for c in changed)))
+                if changed:
+                    log("act read: %d rows gone, %d new; %s" % (
+                        sum(1 for c in changed if c[0] == "-"), sum(1 for c in changed if c[0] == "+"),
+                        "; ".join("%s%r" % c for c in changed[:4])))
             # The action landed in Chrome: the page itself says what it
             # shows now (the screen reader's tree may lag it). The read is
             # the newest first, so that the page is asked only with Chrome
