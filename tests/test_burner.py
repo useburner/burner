@@ -3616,6 +3616,50 @@ class OneRoundTripTests(OfflineTestCase):
         self.assertIn("pressed BACK", out.getvalue())
         self.assertIn("screen: com.example", out.getvalue())
 
+    def test_enter_goes_only_with_somewhere_to_type(self):
+        # a check through Muse, Oct 7: a type that failed, then Enter, on
+        # YouTube's account list: "Add account" had the focus, and Google's
+        # sign-in opened
+        self.allow("u2_invalidate")
+        self.allow("nav_record")
+        sc = self.allow("scrcpy_send", return_value=True)
+        adb = self.allow("adb_or_ensure")
+        self.assertTrue(pc.enter_target(pc.walk(ET.fromstring(SAMPLE_XML))))  # a focused field
+        self.assertFalse(pc.enter_target(pc.walk(ET.fromstring(TAP_XML))))
+        kbd = TAP_XML.replace("</hierarchy>", '<node text="" class="android.widget.FrameLayout" '
+                              'package="com.google.android.inputmethod.latin" bounds="[0,1600][1080,2400]"/></hierarchy>')
+        self.assertTrue(pc.enter_target(pc.walk(ET.fromstring(kbd))))  # the keyboard up: a page's field
+        calls = []
+        screen = [TAP_XML]
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append((cmd, arg))
+            return screen[0]
+        self.allow("u2sock", side_effect=u2)
+        for key in ("enter", "ENTER", "KEYCODE_ENTER", "66", "DPAD_CENTER", "NUMPAD_ENTER"):
+            calls.clear()
+            with self.cap() as (out, err):
+                rc = pc.cmd_press(self.parse(["press", key]))
+            self.assertEqual(rc, 1, key)
+            self.assertIn("no text field has the focus and the keyboard is closed", err.getvalue())
+            self.assertIn("nothing was pressed", err.getvalue())
+            self.assertEqual([c for c, _ in calls], ["dump"], key)  # the helper's newest read; no key sent
+        sc.assert_not_called()
+        adb.assert_not_called()
+        # a text field with the focus: the key goes, in one round trip
+        screen[0] = SAMPLE_XML
+        calls.clear()
+        with self.cap() as (out, err):
+            rc = pc.cmd_press(self.parse(["press", "enter"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual([(c, json.loads(a)) for c, a in calls if c == "act"], [("act", {"key": 66, "idle": 1200})])
+        # other keys never ask
+        screen[0] = TAP_XML
+        calls.clear()
+        with self.cap() as (out, err):
+            rc = pc.cmd_press(self.parse(["press", "BACK"]))
+        self.assertEqual((rc, [c for c, _ in calls]), (0, ["act"]))
+
     def test_press_with_modifiers_keeps_the_old_path(self):
         self.allow("u2_invalidate")
         self.allow("nav_record")

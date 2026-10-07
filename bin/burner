@@ -3413,6 +3413,35 @@ def type_keys(text, slow=False):
                           "".join(esc_char(c) for c in part))
 
 
+# Keys that press the control with the focus when no text field has it:
+# Enter, the numpad's Enter, the D-pad's centre.
+ENTER_KEYS = {66: "ENTER", 160: "NUMPAD_ENTER", 23: "DPAD_CENTER"}
+
+
+def enter_target(nodes):
+    """Whether a read has somewhere for Enter to go: a text field with the
+    focus, or the keyboard open (a page's field takes the focus without
+    a native text field having it). Pure."""
+    for n in nodes:
+        if is_ime_package(n.get("package")):
+            return True
+        if n.get("focused") and (n.get("class") or "").endswith("EditText"):
+            return True
+    return False
+
+
+def _enter_has_a_field():
+    """enter_target on the helper's newest read, else on a read now; True
+    when the screen can't be read (the key goes as it always did)."""
+    root = _cached_root()
+    if root is None:
+        try:
+            root = ui_dump()
+        except Exception:
+            return True
+    return enter_target(walk(root))
+
+
 def cmd_press(args):
     # Key combos: --ctrl/--shift/--alt/--meta send the modifier keyevent
     # before the main key (Android tracks the modifier state).
@@ -3429,6 +3458,17 @@ def cmd_press(args):
     delay_ms = getattr(args, "delay", 120) or 0
     quiet = getattr(args, "quiet", False)
     code = key_code(args.key)
+    name = (args.key or "").strip().upper()
+    if (code in ENTER_KEYS or name.replace("KEYCODE_", "") in ENTER_KEYS.values()) \
+            and not _enter_has_a_field():
+        # On a phone, Enter is a key of the keyboard, up only while a text
+        # field has the focus; with none, the key presses whatever control
+        # has the focus (YouTube's account list: "Add account", and Google's
+        # sign-in opened, Oct 7)
+        print("burner: press {}: no text field has the focus and the keyboard is closed, so the key "
+              "would press whatever control has the focus; nothing was pressed. Tap the button you "
+              "mean, or type into the field first.".format(args.key), file=sys.stderr)
+        return 1
     if not mods and repeat == 1 and code is not None and not quiet:
         # One round trip: the key, the wait for the screen, the read.
         status, root, note = act_and_read({"key": code}, idle_ms=IDLE_HOME_MS if code == 3 else IDLE_ACT_MS)
