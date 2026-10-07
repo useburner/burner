@@ -3467,6 +3467,14 @@ def cmd_type(args):
         if _u2_status.startswith("err"):
             _trace("set_text: {}".format(_u2_status[:60]))
             no_focus = "no editable field" in _u2_status
+        if no_focus and not args.field:
+            # nothing to type into on the newest read (no focused field, no
+            # keyboard): key events would go nowhere and say "typed"
+            root = _cached_root()
+            why = nowhere_to_type(root) if root is not None else ""
+            if why:
+                print("burner: nothing was typed: " + why, file=sys.stderr)
+                return 1
     # Key events into whatever has the focus: the scrcpy helper's open
     # connection types a whole string in a few milliseconds; adb's `input
     # text` is one call per string. Both work in fields that ignore
@@ -3482,6 +3490,27 @@ def cmd_type(args):
     print("typed {} chars ({})".format(len(args.text), how))
     read_after(quiet=quiet)
     return 0
+
+
+def nowhere_to_type(root):
+    """Why key events would go nowhere on this read, with what to tap
+    instead, or "": no text field has the focus and the keyboard is
+    closed (the Play Store's Search tab: a `type` before a tap on its bar
+    went out as key events into nothing, exit 0, Oct 7). Pure."""
+    nodes = walk(root)
+    _lines, keyboard = screen_lines(nodes, *screen_dims())
+    if keyboard or any(_is_text_field(n) and n.get("focused") for n in nodes):
+        return ""
+    boxes = []
+    for n in nodes:
+        words = plain_words(n.get("text") or n.get("desc") or "")
+        if words and (_is_text_field(n) or (n.get("clickable") and words.lower().startswith("search"))) \
+                and words not in boxes:
+            boxes.append(words)
+    if not boxes:
+        return "no text field has the focus and the keyboard is closed: tap the box first"
+    return ("no text field has the focus and the keyboard is closed: tap the box first "
+            "(`burner tap {0}`), or both at once: `burner type --field {0} TEXT`".format(_shell_words(boxes[0])))
 
 
 def focus_field(label):

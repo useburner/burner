@@ -6339,6 +6339,44 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(pc.plan_tap(pc.walk(ET.fromstring(box)), 1080, 2400, text="Spanish")["node"]["text"],
                          "Spanish")
 
+    def test_a_type_with_nowhere_to_go_says_so(self):
+        # Play Store, Oct 7: `type` right after the Search tab (its bar takes
+        # a tap first) went out as key events into nothing, exit 0
+        tab = ('<hierarchy rotation="0"><node text="" class="android.widget.FrameLayout" package="com.android.vending" '
+               'bounds="[0,0][1080,2400]"><node text="Search" class="android.widget.TextView" package="com.android.vending" '
+               'bounds="[0,100][1080,200]"/><node text="What are you looking for?" class="android.widget.TextView" '
+               'package="com.android.vending" bounds="[50,300][1030,400]" clickable="false"/>'
+               '<node text="Search or ask Play" class="android.view.View" package="com.android.vending" '
+               'bounds="[50,450][1030,560]" clickable="true"/></node></hierarchy>')
+        self.allow("screen_dims", return_value=(1080, 2400))
+        self.assertEqual(pc.nowhere_to_type(ET.fromstring(tab)),
+                         'no text field has the focus and the keyboard is closed: tap the box first '
+                         '(`burner tap "Search or ask Play"`), or both at once: '
+                         '`burner type --field "Search or ask Play" TEXT`')
+        focused = tab.replace('<node text="Search or ask Play" class="android.view.View"',
+                              '<node text="" focused="true" class="android.widget.EditText"')
+        self.assertEqual(pc.nowhere_to_type(ET.fromstring(focused)), "")
+        keyboard = tab.replace("</node></hierarchy>", '</node><node text="q" class="android.widget.Button" '
+                               'package="com.google.android.inputmethod.latin" bounds="[0,1800][100,1900]"/></hierarchy>')
+        self.assertEqual(pc.nowhere_to_type(ET.fromstring(keyboard)), "")
+        # the command: nothing typed, exit 1
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append(cmd)
+            if cmd == "dump":
+                return tab
+            pc._u2_status = "err no editable field has the focus" if cmd == "set_text" else "err act not sent: x"
+            return None
+        self.allow("u2sock", side_effect=u2)
+        keys = self.allow("type_keys")
+        with self.cap() as (out, err):
+            rc = pc.cmd_type(self.parse(["type", "lofi"]))
+        self.assertEqual(rc, 1)
+        self.assertIn('burner: nothing was typed: no text field has the focus', err.getvalue())
+        keys.assert_not_called()
+        self.assertNotIn("typed", out.getvalue())
+
     def test_a_field_is_named_by_its_resource_id_last(self):
         # Google Maps, Oct 7: the search box read the query before, so
         # `type --field Search` found no field and took the slow way (9.2s)
