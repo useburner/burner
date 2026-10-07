@@ -5643,7 +5643,7 @@ class WebPathTests(OfflineTestCase):
             return {"found": label != "Nope", "count": 2 if label == "Twice" else 1,
                     "label": label, "screen": WEB_SCREEN}
 
-        def scroll(page, direction="down", times=1, fraction=0.6, idle_ms=500):
+        def scroll(page, direction="down", times=1, fraction=0.6, idle_ms=500, grow_ms=0):
             calls.append(("scroll", direction, times, idle_ms))
             return {"moved": 1200, "screen": WEB_SCREEN}
         fake = types.SimpleNamespace(
@@ -6869,6 +6869,102 @@ class WebPathTests(OfflineTestCase):
         self.assertIn('found="1"', xml)
         self.assertIn("Preheat oven to 350 degrees F", xml)
         self.assertEqual(seen[-1], ("scroll_to", "Preheat", "down"))
+
+    def test_scroll_to_on_a_page_trusts_where_the_words_are_drawn(self):
+        # review, Oct 7: "found" for words off the screen (a list on it held
+        # them below), and "found" with no row to show for it
+        cdp = _cdp()
+        page = _ScriptedPage(cdp, {"SCROLL_TO_JS": {"found": True, "moved": 0, "used": "target phrase",
+                                                    "text": "Filler words go here. Filler\u2026"},
+                                   "READ_JS": WEB_SCREEN})
+        r = cdp.scroll_to(page, "target phrase")
+        self.assertEqual((r["found"], r["near"], r["screen"]["found_in"]), ("1", False, "Filler words go here. Filler\u2026"))
+        self.assertIn('found="1" found_in="Filler words go here. Filler\u2026">', cdp.page_xml(r["screen"], 283, 2400))
+        for answer, found, near in (({"found": False, "other": True, "near": True}, "other", True),
+                                    ({"found": False, "other": True, "near": False}, "other", False),
+                                    ({"found": False, "hidden": True}, "hidden", False),
+                                    ({"found": False}, "0", False), (None, "0", False)):
+            page = _ScriptedPage(cdp, {"SCROLL_TO_JS": answer, "READ_JS": WEB_SCREEN})
+            r = cdp.scroll_to(page, "Preheat")
+            self.assertEqual((r["found"], r["near"]), (found, near))
+            xml = cdp.page_xml(r["screen"], 283, 2400)
+            self.assertIn(' found="%s"' % found + (' near="1"' if near else "") + ">", xml)
+            self.assertNotIn("found_in", xml)
+        # the CLI
+        self.allow("wake")
+        self.allow("u2_invalidate")
+        calls = []
+        replies = []
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append(json.loads(arg) if arg.startswith("{") else arg)
+            return replies.pop(0) if len(replies) > 1 else replies[0]
+        self.allow("u2sock", side_effect=u2)
+        self.allow("ui_dump", return_value=ET.fromstring(cdp.page_xml(WEB_SCREEN, 283, 2400)))
+        # in view, in a row too long to read the words: that row named
+        replies[:] = [cdp.page_xml(dict(WEB_SCREEN, found="1", found_in="Filler words go here. Filler\u2026"),
+                                   283, 2400)]
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to="target phrase", quiet=True))
+        self.assertEqual((rc, out.getvalue()), (0, 'found: target phrase (in "Filler words go here. Filler\u2026")\n'))
+        # only above, and the page ends close by: the scrolls go on (a feed
+        # may load more), each giving the page a moment to grow, and the
+        # last word says where the page has it
+        stuck = cdp.page_xml(dict(WEB_SCREEN, moved=0), 283, 2400)
+        replies[:] = [cdp.page_xml(dict(WEB_SCREEN, found="other", near=True), 283, 2400), stuck]
+        calls.clear()
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to="Preheat", quiet=True))
+        self.assertEqual(rc, 1)
+        acts = [c for c in calls if isinstance(c, dict)]
+        self.assertEqual([(a.get("scroll_to"), a.get("scroll"), a.get("grow")) for a in acts],
+                         [("Preheat", None, None), (None, "down", pc.GROW_MS)])
+        self.assertIn("not found: Preheat (the page didn't move down at scroll 1: it is at its end, or a box over "
+                      "it takes the scroll; the page has it above: `burner scroll up --to \"Preheat\"`)", err.getvalue())
+        # only where it isn't shown: the scrolls look on, and say so at the end
+        moving = [cdp.page_xml(dict(WEB_SCREEN, moved=600, rows=[dict(WEB_SCREEN["rows"][0], text="row %d" % k)]),
+                               283, 2400) for k in range(3)]
+        replies[:] = [cdp.page_xml(dict(WEB_SCREEN, found="hidden"), 283, 2400)] + moving
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=2, to="Shipping details", quiet=True))
+        self.assertEqual(rc, 1)
+        self.assertIn("not found after 2 scrolls: Shipping details (the page has it only where it isn't shown, "
+                      "such as a closed section or a slide aside)", err.getvalue())
+
+    def test_a_search_scroll_at_the_end_waits_for_the_page_to_grow(self):
+        # review, Oct 7: a search stopped at a feed's end while it loaded more.
+        # The scrolls and the read wait each for the one before, in one trip.
+        cdp = _cdp()
+        page = _ScriptedPage(cdp, {"SCROLL_JS": {"moved": 600, "scroller": "page", "grew": True}, "READ_JS": WEB_SCREEN})
+        sent = []
+        real = page.call_many
+        page.call_many = lambda cmds, timeout=10.0, raise_errors=True: sent.append((cmds, timeout)) or real(cmds, timeout, raise_errors)
+        r = cdp.scroll(page, "down", times=2, grow_ms=1000)
+        self.assertEqual((r["moved"], r["grew"]), (1200, True))
+        cmds, timeout = sent[-1]
+        exprs = [p["expression"] for _m, p in cmds]
+        self.assertTrue(all(e.startswith("window.__burnerScroll = Promise.resolve(window.__burnerScroll)")
+                            for e in exprs[:2]))
+        self.assertTrue(exprs[2].startswith("Promise.resolve(window.__burnerScroll)"))
+        self.assertIn(", null, 1000)", exprs[0])  # the scroll's wait, at most
+        self.assertEqual(timeout, 12.0)
+        # a plain scroll: no wait, no chain
+        sent.clear()
+        cdp.scroll(page, "down")
+        self.assertIn(", null, 0)", sent[-1][0][0][1]["expression"])
+        self.assertNotIn("__burnerScroll", sent[-1][0][0][1]["expression"])
+        # no scroll answered: nothing said about moving (not "at its end")
+        page = _ScriptedPage(cdp, {"READ_JS": WEB_SCREEN})
+        real2 = page.call_many
+
+        def failing(cmds, timeout=10.0, raise_errors=True):
+            out = real2(cmds, timeout, raise_errors)
+            return [RuntimeError("stream closed")] * (len(out) - 1) + out[-1:]
+        page.call_many = failing
+        r = cdp.scroll(page, "down")
+        self.assertIsNone(r["moved"])
+        self.assertNotIn("moved=", cdp.page_xml(r["screen"], 283, 2400))
+        self.assertEqual(pc.page_stuck(ET.fromstring(cdp.page_xml(r["screen"], 283, 2400))), "")
 
     def test_a_page_scroll_says_how_far_the_page_moved(self):
         cdp = _cdp()

@@ -970,9 +970,10 @@ SETTLE_JS = r"""
 # A scroll by `fraction` of the viewport's height (down when positive):
 # the window, else the tallest element that scrolls (a page laid out
 # inside one scrolling box). "top"/"bottom" go to the ends. Returns how
-# far it moved.
+# far it moved. `grow` ms: going down at the end, the page this long at
+# most to grow (a feed loads more as it is scrolled), and the scroll again.
 SCROLL_JS = r"""
-(function(fraction, where){
+(function(fraction, where, grow){
   const dy = Math.round(innerHeight * fraction);
   const go = (el, isWin) => {
     const at = () => isWin ? scrollY : el.scrollTop;
@@ -988,60 +989,197 @@ SCROLL_JS = r"""
   const de = document.documentElement, body = document.body;
   const held = Math.max(de.scrollHeight, body ? body.scrollHeight : 0) > innerHeight + 2
     && [de, body].some(e => e && getComputedStyle(e).overflowY === 'hidden');
-  let moved = go(window, true);
-  if (moved !== 0) return {moved: moved, scroller: 'page', held: held};
-  let best = null, bestH = 0;
-  for (const el of document.querySelectorAll('div,main,section,article,ul,body')) {
-    if (el.scrollHeight <= el.clientHeight + 1 || el.clientHeight < innerHeight / 3) continue;
-    const oy = getComputedStyle(el).overflowY;
-    if (oy !== 'auto' && oy !== 'scroll') continue;
-    if (el.clientHeight > bestH) { best = el; bestH = el.clientHeight; }
-  }
-  if (!best) return {moved: 0, scroller: null, held: held};
-  moved = go(best, false);
-  return {moved: moved, scroller: best.tagName.toLowerCase(), held: held};
+  let box = null;
+  const once = () => {
+    const moved = go(window, true);
+    if (moved !== 0) return {moved: moved, scroller: 'page', held: held};
+    let best = null, bestH = 0;
+    for (const el of document.querySelectorAll('div,main,section,article,ul,body')) {
+      if (el.scrollHeight <= el.clientHeight + 1 || el.clientHeight < innerHeight / 3) continue;
+      const oy = getComputedStyle(el).overflowY;
+      if (oy !== 'auto' && oy !== 'scroll') continue;
+      if (el.clientHeight > bestH) { best = el; bestH = el.clientHeight; }
+    }
+    box = best;
+    if (!best) return {moved: 0, scroller: null, held: held};
+    // a box that scrolls in the page's place is its layout, not a hold
+    // (html hidden, body the scroller: "held" for nothing, review Oct 7)
+    return {moved: go(best, false), scroller: best.tagName.toLowerCase(), held: false};
+  };
+  const r = once();
+  if (r.moved !== 0 || !grow || where || dy <= 0) return r;
+  const tall = () => box ? box.scrollHeight : Math.max(de.scrollHeight, body ? body.scrollHeight : 0);
+  const h0 = tall(), t0 = performance.now();
+  return new Promise(done => {
+    const tick = () => {
+      if (tall() > h0 + 1) done(Object.assign(once(), {grew: true}));
+      else if (performance.now() - t0 >= grow) done(r);
+      else setTimeout(tick, 100);
+    };
+    setTimeout(tick, 100);
+  });
 })"""
 
 
-# `scroll --to` on a page: the element holding these words (any "a || b"
-# alternative, case and spaces aside; its text, or its aria-label, alt or
-# title) brought to the middle of the screen: one on the screen already
-# stays; else the nearest below it (down) or above it (up). {found, moved,
-# used, text}; {found: false, other: true} when the words are only on the
-# other side; {found: false} when the page doesn't hold them (yet).
+# `scroll --to` on a page: the words (any "a || b" alternative, case,
+# spaces and curly quotes aside; in the page's text, or an element's
+# aria-label, alt or title) where they are drawn, brought to the middle
+# of the screen: words on the screen already stay; else words beside it
+# (a carousel's slide, a row a list holds out of view), else the nearest
+# below (down) or above (up). Not the box around them: a list or a long
+# paragraph on the screen can hold them screens below (review, Oct 7).
+# {found, moved, used, text}; {found: false, other: true, near} when the
+# words are only on the other side (near: the page ends close by this
+# way, and may load more as it is scrolled); {found: false, hidden: true}
+# when only a box that hides them holds them (a 1px label for screen
+# readers, a closed section); {found: false} when the page doesn't hold
+# them (yet).
 SCROLL_TO_JS = r"""
 (function(label, direction){
   const squash = s => (s || '').replace(/[\u2018\u2019]/g, "'").replace(/\s+/g, ' ').trim().toLowerCase();
-  const vh = innerHeight, up = direction === 'up';
+  // the words in the page's own text: any spaces for a space, a curly
+  // quote for a straight one, case aside
+  const pattern = want => new RegExp(want.split(' ').map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    .replace(/'/g, "['\u2018\u2019]")).join('\\s+'), 'gi');
+  const vh = innerHeight, vw = innerWidth, up = direction === 'up';
   const shown = el => el.checkVisibility ? el.checkVisibility({visibilityProperty: true, opacityProperty: true}) : true;
-  let other = false;
+  const SKIP = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/;
+  const texts = root => document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {acceptNode: n =>
+    n.nodeType === 3 ? NodeFilter.FILTER_ACCEPT : SKIP.test(n.tagName) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_SKIP});
+  const de = document.documentElement, ds = getComputedStyle(de);
+  const bodyClips = ds.overflowX !== 'visible' || ds.overflowY !== 'visible';  // else body's overflow is the window's
+  // where the words are drawn: cut by every box around them that clips (a
+  // carousel's slide off to the side, a list's row scrolled out of it);
+  // null where such a box hides them for good (a 1px box for screen
+  // readers, a closed section)
+  const drawn = c => {
+    if (c.drawn !== undefined) return c.drawn;
+    const r = c.rect;
+    let t = r.top, b = r.bottom, l = r.left, rt = r.right;
+    for (let a = c.range ? c.el : c.el.parentElement; a && a !== de; a = a.parentElement) {
+      const s = getComputedStyle(a);
+      if ((s.overflowX !== 'visible' || s.overflowY !== 'visible') && (a !== document.body || bodyClips)) {
+        const k = a.getBoundingClientRect();
+        if (k.width < 2 || k.height < 2) return (c.drawn = null);
+        if (s.overflowX !== 'visible') { l = Math.max(l, k.left); rt = Math.min(rt, k.right); }
+        if (s.overflowY !== 'visible') { t = Math.max(t, k.top); b = Math.min(b, k.bottom); }
+      }
+      if (s.position === 'fixed') break;  // the boxes above it don't hold it
+    }
+    return (c.drawn = {top: t, bottom: b, left: l, right: rt});
+  };
+  // on the screen: most of a line of the words, not a sliver at its edge
+  const inView = c => {
+    const r = c.rect;
+    if (r.bottom <= 0 || r.top >= vh || r.right <= 0 || r.left >= vw) return false;
+    const k = drawn(c);
+    if (!k) return false;
+    const h = Math.min(k.bottom, vh) - Math.max(k.top, 0), w = Math.min(k.right, vw) - Math.max(k.left, 0);
+    return h > 0 && w > 0 && h >= Math.min(16, r.height) - 0.5 && w >= Math.min(16, r.width) - 0.5;
+  };
+  const scrollerOf = el => {
+    for (let a = el; a && a !== de; a = a.parentElement) {
+      const oy = getComputedStyle(a).overflowY;
+      if ((oy === 'auto' || oy === 'scroll') && a.scrollHeight > a.clientHeight + 1) return a;
+    }
+    return null;
+  };
+  const measure = c => { c.rect = (c.range || c.el).getBoundingClientRect(); c.drawn = undefined; return c; };
+  const say = c => {
+    const s = (c.el.textContent || c.el.getAttribute('aria-label') || c.el.getAttribute('alt')
+      || c.el.getAttribute('title') || '').replace(/\s+/g, ' ').trim();
+    return s.length > 80 ? s.slice(0, 79) + '\u2026' : s;
+  };
+  let other = null, hidden = null;
   for (const want of label.split('||').map(squash).filter(Boolean)) {
-    const hits = new Set();
-    const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    // the elements whose own text holds the words, or whose inline parts
+    // do ("Pre<b>heat</b> oven"), each looked at once; and those named so
+    const hits = new Set(), checked = new Set(), named = new Set();
+    const tw = texts(document.body);
     for (let t = tw.nextNode(); t; t = tw.nextNode()) {
       const p = t.parentElement;
-      if (!p || p.closest('script,style,noscript,template')) continue;
-      // the words in one text node, or across the inline parts of its
-      // element ("Pre<b>heat</b> oven")
+      if (!p || !t.nodeValue.trim()) continue;
       if (squash(t.nodeValue).includes(want)) hits.add(p);
-      else if (p.textContent.length < 1000 && squash(p.textContent).includes(want)) hits.add(p);
+      else if (!checked.has(p)) {
+        checked.add(p);
+        const all = p.textContent;
+        if (all.length < 1000 && squash(all).includes(want)) hits.add(p);
+      }
     }
     for (const el of document.body.querySelectorAll('[aria-label],[alt],[title]'))
-      if (squash(el.getAttribute('aria-label') || el.getAttribute('alt') || el.getAttribute('title')).includes(want)) hits.add(el);
-    const placed = [];
-    for (const el of hits) { if (!shown(el)) continue; const r = el.getBoundingClientRect(); if (r.width > 0 && r.height > 0) placed.push([el, r]); }
-    if (!placed.length) continue;
-    const here = placed.find(([el, r]) => r.bottom > 0 && r.top < vh);
-    if (here) return {found: true, moved: 0, used: want, text: squash(here[0].textContent).slice(0, 80)};
-    const ahead = placed.filter(([el, r]) => up ? r.bottom <= 0 : r.top >= vh)
-      .sort((a, b) => up ? b[1].bottom - a[1].bottom : a[1].top - b[1].top);
-    if (!ahead.length) { other = true; continue; }
-    const before = scrollY;
-    ahead[0][0].scrollIntoView({block: 'center', inline: 'nearest'});
-    return {found: true, moved: scrollY - before, used: want, text: squash(ahead[0][0].textContent).slice(0, 80)};
+      if (squash(el.getAttribute('aria-label') || el.getAttribute('alt') || el.getAttribute('title')).includes(want)) {
+        hits.add(el);
+        named.add(el);
+      }
+    // the innermost: a box holding one that holds the words is not where they are
+    const outer = new Set();
+    for (const h of hits) for (let a = h.parentElement; a && !outer.has(a); a = a.parentElement) outer.add(a);
+    const cands = [];
+    for (const el of hits) {
+      if (outer.has(el) || !shown(el)) continue;
+      let n = 0;
+      if (!named.has(el)) {
+        // the words themselves: a long paragraph on the screen can hold them far below it
+        const nodes = [];
+        let all = '';
+        const w = texts(el);
+        for (let t = w.nextNode(); t; t = w.nextNode()) { nodes.push([t, all.length]); all += t.nodeValue; }
+        const at = (i, end) => {
+          let k = 0;
+          while (k < nodes.length - 1 && (end ? nodes[k][1] + nodes[k][0].nodeValue.length < i : nodes[k + 1][1] <= i)) k++;
+          return [nodes[k][0], i - nodes[k][1]];
+        };
+        const re = pattern(want);
+        for (let m = re.exec(all); m && n < 8; m = re.exec(all)) {
+          const range = document.createRange();
+          range.setStart(...at(m.index, false));
+          range.setEnd(...at(m.index + m[0].length, true));
+          const c = measure({el: el, range: range});
+          if (c.rect.width > 0 && c.rect.height > 0) { cands.push(c); n++; }
+        }
+      }
+      if (!n) {
+        const c = measure({el: el});
+        if (c.rect.width > 0 && c.rect.height > 0) cands.push(c);
+      }
+    }
+    if (!cands.length) continue;
+    const here = cands.find(inView);
+    if (here) return {found: true, moved: 0, used: want, text: say(here)};
+    // beside the screen (a slide off to the side, a row a list holds out
+    // of view), else the nearest ahead
+    const go = cands.find(c => c.rect.bottom > 0 && c.rect.top < vh && drawn(c))
+      || cands.filter(c => up ? c.rect.bottom <= 0 : c.rect.top >= vh)
+        .sort((a, b) => up ? b.rect.bottom - a.rect.bottom : a.rect.top - b.rect.top).find(drawn);
+    if (!go) {
+      const back = cands.find(c => (up ? c.rect.top >= vh : c.rect.bottom <= 0) && drawn(c));
+      if (back && !other) {
+        // only on the other side; and how far the page goes on this way
+        // (one that ends close by may load more as it is scrolled: a feed)
+        const se = document.scrollingElement || de;
+        const sc = se.scrollHeight > se.clientHeight + 2 ? se : scrollerOf(back.el);
+        const room = !sc ? 0 : up ? sc.scrollTop : sc.scrollHeight - sc.clientHeight - sc.scrollTop;
+        other = {found: false, other: true, near: room < 1.5 * vh, used: want};
+      } else if (!back && !hidden) hidden = {found: false, hidden: true, used: want};
+      continue;
+    }
+    const top = go.rect.top;
+    go.el.scrollIntoView({block: go.rect.top < vh && go.rect.bottom > 0 ? 'nearest' : 'center',
+                          inline: 'nearest', behavior: 'instant'});
+    if (!inView(measure(go))) {
+      // a box taller than the screen: the words themselves to its middle
+      const sc = scrollerOf(go.range ? go.el : go.el.parentElement || go.el);
+      const box = sc ? sc.getBoundingClientRect() : {top: 0, height: vh};
+      (sc || window).scrollBy({top: go.rect.top + go.rect.height / 2 - (box.top + box.height / 2), behavior: 'instant'});
+      measure(go);
+    }
+    const moved = Math.round(top - go.rect.top);
+    if (inView(go)) return {found: true, moved: moved, used: want, text: say(go)};
+    if (!hidden) hidden = {found: false, hidden: true, used: want, moved: moved};
   }
-  return other ? {found: false, other: true} : {found: false};
-})"""
+  return other || hidden || {found: false};
+})
+"""
 
 
 # The page's words as a reader sees them (innerText: what is drawn, in
@@ -1203,7 +1341,11 @@ def page_xml(screen, top, screen_h=0, pkg="com.android.chrome"):
     if "moved" in screen:
         extra = ' moved="%d"' % int(screen.get("moved") or 0) + (' held="1"' if screen.get("held") else "")
     if "found" in screen:
-        extra += ' found="%s"' % screen["found"]  # what a `scroll --to` asked the page
+        # what a `scroll --to` asked the page: whether it holds the words,
+        # where, and the start of the element holding them
+        extra += ' found="%s"' % screen["found"] + (' near="1"' if screen.get("near") else "")
+        if screen.get("found_in"):
+            extra += " found_in=%s" % quoteattr(_plain(screen["found_in"]))
     return ('<?xml version="1.0" encoding="UTF-8"?>\n<hierarchy rotation="0" page="1"%s>\n' % extra
             + "\n".join(parts) + "\n</hierarchy>")
 
@@ -1257,7 +1399,7 @@ def settle(page, idle_ms=1200, poll_s=0.15, quiet_s=0.3, url=None, loading=False
 
 
 # The words of a row that stands in for content still coming: a
-# skeleton's or a spinner's ("Loading", "Loading…", "Please wait"), and a
+# skeleton's or a spinner's ("Loading", "Loading\u2026", "Please wait"), and a
 # label of one on a row with no words of its own ("Loading price chart").
 _BUSY_WORDS = re.compile(r"^(loading|please wait)\s*(\.{1,3}|\u2026)?$", re.I)
 _BUSY_LABEL = re.compile(r"^loading\b", re.I)
@@ -1702,42 +1844,60 @@ def page_text(page, start=0, count=20000):
 
 
 def scroll_to(page, label, direction="down"):
-    """The element with these words brought into view by the page itself
-    (see SCROLL_TO_JS) and the read a moment later, in one round trip:
-    {"found": "1" (in view now), "other" (only on the other side) or "0"
-    (not on the page), "screen"}; the read carries `found` for page_xml."""
+    """The words brought into view by the page itself (see SCROLL_TO_JS)
+    and the read a moment later, in one round trip: {"found": "1" (in
+    view now), "other" (only on the other side), "hidden" (only where
+    they aren't shown) or "0" (not on the page), "near", "used", "moved",
+    "screen"}; the read carries found, near and found_in for page_xml."""
     res = page.call_many([_evaluate(_js(SCROLL_TO_JS, label, direction)),
                           _evaluate(_later(_js(READ_JS, 600), 150))], timeout=10.0, raise_errors=False)
     try:
         hit = _value(res[0]) or {}
     except RuntimeError:
         hit = {}
-    found = "1" if hit.get("found") else ("other" if hit.get("other") else "0")
-    screen = dict(_read_or_again(page, res[1]) or {}, found=found)
-    return {"found": found, "used": hit.get("used") or "", "moved": hit.get("moved") or 0, "screen": screen}
+    found = ("1" if hit.get("found") else "other" if hit.get("other") else
+             "hidden" if hit.get("hidden") else "0")
+    near = found == "other" and bool(hit.get("near"))
+    screen = dict(_read_or_again(page, res[1]) or {}, found=found, near=near,
+                  found_in=(hit.get("text") or "") if found == "1" else "")
+    return {"found": found, "near": near, "used": hit.get("used") or "", "moved": hit.get("moved") or 0,
+            "screen": screen}
 
 
-def scroll(page, direction="down", times=1, fraction=0.6, idle_ms=500):
+def scroll(page, direction="down", times=1, fraction=0.6, idle_ms=500, grow_ms=0):
     """Scroll like a finger would, `times` times (or to an end: "top",
     "bottom"), and read once the rows are in place, all in one round
-    trip (a scroll loads nothing). Returns the read and how far it
-    moved."""
+    trip (a scroll loads nothing). Returns the read and how far it moved
+    (None when no scroll answered). grow_ms: at the end going down, the
+    page this long at most to grow (a feed), each scroll and the read
+    then waiting for the one before (see SCROLL_JS)."""
     where = direction if direction in ("top", "bottom") else None
     step = fraction * (1 if direction == "down" else -1)
-    cmds = [_evaluate(_js(SCROLL_JS, step, where))] * (1 if where else max(1, int(times)))
-    cmds.append(_evaluate(_later(_js(READ_JS, 600), 150)))
-    res = page.call_many(cmds, timeout=10.0, raise_errors=False)
-    moved, last, held = 0, {}, False
+    one = _js(SCROLL_JS, step, where, int(grow_ms))
+    later = _later(_js(READ_JS, 600), 150)
+    if grow_ms:
+        after = "Promise.resolve(window.__burnerScroll).catch(() => null).then(() => %s)"
+        one = "window.__burnerScroll = " + after % one
+        later = after % later
+    n = 1 if where else max(1, int(times))
+    res = page.call_many([_evaluate(one)] * n + [_evaluate(later)],
+                         timeout=10.0 + n * grow_ms / 1000.0, raise_errors=False)
+    moved, last, held, answered, grew = 0, {}, False, 0, False
     for r in res[:-1]:
         try:
             last = _value(r) or {}
         except RuntimeError:
             continue
+        answered += 1
         moved += last.get("moved") or 0
         held = held or bool(last.get("held"))
+        grew = grew or bool(last.get("grew"))
     # the read says how far the page moved, and whether something over it
     # holds it (see page_xml): a scroll that moved nothing said "scrolled"
-    # ten times on allrecipes.com (Oct 7)
-    screen = dict(_read_or_again(page, res[-1]) or {}, moved=moved, held=held)
-    return {"moved": moved, "scroller": last.get("scroller"), "held": held,
-            "screen": screen, "ready": "complete"}
+    # ten times on allrecipes.com (Oct 7). No scroll answered: it says
+    # nothing (not "at its end", review Oct 7)
+    screen = dict(_read_or_again(page, res[-1]) or {})
+    if answered:
+        screen.update(moved=moved, held=held)
+    return {"moved": moved if answered else None, "scroller": last.get("scroller"), "held": held,
+            "grew": grew, "screen": screen, "ready": "complete"}

@@ -4859,8 +4859,10 @@ def page_stuck(root):
 def _page_scroll_to(text, direction):
     """`scroll --to` on a page: the page finds the words and brings them
     into view (the helper's scroll_to, see cdp.SCROLL_TO_JS): ("1" in view
-    now, "other" only on the other side, or "0" not on the page; the read),
-    or (None, None) when the helper can't ask the page."""
+    now, "other" only on the other side, "hidden" only where they aren't
+    shown, or "0" not on the page; the read, which says near="1" when the
+    page ends close by this way), or (None, None) when the helper can't
+    ask the page."""
     if direction not in ("down", "up"):
         return None, None
     status, root, _note = act_and_read({"scroll_to": text, "direction": direction}, idle_ms=IDLE_SCROLL_MS)
@@ -4869,11 +4871,20 @@ def _page_scroll_to(text, direction):
     return root.get("found"), root
 
 
-def _scroll_step(direction, pkg):
+# A search's scroll at a page's end: the page this long at most to grow
+# (a feed loads more as it is scrolled) before the search stops there
+GROW_MS = 1000
+
+
+def _scroll_step(direction, pkg, grow_ms=0):
     """One scroll and the screen after it: by the page itself in Chrome,
-    else a swipe and a settled read. None when the screen can't be read."""
+    else a swipe and a settled read. None when the screen can't be read.
+    grow_ms: see GROW_MS."""
     if pkg in WEB_APPS:
-        status, root, note = act_and_read({"scroll": direction}, idle_ms=IDLE_SCROLL_MS)
+        spec = {"scroll": direction}
+        if grow_ms:
+            spec["grow"] = grow_ms
+        status, root, note = act_and_read(spec, idle_ms=IDLE_SCROLL_MS)
         if status == "ok":
             return root
         if status != "unsent":
@@ -5063,6 +5074,7 @@ def cmd_scroll(args):
     root = ui_dump()  # also refreshes the screen size
     pkg = dump_package(root)
     before = visible_lines(walk(root))
+    elsewhere = ""  # where else the page has the words, for the last word
     for i in range(times + 1):
         sel, hits = holding_which(walk(root), args.to)
         if not hits and i == 0 and pkg in WEB_APPS:
@@ -5072,17 +5084,25 @@ def cmd_scroll(args):
             # yet (a list that loads as it scrolls) go to the scrolls below
             found, page_root = _page_scroll_to(args.to, args.direction)
             if found == "other":
-                print("not found {}: {} (the page has it {}: `burner scroll {} --to {}`)".format(
-                    "below" if args.direction == "down" else "above", args.to,
+                elsewhere = "the page has it {}: `burner scroll {} --to {}`".format(
                     "above" if args.direction == "down" else "below",
-                    "up" if args.direction == "down" else "down", _shell_words(args.to)), file=sys.stderr)
-                return 1
+                    "up" if args.direction == "down" else "down", _shell_words(args.to))
+                if page_root.get("near") != "1":
+                    print("not found {}: {} ({})".format("below" if args.direction == "down" else "above",
+                                                         args.to, elsewhere), file=sys.stderr)
+                    return 1
+                # the page ends close by this way and may load more as it is
+                # scrolled (a feed): the scrolls below look on
+            elif found == "hidden":
+                elsewhere = "the page has it only where it isn't shown, such as a closed section or a slide aside"
             if page_root is not None:
                 root = page_root
                 sel, hits = holding_which(walk(root), args.to)
                 if found == "1" and not hits:
-                    # the page has the words in view, though no row reads them whole
-                    print("found: {}".format(args.to))
+                    # the words are on the screen (the page placed them), in a
+                    # row too long to read them whole: that row named
+                    where = page_root.get("found_in") or ""
+                    print("found: {}{}".format(args.to, ' (in "{}")'.format(where[:LABEL_MAX]) if where else ""))
                     if not quiet:
                         print_screen(root)
                     return 0
@@ -5098,7 +5118,7 @@ def cmd_scroll(args):
         if i == times:
             break
         # Looking for text needs a fresh read after each swipe.
-        root = _scroll_step(args.direction, pkg)
+        root = _scroll_step(args.direction, pkg, grow_ms=GROW_MS)
         if root is None:
             print("scrolled {} x{}; couldn't read the screen to look for {}"
                   .format(args.direction, i + 1, args.to), file=sys.stderr)
@@ -5112,9 +5132,10 @@ def cmd_scroll(args):
         if pkg in WEB_APPS and (page_stuck(root) or after == before):
             # the page moved nothing, or its rows stayed as they were: more
             # scrolls do the same (ten for nothing on allrecipes.com, Oct 7)
-            print("not found: {} (the page didn't move {} at scroll {}: {})".format(
+            print("not found: {} (the page didn't move {} at scroll {}: {}{})".format(
                 args.to, args.direction, i + 1,
-                page_stuck(root) or "its rows stayed as they were"), file=sys.stderr)
+                page_stuck(root) or "its rows stayed as they were",
+                "; " + elsewhere if elsewhere else ""), file=sys.stderr)
             if not quiet:
                 print_screen(root)
             return 1
@@ -5149,7 +5170,7 @@ def cmd_scroll(args):
                     print_screen(root)
                 return 1
         before = after
-    print("not found after {} scrolls: {}".format(times, args.to),
+    print("not found after {} scrolls: {}{}".format(times, args.to, " ({})".format(elsewhere) if elsewhere else ""),
           file=sys.stderr)
     if not quiet:
         print_screen(root)

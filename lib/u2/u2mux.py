@@ -2526,9 +2526,11 @@ class U2Daemon:
                 except Exception as e:
                     self._web = None
                     raise RuntimeError("act failed after sending: %s" % err_text(e, 120))
-                log("web scroll to %r: %s%s" % (spec["scroll_to"], {"1": "in view", "other": "only on the other side",
-                                                                      "0": "not on the page"}.get(r["found"], r["found"]),
-                                                 ", moved %s px" % r["moved"] if r["moved"] else ""))
+                log("web scroll to %r: %s%s" % (spec["scroll_to"], {
+                    "1": "in view", "other": "only on the other side" + (", the page's end close by" if r.get("near")
+                                                                          else ""),
+                    "hidden": "only where it isn't shown", "0": "not on the page"}.get(r["found"], r["found"]),
+                    ", moved %s px" % r["moved"] if r["moved"] else ""))
                 xml = self._after_page(r["screen"])
                 self._remember(xml)
             return xml.encode()
@@ -2545,15 +2547,20 @@ class U2Daemon:
                     with _t("web scroll"):
                         r = _cdp().scroll(page, spec.get("scroll", "down"),
                                           int(spec.get("times", 1)),
-                                          idle_ms=int(spec.get("idle", 500)))
+                                          idle_ms=int(spec.get("idle", 500)),
+                                          grow_ms=int(spec.get("grow", 0)))
                 except Exception as e:
                     self._web = None
                     raise RuntimeError("act failed after sending: %s" % err_text(e, 120))
                 # how far, by what, and whether the page is held (a pop-up
                 # over it): the ten scrolls for nothing on allrecipes.com
                 # left no word why (Oct 7)
-                log("web scroll: moved %s px (%s)%s" % (r.get("moved"), r.get("scroller") or "nothing",
-                                                         ", the page held" if r.get("held") else ""))
+                if r.get("moved") is None:
+                    log("web scroll: the page's scroll didn't answer")
+                else:
+                    log("web scroll: moved %s px (%s)%s%s" % (r.get("moved"), r.get("scroller") or "nothing",
+                                                             ", the page held" if r.get("held") else "",
+                                                             ", after the page grew" if r.get("grew") else ""))
                 xml = self._after_page(r["screen"])
                 self._remember(xml)
             return xml.encode()
