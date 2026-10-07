@@ -2680,7 +2680,10 @@ def cmd_tap(args):
         return _tap_fail(args, '"{}" {}; scroll {} a little and tap again'.format(
             args.text, what, "up" if plan["edge"] == "top" else "down"))
     if plan["action"] == "nomatch":
-        return _tap_fail(args, 'no match for "{}"'.format(args.text))
+        # what to do next, in one command: a row below the fold was looked
+        # for by a screenshot, a scroll and a tap again (the battery task, Oct 6)
+        return _tap_fail(args, 'no match for "{0}" on the screen; `burner scroll down --to "{0}"` '
+                               'looks further down'.format(args.text))
     if plan["action"] == "ambiguous":
         return _tap_ambiguous(args, plan["used"], plan["hits"], plan["fuzzy"])
     if plan["action"] == "nobounds":

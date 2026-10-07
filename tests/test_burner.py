@@ -586,7 +586,8 @@ class JsonOutputTests(OfflineTestCase):
         data = json.loads(out.getvalue())
         self.assertFalse(data["ok"])
         self.assertIn("error", data)
-        self.assertIn('no match for "Nope"', err.getvalue())
+        self.assertIn('no match for "Nope" on the screen; `burner scroll down --to "Nope"` looks further down',
+                      err.getvalue())
         pc.ui_dump.assert_any_call(fresh=True)  # the extra read skips the helper's cache
 
     def test_tap_reads_once_more_when_the_label_is_still_drawing(self):
