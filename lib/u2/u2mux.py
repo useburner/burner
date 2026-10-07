@@ -1008,9 +1008,10 @@ def window_over(windows_xml, rect, front_pkg):
 
 
 def _log_handshake(page):
-    """Say in the log that the page's session took a second handshake
-    (Chrome dropped the first: see cdp.Page.DROPPED)."""
+    """Say in the log, once per session, that the page's session took a
+    second handshake (Chrome dropped the first: see cdp.Page.DROPPED)."""
     if getattr(page, "handshake_again", False):
+        page.handshake_again = False  # said: the session is reused for many reads
         log("the page's session took a second handshake (Chrome dropped the first, busy)")
 
 
@@ -1875,6 +1876,11 @@ class U2Daemon:
             xml = self._page_read(assume_chrome=page_first, hint=hint, loaded=page_first)
             if xml is None and page_first:
                 return ""
+            # a page's read comes from Chrome's DevTools, not the screen
+            # reader: a page with no words (Reddit's JSON, a wall in a
+            # frame) said nothing of that server, which was replaced all
+            # the same, a 10s `state` (Oct 7)
+            from_page = xml is not None
             if xml is None:
                 # the page check's own look at the screen (Chrome left the
                 # front), when it took one, is this read
@@ -1882,7 +1888,9 @@ class U2Daemon:
             if xml is None:
                 with _t("dump rpc"):
                     xml = read_screen(self.d)
-            if blank_screen(xml):
+            if from_page:
+                pass
+            elif blank_screen(xml):
                 xml, _ = self._fix_blank_read(xml, "blank read")
             elif mute_read(xml):
                 xml, _ = self._fix_blank_read(xml, "wordless read", replace)

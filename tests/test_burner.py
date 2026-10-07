@@ -6702,6 +6702,29 @@ class EmptyScreenTests(OfflineTestCase):
         self.assertTrue(mod.mute_read(MUTE_XML.replace('index="0" text="" class="androidx',
                                                        'index="0" resource-id="android:id/text1" text="" class="androidx')))
 
+    def test_a_page_with_no_words_leaves_the_screen_reader_alone(self):
+        # Reddit, Oct 7: a page read with no words counted toward a
+        # wordless spell, and the phone's UI server was killed and started
+        # again (a 10s `state`); a page read doesn't go through that server
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        bare = _cdp().page_xml(dict(WEB_SCREEN, title="", url="", rows=[]), 283, 2400)
+        self.assertTrue(mod.mute_read(bare))
+        dm._page_read = lambda **kw: bare
+        dm._fix_wordless_read = mock.Mock(side_effect=AssertionError("the server must not be replaced"))
+        dm._mute_since = mod._time.monotonic() - 30  # a long spell already
+        self.assertEqual(dm._dump(fresh=True), bare)
+        dm._fix_wordless_read.assert_not_called()
+        # the session that took a second handshake is said once, not on every reuse
+        lines = []
+        mod.log = lambda *a: lines.append(" ".join(str(x) for x in a))
+        page = SimpleNamespace(handshake_again=True)
+        mod._log_handshake(page)
+        mod._log_handshake(page)
+        self.assertEqual(len(lines), 1)
+
     def test_helper_fix_blank_read_replaces_a_wordless_server(self):
         mod = _u2mux()
         self.no_sleep(mod)
