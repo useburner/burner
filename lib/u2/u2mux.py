@@ -63,10 +63,13 @@ def log_arg(arg, cmd=""):
         return "<%d characters>" % len(arg) if cmd == "set_text" else arg[:80]
     if isinstance(spec, dict):
         for k in ("set_text", "text"):
-            if isinstance(spec.get(k), str):
-                spec[k] = "<%d characters>" % len(spec[k])
+            v = spec.get(k)
+            if v is not None:
+                spec[k] = "<%d characters>" % (len(v) if isinstance(v, str) else len(json.dumps(v)))
         return json.dumps(spec)[:80]
-    return arg[:80]
+    # a bare value is the text itself for set_text ("482913", a code, reads
+    # as JSON: it was logged as it is, review of Oct 7)
+    return "<%d characters>" % len(arg) if cmd in ("set_text", "act") else arg[:80]
 
 
 def own_log(path, mode="a"):
@@ -1663,6 +1666,8 @@ def field_selector(rid=""):
 
 
 TAP_OPENED_S = 30.0  # a control tapped this recently may have opened the box a `type --field` names
+BOX_COMING_S = 3.0   # ... and a box it opens may still be coming this long after the tap: looked for, not tapped for
+BOX_LOOKS = 4        # looks for that box, at most
 FIELD_AGAIN_S = 0.4  # a field not (or not yet) where the typing wants it is looked for again this much later
 WAKE_RPC_S = 3.0     # the wake before a launch: a no-op, or 500ms on the phone
 
@@ -2068,13 +2073,23 @@ class U2Daemon:
         "new_tab"): the page in hand is dropped (it is behind the new tab
         now: its text was read as the screen's, weather.gov, Oct 7), and
         the new tab, found by its address, read; the screen reader's read
-        when it can't be reached yet."""
+        when it can't be reached yet. The tab it left, still the one in
+        front then, is no read of the new one: looked for once more (the
+        review of Oct 7)."""
         log("web tap: the touch opened a new tab (%s); reading it" % str(r["new_tab"])[:100])
+        left = getattr(self._web, "target", None)
         if self._web is not None:
             self._web.visible_at = 0.0
         self._web = None
-        _time.sleep(self.NEW_TAB_S)
-        xml = self._page_read(hint=r["new_tab"])
+        for look in range(2):
+            _time.sleep(self.NEW_TAB_S)
+            xml = self._page_read(hint=r["new_tab"])
+            page = getattr(self, "_web", None)
+            if xml is None or page is None or left is None or getattr(page, "target", None) != left or look:
+                break
+            log("web tap: the tab it left is still in front; looking again")
+            page.visible_at = 0.0
+            self._web = None
         if xml is None:
             with _t("dump rpc (new tab)"):
                 xml = read_screen(self.d)
@@ -3055,6 +3070,7 @@ class U2Daemon:
         return fields[0]
 
     NO_FIELD_TAP = "act not sent: --field on a native screen needs a tap on the field first"
+    NO_BOX_YET = "act not sent: these words were tapped a moment ago, and no text box has the focus yet"
 
     def _type_into_field(self, spec):
         """`type --field` on a native screen, where setText goes to
@@ -3095,8 +3111,13 @@ class U2Daemon:
         tapped, tapped_at = getattr(self, "_last_tap", None) or ("", -1e9)
         opened = (plain_words(tapped).lower() == plain_words(label).lower()
                   and _time.monotonic() - tapped_at < TAP_OPENED_S)
+        # tapped a moment ago: the box it opens may still be coming, and
+        # the words are not tapped again (a second tap on a screen that is
+        # opening lands on what comes in there, review of Oct 7); a tap
+        # older than that opened no box, and the bar may take a tap again
+        coming = opened and _time.monotonic() - tapped_at < BOX_COMING_S
         first = xml  # the read just taken: a bar is tapped where two reads agree
-        if now is None and last and not opened:
+        if now is None and last and not coming:
             # a bar that opens its box, in the same place on the assistant's
             # read and this one: still, so tapped and typed now (the second
             # look below cost about 1s, Oct 7)
@@ -3137,6 +3158,21 @@ class U2Daemon:
             spec["field_selector"] = focused_field_selector(now.get("rid", "") if other or secret else "")
             return self._act_batch(spec)
         lone = lone_focused_field(xml, label) if now is None and opened else None
+        looks = 0
+        while lone is None and now is None and coming and looks < BOX_LOOKS \
+                and _time.monotonic() - tapped_at < BOX_COMING_S:
+            # the box the tap opens, looked for again
+            looks += 1
+            _time.sleep(FIELD_AGAIN_S)
+            try:
+                with _t("field read (box coming)"):
+                    xml = self._dump(fresh=True)
+            except Exception as e:
+                raise ActNotSent("act not sent: the read before it failed (%s)" % err_text(e, 100))
+            now = field_node(xml, label)
+            if now is not None and now["focused"]:
+                return self._type_at_once(spec, now)
+            lone = lone_focused_field(xml, label) if now is None else None
         if lone is not None:
             # the control with these words was just tapped and is gone: it
             # opened this box (Play's "Search or ask Play" opens "Search
@@ -3148,10 +3184,13 @@ class U2Daemon:
             return self._type_at_once(spec, lone)
         # a bar, in the same place on both reads just taken (a bar seen on
         # one read alone may still be moving, review Oct 7)
-        bar = self._bar_named(xml, label) if now is None and not opened else None
+        bar = self._bar_named(xml, label) if now is None and not coming else None
         was = self._bar_named(first, label) if bar is not None else None
         if bar is not None and was is not None and bar["center"] == was["center"]:
             return self._tap_bar_and_type(spec, bar, label)
+        if coming and now is None:
+            # no box came: said in words that don't send the CLI to tap again
+            raise RuntimeError(self.NO_BOX_YET)
         raise RuntimeError(self.NO_FIELD_TAP)
 
     def _tap_bar_and_type(self, spec, bar, label):

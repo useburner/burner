@@ -1214,9 +1214,16 @@ def field_named(sel, n, focused_ok=False):
     a = plain_words(sel).lower()
     if not a or (any(w in SECRET_WORDS for w in re.findall(r"[a-z]+", a)) and not n.get("password")):
         return False
+    return words_lead(sel, n)
+
+
+def words_lead(sel, n):
+    """Whether the words `sel` are the head of row `n`'s words (its text
+    or its description), as whole words, a leading symbol aside. Pure."""
+    a = plain_words(sel).lower()
     for s in (n.get("text"), n.get("desc")):
         head = re.sub(r"^[^\w]+", "", plain_words(s).lower())
-        if re.match(re.escape(a) + r"(?![\w-])", head):
+        if a and re.match(re.escape(a) + r"(?![\w-])", head):
             return True
     return False
 
@@ -2656,13 +2663,16 @@ def plan_tap(nodes, w, h, text=None, xy=None, fuzzy=False, index=None,
             # `tap "Echo Dot"` ambiguous with the product's row (review, Oct 7)
             # (a field with the focus last: an auto-focused "Email or
             # phone" reads its hint, review of Oct 7). A field only when no
-            # other row holds the words: then they are the screen's
+            # other row starts with the words: then they are the screen's
             # content, and the field's words a query typed into it (`tap
             # Target --index 0` on Maps' results tapped its search box,
-            # which held "Target Woodbury MN", Oct 7)
+            # which held "Target Woodbury MN", Oct 7); a row that only
+            # holds them leaves the field named ("Forgot email?" under
+            # "Email or phone", "Recent searches" under "Search settings",
+            # review of Oct 7)
             words_rows = [n for n in loose if not _is_text_field(n)]
             hits = ([n for n in words_rows if fuzzy_ok(sel, n["text"] or n["desc"] or "")]
-                    or ([] if words_rows else
+                    or ([] if any(words_lead(sel, n) for n in words_rows) else
                         [n for n in loose if field_named(sel, n)]
                         or [n for n in loose if field_named(sel, n, focused_ok=True)]))
             if hits:
@@ -3440,6 +3450,14 @@ def cmd_type(args):
         if status == "lost" or (status.startswith("failed") and "no editable field" not in status):
             # the helper had it: its word on what happened, no claim of typing
             return print_act(status, root, note, "typing")
+        if status == "unsent" and "no text box has the focus yet" in _u2_status:
+            # the words were tapped a moment ago and the box they open
+            # hasn't come: a tap on them again lands on the screen that is
+            # opening (review of Oct 7)
+            print('burner: "{}" was tapped a moment ago and no text box has the focus yet, so nothing '
+                  'was typed and it isn\'t tapped again; run burner state to see the screen'.format(args.field),
+                  file=sys.stderr)
+            return 1
     if args.field:
         got = focus_field(args.field)
         if got == "missing":
@@ -3516,18 +3534,28 @@ def nowhere_to_type(root):
     _lines, keyboard = screen_lines(nodes, *screen_dims())
     if keyboard or any(_is_text_field(n) and n.get("focused") for n in nodes):
         return ""
-    boxes = []
+    boxes, wordless = [], None
     for n in nodes:
         words = plain_words(n.get("text") or n.get("desc") or "")
         if words and (_is_text_field(n) or (tappable_row(n) and words.lower().startswith("search"))) \
                 and words not in boxes:
             boxes.append(words)
-    if not boxes:
-        # no box to name (the Calculator, a terminal, a game take key
-        # events with no text field): key events, as before (review, Oct 7)
-        return ""
-    return ("no text field has the focus and the keyboard is closed: tap the box first "
-            "(`burner tap {0}`), or both at once: `burner type --field {0} TEXT`".format(_shell_words(boxes[0])))
+        elif not words and wordless is None and _is_text_field(n) and _bounds_rect(n.get("bounds")):
+            wordless = n
+    if boxes:
+        return ("no text field has the focus and the keyboard is closed: tap the box first "
+                "(`burner tap {0}`), or both at once: `burner type --field {0} TEXT`".format(_shell_words(boxes[0])))
+    if wordless is not None:
+        # an empty box with no words of its own (its label a line apart):
+        # named by its place (key events went into nothing, exit 0, review
+        # of Oct 7)
+        x1, y1, x2, y2 = _bounds_rect(wordless["bounds"])
+        w, h = screen_dims()
+        return ("no text field has the focus and the keyboard is closed: tap the empty text box first "
+                "(`burner tap --xy {:.2f},{:.2f}`)".format(min(1.0, (x1 + x2) / 2.0 / w), min(1.0, (y1 + y2) / 2.0 / h)))
+    # no box at all (the Calculator, a terminal, a game take key events
+    # with no text field): key events, as before (review, Oct 7)
+    return ""
 
 
 def focus_field(label):

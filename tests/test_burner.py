@@ -6000,6 +6000,11 @@ class WebPathTests(OfflineTestCase):
                          '{"set_text": "<14 characters>", "field": "Password"}')
         self.assertEqual(mod.log_arg("cached"), "cached")
         self.assertEqual(mod.log_arg("hunter2-raw", "set_text"), "<11 characters>")  # not JSON: still out
+        # text that reads as JSON: still out (review of Oct 7: "482913" was logged)
+        for raw in ("482913", "4111111111111111", '"hunter2"', "[1, 2]", "true"):
+            self.assertEqual(mod.log_arg(raw, "set_text"), "<%d characters>" % len(raw))
+        self.assertEqual(mod.log_arg('{"set_text": 482913, "field": "Code"}', "act"),
+                         '{"set_text": "<6 characters>", "field": "Code"}')
         lines = []
         failing = mock.Mock(side_effect=RuntimeError("act failed after sending: the field was tapped"))
         with mock.patch.object(mod, "log", lambda *a: lines.append(" ".join(str(x) for x in a))),                 mock.patch.object(dm, "cmd_act", failing), self.assertRaises(RuntimeError):
@@ -6261,18 +6266,43 @@ class WebPathTests(OfflineTestCase):
         dm2.cmd_act(json.dumps({"tap_label": "OK"}))
         self.assertEqual(dm2._last_tap[0], "OK")
         # the words still on the screen (a button that hasn't opened a box
-        # yet), two fields, or the one field without the focus: the CLI's way
-        for xml, label in ((box.replace('text="OK"', 'text="Search or ask Play"'), "Search or ask Play"),
-                           (box.replace("</hierarchy>", '<node text="" class="android.widget.EditText" '
-                                        'package="com.example" bounds="[100,1600][900,1700]" focused="false"/></hierarchy>'),
-                            "Search or ask Play"),
-                           (box.replace('focused="true"', 'focused="false"'), "Search or ask Play")):
+        # yet), two fields, or the one field without the focus, a moment
+        # after the tap: the box looked for again, the words not tapped
+        # again (review of Oct 7), and said so
+        cases = ((box.replace('text="OK"', 'text="Search or ask Play"'), "Search or ask Play"),
+                 (box.replace("</hierarchy>", '<node text="" class="android.widget.EditText" '
+                              'package="com.example" bounds="[100,1600][900,1700]" focused="false"/></hierarchy>'),
+                  "Search or ask Play"),
+                 (box.replace('focused="true"', 'focused="false"'), "Search or ask Play"))
+        for xml, label in cases:
             sent.clear()
+            dm._last_tap = ("Search or ask Play", mod._time.monotonic())
+            dm.d = _FakeServer([xml] * 8)
+            with self.assertRaises(RuntimeError) as cm:
+                dm.cmd_act(json.dumps({"set_text": "duolingo", "field": label, "idle": 1200}))
+            self.assertEqual((str(cm.exception), sent), (dm.NO_BOX_YET, []))
+            self.assertEqual(dm.d.calls.count("dumpWindowHierarchy"), 2 + mod.BOX_LOOKS)
+        # the box comes while it is looked for: the text goes into it
+        sent.clear()
+        dm._last_tap = ("Search or ask Play", mod._time.monotonic())
+        dm.d = _FakeServer([cases[0][0], cases[0][0], cases[0][0], box])
+        self.assertEqual(dm.cmd_act(json.dumps({"set_text": "duolingo", "field": "Search or ask Play", "idle": 1200})),
+                         SAMPLE_XML.encode())
+        self.assertEqual(sent[0]["field_selector"]["resourceId"], "com.example:id/q")
+        # long after the tap, it opened no box: the CLI's way; the button
+        # still there is tapped and typed into, in one trip
+        for xml, label in cases[1:]:
+            sent.clear()
+            dm._last_tap = ("Search or ask Play", mod._time.monotonic() - 10)
             dm.d = _FakeServer([xml, xml])
             with self.assertRaises(RuntimeError) as cm:
                 dm.cmd_act(json.dumps({"set_text": "duolingo", "field": label, "idle": 1200}))
-            self.assertEqual(str(cm.exception), dm.NO_FIELD_TAP)
-            self.assertEqual(sent, [])
+            self.assertEqual((str(cm.exception), sent), (dm.NO_FIELD_TAP, []))
+        sent.clear()
+        dm._last_tap = ("Search or ask Play", mod._time.monotonic() - 10)
+        dm.d = _FakeServer([cases[0][0].replace('focused="true"', 'focused="false"')] * 2)
+        dm.cmd_act(json.dumps({"set_text": "duolingo", "field": "Search or ask Play", "idle": 1200}))
+        self.assertEqual(sent[0]["opens_box"], "Search or ask Play")
 
     def test_a_tap_s_box_is_forgotten_after_another_action(self):
         # the review of Oct 7: the control tapped by words was taken for
@@ -6449,6 +6479,17 @@ class WebPathTests(OfflineTestCase):
                  'package="com.example" bounds="[100,600][900,700]" clickable="true" focused="false"/></hierarchy>')
         plan = pc.plan_tap(pc.walk(ET.fromstring(email)), 1080, 2400, text="Email")
         self.assertEqual((plan["action"], plan["node"]["text"]), ("tap", "Email or phone"))
+        # a row that only holds the words, not starting with them, leaves
+        # the box named (review of Oct 7: these found nothing)
+        for row, label, box_words in (("Forgot email?", "Email", "Email or phone"),
+                                      ("We will never share your email address", "Email", "Email address"),
+                                      ("Recent searches", "Search", "Search settings")):
+            screen = ('<hierarchy rotation="0"><node text="%s" class="android.widget.EditText" package="com.example" '
+                      'bounds="[100,600][900,700]" clickable="true" focused="false"/><node text="%s" '
+                      'class="android.widget.TextView" package="com.example" bounds="[100,760][900,820]"/></hierarchy>'
+                      % (box_words, row))
+            plan = pc.plan_tap(pc.walk(ET.fromstring(screen)), 1080, 2400, text=label)
+            self.assertEqual((plan["action"], plan["node"]["text"]), ("tap", box_words), row)
 
     def test_a_type_with_nowhere_to_go_says_so(self):
         # Play Store, Oct 7: `type` right after the Search tab (its bar takes
@@ -6481,6 +6522,15 @@ class WebPathTests(OfflineTestCase):
                 'calculator" bounds="[0,0][1080,2400]"><node text="7" class="android.widget.Button" package="com.google.'
                 'android.calculator" bounds="[0,1500][270,1700]" clickable="true"/></node></hierarchy>')
         self.assertEqual(pc.nowhere_to_type(ET.fromstring(calc)), "")
+        # an empty box with no words of its own (its label a line apart):
+        # named by its place (key events went into nothing, review of Oct 7)
+        empty = ('<hierarchy rotation="0"><node text="" class="android.widget.FrameLayout" package="com.example" '
+                 'bounds="[0,0][1080,2400]"><node text="Email" class="android.widget.TextView" package="com.example" '
+                 'bounds="[100,500][400,560]"/><node text="" class="android.widget.EditText" package="com.example" '
+                 'bounds="[100,580][980,700]" clickable="true" focused="false"/></node></hierarchy>')
+        root = ET.fromstring(empty)
+        pc._update_screen_from_dump(root)
+        self.assertIn("tap the empty text box first (`burner tap --xy 0.50,0.27`)", pc.nowhere_to_type(root))
         # a focused AutoCompleteTextView is a field with the focus
         auto = focused.replace('class="android.widget.EditText"', 'class="android.widget.AutoCompleteTextView"')
         self.assertEqual(pc.nowhere_to_type(ET.fromstring(auto)), "")
@@ -6547,7 +6597,7 @@ class WebPathTests(OfflineTestCase):
         dm._last_tap = ("Search or ask Play", mod._time.monotonic())
         with self.assertRaises(RuntimeError) as cm:
             dm.cmd_act(json.dumps({"set_text": "espn", "field": "Search or ask Play", "idle": 1200}))
-        self.assertEqual((str(cm.exception), sent), (dm.NO_FIELD_TAP, []))
+        self.assertEqual((str(cm.exception), sent), (dm.NO_BOX_YET, []))
         dm._last_tap = None
         # a SearchView's AutoCompleteTextView is a field, not a bar
         auto = bar.replace('<node text="Search or ask Play" class="android.widget.TextView"',
@@ -6635,6 +6685,29 @@ class WebPathTests(OfflineTestCase):
         self.assertNotIn(mock.call(0.5), slept.call_args_list)
         self.assertIn("typed 7 chars", out.getvalue())
         self.assertNotIn("into Password", out.getvalue())
+
+    def test_type_with_a_field_tapped_a_moment_ago_does_not_tap_it_again(self):
+        # the review of Oct 7: the helper had no box yet for the bar just
+        # tapped, and the CLI's fallback tapped the bar a second time
+        self.allow("u2_invalidate")
+        self.allow("nav_record")
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            spec = json.loads(arg) if cmd == "act" else {}
+            calls.append((cmd, spec))
+            if cmd == "act" and spec.get("field"):
+                pc._u2_status = ("err act not sent: these words were tapped a moment ago, and no text box "
+                                 "has the focus yet")
+                return None
+            return SAMPLE_XML
+        self.allow("u2sock", side_effect=u2)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_type(self.parse(["type", "--field", "Search or ask Play", "espn"]))
+        self.assertEqual(rc, 1)
+        self.assertEqual([(c, s.get("field"), s.get("tap_label")) for c, s in calls],
+                         [("act", "Search or ask Play", None)])  # no tap, no typing elsewhere
+        self.assertIn("isn't tapped again", err.getvalue())
 
     def test_an_action_batch_is_never_replayed_on_a_stale_stream(self):
         mod = _u2mux()
@@ -7540,6 +7613,19 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual((xml, read_with, dm._web, old.visible_at),
                          ('<hierarchy rotation="0" page="1"/>', ["https://forecast.weather.gov/MapClick.php?x=1"],
                           None, 0.0))
+        # the review of Oct 7: the tab it left, still in front at the read,
+        # is no read of the new tab: looked for once more
+        old.target = "T-old"
+        dm._web = old
+        reads = iter([("T-old", "<hierarchy page=\"old\"/>"), ("T-new", "<hierarchy page=\"new\"/>")])
+
+        def page_read(hint=None, **kw):
+            target, xml = next(reads)
+            dm._web = SimpleNamespace(target=target, visible_at=1e9)
+            return xml
+        dm._page_read = page_read
+        self.assertEqual(dm._new_tab_read({"new_tab": "https://forecast.weather.gov/x"}), '<hierarchy page="new"/>')
+        self.assertEqual(dm._web.target, "T-new")
 
     def test_a_page_scroll_says_how_far_the_page_moved(self):
         cdp = _cdp()
