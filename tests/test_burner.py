@@ -5885,9 +5885,17 @@ class WebPathTests(OfflineTestCase):
         act(unfocused, unfocused)
         self.assertEqual((reads, sent[0]["tap_first"]), ([True], [500, 650]))
         # moved since the assistant's read, and in its new place on a look
-        # 0.4s later: tapped there, and typed, in one batch (Oct 7)
+        # 0.4s later: tapped there, and typed, in one batch (Oct 7); the
+        # text into the field with the focus after the tap, which may be
+        # another box (Maps' bar opens its search screen, Oct 7)
         act(unfocused, moved)
         self.assertEqual((reads, sent[0]["tap_first"]), ([True, True], [500, 950]))
+        self.assertEqual(sent[0]["field_selector"], mod.focused_field_selector())
+        # another field with the focus before the tap: pinned to this one
+        other = moved.replace("</hierarchy>", '<node text="" resource-id="com.example:id/other" '
+                              'class="android.widget.EditText" package="com.example" bounds="[100,1500][900,1600]" '
+                              'enabled="true" focused="true"/></hierarchy>')
+        act(other.replace("[100,900][900,1000]", "[100,600][900,700]"), other)
         self.assertEqual(sent[0]["field_selector"]["resourceId"], "com.example:id/q")
         # focused, but with no resource id to pin it: a read now first
         # (the focus may have moved since the assistant's read)

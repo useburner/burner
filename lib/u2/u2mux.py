@@ -2962,7 +2962,16 @@ class U2Daemon:
             before, now, xml = now, again, xml2
         if now is not None and before is not None and now["center"] == before["center"]:
             spec["tap_first"] = list(now["center"])
-            spec["field_selector"] = focused_field_selector(now.get("rid", ""))
+            # the text goes where the focus went: the tap may open another
+            # box (Maps' bar opens its search screen, whose box has another
+            # id: the typing pinned to the bar's found nothing, 3s, Oct 7);
+            # pinned to this field only when another one has the focus (a
+            # tap that focused nothing must not type into that one)
+            try:
+                other = any(n["field"] and n["focused"] for n in iter_nodes(xml))
+            except Exception:
+                other = True
+            spec["field_selector"] = focused_field_selector(now.get("rid", "") if other else "")
             return self._act_batch(spec)
         tapped, tapped_at = getattr(self, "_last_tap", None) or ("", -1e9)
         opened = (plain_words(tapped).lower() == plain_words(label).lower()
