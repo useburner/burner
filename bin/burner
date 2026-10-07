@@ -5219,7 +5219,7 @@ def _scroll_plain(direction, times, quiet=False):
               file=sys.stderr)
     else:
         print("scrolled {} x{}".format(direction, times))
-        if root is not None and before is not None and same_rows(root, before):
+        if root is not None and before is not None and moved_nothing(before, root):
             print("  " + SCROLL_STILL.get(direction, "(nothing moved this way)"))
         elif times == 1:
             hint = scroll_hint(direction)
@@ -5238,12 +5238,18 @@ SCROLL_STILL = {"up": "(nothing moved: this is the top. In a feed of videos or p
                 "down": "(nothing moved: the end of the list this way, or the swipe was dropped)"}
 
 
-def same_rows(a, b):
-    """Whether two reads show the same rows, their digits aside (a video's
-    time and a like count go on changing by themselves). Pure."""
+def moved_nothing(before, after):
+    """Whether a scroll left the screen where it was: nearly all the rows
+    with words on the read before it are on the read after it, in the same
+    places, their digits aside (a video's time and its likes go on
+    changing) and one in five may differ (a Short's song name scrolling
+    by: an exact match of every row missed the first Short, the live
+    check). Pure."""
     def rows(root):
-        return [re.sub(r"\d+", "#", line) for line in visible_lines(walk(root))]
-    return rows(a) == rows(b)
+        return {(re.sub(r"\d+", "#", node_label(n)), (n["class"] or "").split(".")[-1], tuple(n["center"]))
+                for n in walk(root) if compact_visible(n, False) and node_label(n)}
+    a, b = rows(before), rows(after)
+    return bool(a) and len(a & b) >= len(a) - len(a) // 5
 
 
 def _scroll_plain_adb(direction, times, quiet=False):

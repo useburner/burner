@@ -11188,6 +11188,20 @@ class AirbnbRoundTests(OfflineTestCase):
             self.assertEqual(pc._scroll_plain("up", 1), 0)
         self.assertIn("scrolled up x1\n  (nothing moved: this is the top. In a feed of videos or posts, the next "
                       "one is `burner scroll down`)", out.getvalue())
+        # one row in five may differ (a Short's song name scrolling by: the
+        # live check printed no note); the same rows in other places moved
+        def rows(*words, dy=0):
+            return ET.fromstring('<hierarchy rotation="0"><node class="android.widget.FrameLayout" '
+                                 'bounds="[0,0][1080,2400]">' + "".join(
+                                     '<node text="%s" class="android.widget.TextView" bounds="[100,%d][900,%d]"/>'
+                                     % (w, 300 + 200 * i + dy, 380 + 200 * i + dy) for i, w in enumerate(words))
+                                 + '</node></hierarchy>')
+        short = ("@vikings", "Game day", "40K likes", "View 120 comments", "Original sound - artist")
+        self.assertTrue(pc.moved_nothing(rows(*short), rows("@vikings", "Game day", "41K likes", "View 121 comments",
+                                                            "nal sound - artist  Origi")))
+        self.assertFalse(pc.moved_nothing(rows(*short), rows(*short, dy=-200)))
+        self.assertFalse(pc.moved_nothing(rows(*short), rows("@BenGtalks", "Tips", "2K likes", "View 9 comments",
+                                                             "Original sound - artist")))
         # it moved: nothing said
         self.allow("_cached_root", return_value=ET.fromstring(SAMPLE_XML.replace('text="Hello"', 'text="Earlier"')))
         with mock.patch.object(pc, "COMMANDS_LOG", log), mock.patch.object(pc, "_screen_pkg", "com.example"), \
