@@ -1423,6 +1423,19 @@ def screen_words(xml):
         return None
 
 
+def words_changed(before, after):
+    """The rows' words in one read and not the other, as ("-" or "+", the
+    words cut to 40 characters), switch states aside; None for a read that
+    can't be parsed. Pure."""
+    a, b = screen_words(before), screen_words(after)
+    if a is None or b is None:
+        return None
+    ta, tb = [(t or d) for t, d, _c in a], [(t or d) for t, d, _c in b]
+    gone = [w for w in ta if w not in tb]
+    came = [w for w in tb if w not in ta]
+    return [("-", w[:40]) for w in gone] + [("+", w[:40]) for w in came]
+
+
 def worded_rows(xml):
     """How many rows of a read carry words (text or a description), the
     system UI's aside. Pure."""
@@ -2934,6 +2947,14 @@ class U2Daemon:
                     and (screen_sig(xml) == screen_sig(before) or half_drawn_after(xml, before)
                          or (screen_words(xml) is not None and screen_words(xml) == screen_words(before)))):
                 xml = self._relook(xml)
+            elif before and acted and "set_text" not in spec:
+                # a few rows changed, and no second look: which (a tap that
+                # opened another app's screen read as the page before it with
+                # some words changed, and nothing said which, Oct 7)
+                changed = words_changed(before, xml)
+                if changed and len(changed) <= 4:
+                    log("act read: %d row%s changed: %s" % (len(changed), "" if len(changed) == 1 else "s",
+                                                            "; ".join("%s%r" % c for c in changed)))
             # The action landed in Chrome: the page itself says what it
             # shows now (the screen reader's tree may lag it). The read is
             # the newest first, so that the page is asked only with Chrome

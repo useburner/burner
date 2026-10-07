@@ -5892,6 +5892,8 @@ class WebPathTests(OfflineTestCase):
         self.assertNotEqual(mod.screen_sig(moved), mod.screen_sig(SAMPLE_XML))
         self.assertEqual(run({"tap": [250, 450], "idle": 1200}, moved), results)
         self.assertEqual(len(batches), 2)
+        self.assertEqual(mod.words_changed(SAMPLE_XML, results), [("-", "Hello"), ("+", "Search results")])
+        self.assertEqual(mod.words_changed(SAMPLE_XML, moved), [])
         # a switch's state is no place: a toggle's read is kept, one trip
         toggled = SAMPLE_XML.replace("</hierarchy>", '<node text="Wi-Fi" checked="true" package="com.example" '
                                      'class="android.widget.Switch" bounds="[0,1500][1080,1600]"/></hierarchy>')
