@@ -3504,7 +3504,7 @@ def nowhere_to_type(root):
     boxes = []
     for n in nodes:
         words = plain_words(n.get("text") or n.get("desc") or "")
-        if words and (_is_text_field(n) or (n.get("clickable") and words.lower().startswith("search"))) \
+        if words and (_is_text_field(n) or (tappable_row(n) and words.lower().startswith("search"))) \
                 and words not in boxes:
             boxes.append(words)
     if not boxes:

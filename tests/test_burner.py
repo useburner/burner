@@ -6356,6 +6356,14 @@ class WebPathTests(OfflineTestCase):
         focused = tab.replace('<node text="Search or ask Play" class="android.view.View"',
                               '<node text="" focused="true" class="android.widget.EditText"')
         self.assertEqual(pc.nowhere_to_type(ET.fromstring(focused)), "")
+        # the bar's words in a box that takes the tap (the Play Store's, Oct 7)
+        boxed = tab.replace('<node text="Search or ask Play" class="android.view.View" package="com.android.vending" '
+                            'bounds="[50,450][1030,560]" clickable="true"/>',
+                            '<node text="" class="android.view.View" package="com.android.vending" '
+                            'bounds="[50,450][1030,560]" clickable="true"><node text="Search or ask Play" '
+                            'class="android.widget.TextView" package="com.android.vending" '
+                            'bounds="[150,470][900,540]"/></node>')
+        self.assertIn('`burner tap "Search or ask Play"`', pc.nowhere_to_type(ET.fromstring(boxed)))
         keyboard = tab.replace("</node></hierarchy>", '</node><node text="q" class="android.widget.Button" '
                                'package="com.google.android.inputmethod.latin" bounds="[0,1800][100,1900]"/></hierarchy>')
         self.assertEqual(pc.nowhere_to_type(ET.fromstring(keyboard)), "")
