@@ -2508,12 +2508,14 @@ class U2Daemon:
         label = spec.pop("field")
         young = self._last_xml and _time.monotonic() - self._last_xml_t < BY_WORDS_S
         before = field_node(self._last_xml, label) if young else None
-        if before is None:
-            raise RuntimeError(self.NO_FIELD_TAP)
-        if before["focused"] and before.get("rid"):
+        if before is not None and before["focused"] and before.get("rid"):
             # its resource id pins it: a field that lost the focus since is
             # not found by the phone, and nothing is typed
             return self._type_at_once(spec, before)
+        # a read now: the field may have come since the newest read (that
+        # read, taken as a tap's screen was still sliding, showed Settings'
+        # search bar, and the box was typed into 7.5s later, Oct 6); the
+        # CLI's tap of the field, when it comes to that, goes by this read
         try:
             with _t("field read"):
                 xml = self._dump(fresh=True)
@@ -2522,7 +2524,7 @@ class U2Daemon:
         now = field_node(xml, label)
         if now is not None and now["focused"]:
             return self._type_at_once(spec, now)
-        if now is not None and now["center"] == before["center"]:
+        if now is not None and before is not None and now["center"] == before["center"]:
             spec["tap_first"] = list(now["center"])
             spec["field_selector"] = focused_field_selector(now.get("rid", ""))
             return self._act_batch(spec)

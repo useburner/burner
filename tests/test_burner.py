@@ -4999,6 +4999,12 @@ class WebPathTests(OfflineTestCase):
         norid = SAMPLE_XML.replace('resource-id="com.example:id/q"', 'resource-id=""')
         act(norid, norid)
         self.assertEqual((reads, sent[0]["field_selector"]), ([True], mod.focused_field_selector()))
+        # the newest read shows the words on a row that isn't a field (Settings'
+        # search bar, read as the screen slid, Oct 6); the read now, the box
+        # with the focus: typed at once
+        bar = SAMPLE_XML.replace('class="android.widget.EditText"', 'class="android.widget.TextView"')
+        act(bar, SAMPLE_XML)
+        self.assertEqual((reads, sent[0].get("tap_first"), "field_selector" in sent[0]), ([True], None, True))
         # moved since, gone, not a field, an old read: the CLI's way (it taps first)
         for before, now, label, age in ((unfocused, moved, "Search", 0), (unfocused, TAP_XML, "Search", 0),
                                         (SAMPLE_XML, None, "OK", 0), (SAMPLE_XML, None, "Search", 60),
@@ -5190,7 +5196,7 @@ class WebPathTests(OfflineTestCase):
         mod = _u2mux()
         EmptyScreenTests.no_sleep(self, mod)
         dm = EmptyScreenTests._daemon(self, mod)
-        dm.d = _FakeServer([])
+        dm.d = _FakeServer([SAMPLE_XML])  # the read now: no "Password" field on it either
         dm._batch = mock.Mock(side_effect=AssertionError("setText must not go to the focused field"))
         dm._last_xml, dm._last_xml_t = SAMPLE_XML, mod._time.monotonic()  # com.example, not Chrome
         with self.assertRaises(RuntimeError) as cm:
