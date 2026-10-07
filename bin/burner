@@ -1321,7 +1321,9 @@ def is_point_covered(nodes, x, y, exclude_node, ignore=None):
     "Topmost" = latest in document order (walk() order: parents before
     children, siblings in order — later nodes paint on top). exclude_node is
     skipped (the tap target itself); pass None to check every node. With a
-    target, only covers that would really steal the tap count (_is_blocker).
+    target, only covers that would really steal the tap count (_is_blocker),
+    and the target's own words and icons never do (rows inside it that take
+    no taps: a touch on them is the target's).
     `ignore`: a test for nodes that never count (a page's own rows, for a
     row of its WebView). Pure function: no adb, unit-testable."""
     idx = -1
@@ -1336,10 +1338,21 @@ def is_point_covered(nodes, x, y, exclude_node, ignore=None):
             continue
         r = _bounds_rect(n.get("bounds"))
         if r and r[0] <= x <= r[2] and r[1] <= y <= r[3]:
-            if exclude_node is not None and not _is_blocker(n, exclude_node):
+            if exclude_node is not None and (
+                    not _is_blocker(n, exclude_node)
+                    # a row described "Opens in another app" holding its
+                    # channel's name over its centre (YouTube, Oct 7)
+                    or (not n.get("clickable") and _inside(n, exclude_node))):
                 continue
             cover = n
     return cover
+
+
+def _inside(node, outer):
+    """True when `node` is drawn inside `outer`: one of its descendants on
+    the same read. Pure."""
+    elem = (outer or {}).get("elem")
+    return elem is not None and any(p is elem for p in node.get("parents", ()))
 
 
 def find_uncovered_point(node, nodes, ignore=None):
@@ -1404,8 +1417,12 @@ def _looks_like_overlay(node, w, h):
     if short not in _CONTAINER_CLASSES:
         return False
     # Inside a clickable ancestor (a list row's inner layout), it is part of
-    # that control: the tap lands on the row, which is what was asked.
-    if any(p.attrib.get("clickable") == "true" for p in node.get("parents", [])):
+    # that control: the tap lands on the row, which is what was asked. A
+    # clickable box is that control itself: the rows of YouTube's account
+    # list, in a dialog 70% of the screen wide, read as dialogs, and a tap
+    # on one was refused as covered by itself (Oct 7).
+    if node.get("clickable") or any(p.attrib.get("clickable") == "true"
+                                    for p in node.get("parents", [])):
         return False
     x1, y1, x2, y2 = r
     # A real dialog/popup is a modest floating box; a layout container
@@ -1424,14 +1441,18 @@ def topmost_occluder(nodes, x, y, w, h):
     node at the point. Full-screen window/root containers are the expected
     background, and ordinary edge-to-edge layout containers (toolbars, nav
     bars) are the tap's natural landing spot — neither counts as blocking.
-    Only a floating overlay (dialog, popup) that would steal the tap does.
-    Returns the blocker node or None. Pure function: no adb, unit-testable."""
+    Only a floating overlay (dialog, popup) that would steal the tap does,
+    and not where a control of its own is at the point (its button, its
+    row): the tap is for that control. Returns the blocker node or None.
+    Pure function: no adb, unit-testable."""
     cover = None
     for n in nodes:  # document order; later = on top, so last match wins
         r = _bounds_rect(n.get("bounds"))
         if r and r[0] <= x <= r[2] and r[1] <= y <= r[3]:
             if not _covers_screen(n, w, h) and _looks_like_overlay(n, w, h):
                 cover = n
+            elif cover is not None and is_interactive(n):
+                cover = None
     return cover
 
 
@@ -2244,9 +2265,27 @@ def snap_save(nodes, include_all=False):
 
 
 def snap_resolve(handle):
-    """Resolve '@eN' or '@eN~s<gen>' to (x, y) pixel coords from the last burner snap.
+    """(x, y) of a snap handle in pixels (see snap_entry)."""
+    entry = snap_entry(handle)
+    return entry["x"], entry["y"]
 
-    Returns (x, y) or raises ValueError with a human-readable reason.
+
+def snap_node(nodes, entry):
+    """The row of this read a snap handle names: the same centre, class and
+    words as when it was numbered; None where the screen has changed. Pure."""
+    for n in nodes:
+        if (tuple(n.get("center") or ()) == (entry.get("x"), entry.get("y"))
+                and (n.get("class") or "").split(".")[-1] == entry.get("class")
+                and node_label(n) == entry.get("label")):
+            return n
+    return None
+
+
+def snap_entry(handle):
+    """Resolve '@eN' or '@eN~s<gen>' to its entry in the last burner snap:
+    x, y (pixels), label and class.
+
+    Returns the entry or raises ValueError with a human-readable reason.
     A pinned handle (@eN~s<gen>) whose generation does not match the current
     snap is rejected explicitly — the coordinates may belong to a different
     screen."""
@@ -2271,7 +2310,7 @@ def snap_resolve(handle):
         raise ValueError("no such handle {} in current snap".format(handle))
     if entry.get("x") is None:
         raise ValueError("handle {} has no tap point".format(handle))
-    return entry["x"], entry["y"]
+    return entry
 
 
 def cmd_dump(args):
@@ -2518,9 +2557,32 @@ def _print_settle_diff(added, removed, cap=80):
             shown += 1
 
 
+HELD_WORDS = 3  # the words an ambiguous candidate holds, named in its line
+
+
+def held_words(node):
+    """The words of the rows inside `node` (its own words left out), as
+    '"a", "b"': rows described alike are told apart by what they hold
+    (YouTube's account list, Oct 7: two rows read "Opens in another app",
+    one holding a channel, the other YouTube Kids, and `--index 0` was
+    taken blind). "" for none. Pure."""
+    elem = node.get("elem")
+    if elem is None:
+        return ""
+    own = plain_words(node.get("text") or node.get("desc") or "").strip()
+    words = []
+    for el in elem.iter():
+        w = plain_words(el.attrib.get("text") or el.attrib.get("content-desc") or "").strip()
+        if el is not elem and w and w != own and w not in words:
+            words.append(w if len(w) <= 40 else w[:39] + "\u2026")
+            if len(words) == HELD_WORDS:
+                break
+    return ", ".join('"{}"'.format(w) for w in words)
+
+
 def _tap_ambiguous(args, used, hits, fuzzy_used):
     """Refuse an ambiguous tap: list up to 5 candidates, exit 1."""
-    lines = ["  [{}] {}".format(i, format_compact(h))
+    lines = ["  [{}] {}{}".format(i, format_compact(h), " holding " + held_words(h) if held_words(h) else "")
              for i, h in enumerate(hits[:5])]
     if len(hits) > 5:
         lines.append("  ... and {} more".format(len(hits) - 5))
@@ -2627,11 +2689,13 @@ def cut_off_edge(node, hits, h):
 
 
 def plan_tap(nodes, w, h, text=None, xy=None, fuzzy=False, index=None,
-             check=True):
+             check=True, target=None):
     """Decide what a tap would do on this screen, without touching the phone.
 
     xy is a pixel point (from --xy or an @eN handle); otherwise text is the
-    label, with "a || b" fallbacks. Returns a dict with "action":
+    label, with "a || b" fallbacks. `target`: the row an @eN handle names on
+    this read (see snap_node): what is drawn over it counts, as for a tap by
+    its words, and the dialog it sits in doesn't. Returns a dict with "action":
       tap        xy, node (None for a point tap), moved (covered centre,
                  so a free point inside the target is used instead)
       refused    xy, cover (the node that would steal the tap)
@@ -2643,6 +2707,15 @@ def plan_tap(nodes, w, h, text=None, xy=None, fuzzy=False, index=None,
     through it, so a wrong refusal can be fixed and proven offline."""
     if xy is not None:
         x, y = xy
+        if check and target is not None:
+            ignore = in_webview if in_webview(target) else None
+            cover = is_point_covered(nodes, x, y, target, ignore)
+            if cover is None:
+                return {"action": "tap", "xy": (x, y), "node": target, "moved": False}
+            alt = find_uncovered_point(target, nodes, ignore)
+            if alt is None:
+                return {"action": "refused", "xy": (x, y), "cover": cover}
+            return {"action": "tap", "xy": alt, "node": target, "moved": True}
         if check:
             cover = topmost_occluder(nodes, x, y, w, h)
             if cover is not None:
@@ -2754,12 +2827,13 @@ def cmd_tap(args):
             return _tap_fail(args, str(e))
     # @eN snap handles resolve locally (no phone needed yet); a bad handle
     # is a usage error, reported before waking the device.
-    snap_xy = None
+    snap_xy = snap = None
     if args.xy is None and args.text and args.text.strip().startswith("@e"):
         try:
-            snap_xy = snap_resolve(args.text)
+            snap = snap_entry(args.text)
         except ValueError as e:
             return _tap_fail(args, str(e))
+        snap_xy = (snap["x"], snap["y"])
     plain = (args.xy is None and snap_xy is None and not args.fuzzy
              and not args.settle and not as_json(args) and not args.no_occlusion_check)
     if plain:
@@ -2851,10 +2925,11 @@ def cmd_tap(args):
             nx, ny = xy_norm
             x, y = int(nx * w), int(ny * h)
             tap_label = "--xy {}".format(args.xy)
-        plan = plan_tap(nodes, w, h, xy=(x, y),
-                        check=not args.no_occlusion_check)
+        plan = plan_tap(nodes, w, h, xy=(x, y), check=not args.no_occlusion_check,
+                        target=snap_node(nodes, snap) if snap else None)
         if plan["action"] == "refused":
             return _tap_refused(args, x, y, plan["cover"])
+        x, y = plan["xy"]  # a handle's row partly covered: a free point of it
         prev_lines = visible_lines(nodes) if args.settle else None
         prev_fp = screen_fingerprint(nodes)  # for nav memory (no extra dump)
         from_nodes = nodes  # for nav recording

@@ -1322,6 +1322,42 @@ def _twelve_line_xml():
             'checked="false">' + kids + "</node></hierarchy>")
 
 
+YT_ACCOUNTS_XML = """<hierarchy rotation="0">
+  <node text="" class="android.widget.FrameLayout" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[0,0][1080,2400]">
+    <node text="" class="android.widget.FrameLayout" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[135,720][945,1500]">
+      <node text="Accounts" class="android.widget.TextView" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[200,760][800,818]"/>
+      <node text="" class="android.widget.ImageView" package="com.google.android.youtube" content-desc="Add account" clickable="true" enabled="true" bounds="[790,740][888,840]"/>
+      <node text="pat@example.com" class="android.widget.TextView" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[200,870][880,918]"/>
+      <node text="" class="androidx.recyclerview.widget.RecyclerView" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[162,936][918,1480]">
+        <node text="" class="android.widget.RelativeLayout" package="com.google.android.youtube" content-desc="Opens in another app" clickable="true" enabled="true" bounds="[162,936][918,1071]">
+          <node text="Pat Example" class="android.widget.TextView" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[333,950][600,1012]"/>
+          <node text="1 subscriber" class="android.widget.TextView" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[333,1012][879,1044]"/>
+        </node>
+        <node text="" class="android.widget.RelativeLayout" package="com.google.android.youtube" content-desc="" clickable="true" enabled="true" bounds="[162,1071][918,1206]">
+          <node text="Second Channel" class="android.widget.TextView" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[333,1085][590,1147]"/>
+          <node text="3 subscribers" class="android.widget.TextView" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[333,1147][879,1179]"/>
+        </node>
+        <node text="" class="android.widget.RelativeLayout" package="com.google.android.youtube" content-desc="Opens in another app" clickable="true" enabled="true" bounds="[162,1341][918,1476]">
+          <node text="Kid" class="android.widget.TextView" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[333,1355][460,1417]"/>
+          <node text="YouTube Kids" class="android.widget.TextView" package="com.google.android.youtube" content-desc="" clickable="false" enabled="true" bounds="[333,1417][817,1449]"/>
+        </node>
+      </node>
+    </node>
+  </node>
+</hierarchy>"""
+
+POPUP_OVER_ROW_XML = """<hierarchy rotation="0">
+  <node text="" class="android.widget.FrameLayout" bounds="[0,0][1080,2400]" clickable="false" enabled="true">
+    <node text="" class="android.widget.LinearLayout" bounds="[0,1000][1080,1200]" clickable="true" enabled="true">
+      <node text="Content row" class="android.widget.TextView" bounds="[40,1050][600,1150]" clickable="false" enabled="true"/>
+    </node>
+    <node text="" class="android.widget.FrameLayout" bounds="[100,900][700,1400]" clickable="false" enabled="true">
+      <node text="Popup item" class="android.widget.TextView" bounds="[100,1000][700,1100]" clickable="true" enabled="true"/>
+    </node>
+  </node>
+</hierarchy>"""
+
+
 class AmbiguousTapTests(OfflineTestCase):
     def _tap(self, argv, xml=AMBI_XML):
         self.allow("wake_async")
@@ -1349,6 +1385,22 @@ class AmbiguousTapTests(OfflineTestCase):
         self.assertIn("[0]", err)
         self.assertIn("[1]", err)
         tc.assert_not_called()
+
+    def test_ambiguous_rows_are_told_apart_by_the_words_they_hold(self):
+        # YouTube's account list, Oct 7: two rows described "Opens in
+        # another app", one a channel, the other YouTube Kids; the assistant
+        # took --index 0 blind
+        rc, out, err, tc = self._tap(["tap", "Opens in another app"], xml=YT_ACCOUNTS_XML)
+        self.assertEqual(rc, 1)
+        self.assertIn('[0] [Opens in another app] (click) [RelativeLayout] (540,1003) holding '
+                      '"Pat Example", "1 subscriber"', err)
+        self.assertIn('[1] [Opens in another app] (click) [RelativeLayout] (540,1408) holding '
+                      '"Kid", "YouTube Kids"', err)
+        tc.assert_not_called()
+        # a row's words name it: its own row is tapped
+        rc, out, err, tc = self._tap(["tap", "Pat Example"], xml=YT_ACCOUNTS_XML)
+        self.assertEqual(rc, 0, err)
+        tc.assert_called_once_with(540, 1003)
 
     def test_ambiguous_tap_index_selects(self):
         rc, out, err, tc = self._tap(["tap", "OK", "--index", "1"])
@@ -1685,6 +1737,59 @@ class SnapTests(OfflineTestCase):
             rc = pc.cmd_tap(self.parse(["tap", "--quiet", "@e2"]))
         self.assertEqual(rc, 0)
         tc.assert_called_once_with(650, 450)  # Cancel button coords
+
+    def _handle(self, numbered, words):
+        return next(h for h, line in numbered if words in line).split("~")[0]
+
+    def test_tap_at_a_handle_on_a_row_of_a_narrow_dialog(self):
+        # YouTube's account list, Oct 7: `tap @e4` on a channel's row was
+        # refused as "covered by" that row (a dialog 70% of the screen wide:
+        # its rows read as dialogs)
+        numbered = self._save(YT_ACCOUNTS_XML)
+        handle = self._handle(numbered, "[Opens in another app] (click) [RelativeLayout] (540,1003)")
+        self.allow("wake_async")
+        self.allow("ui_dump", return_value=ET.fromstring(YT_ACCOUNTS_XML))
+        tc = self.allow("tap_center")
+        self.allow("u2sock", return_value=None)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_tap(self.parse(["tap", "--quiet", "--no-evidence", handle]))
+        self.assertEqual(rc, 0, err.getvalue())
+        tc.assert_called_once_with(540, 1003)
+        # the row's own words over its centre are the row's; a control
+        # inside it there would take the touch
+        nodes = pc.walk(ET.fromstring(YT_ACCOUNTS_XML))
+        entry = {"x": 540, "y": 1003, "label": "[Opens in another app]", "class": "RelativeLayout"}
+        row = pc.snap_node(nodes, entry)
+        self.assertEqual(row["desc"], "Opens in another app")
+        self.assertIsNone(pc.is_point_covered(nodes, 540, 1003, row))
+        plan = pc.plan_tap(nodes, 1080, 2400, xy=(540, 1003), target=row)
+        self.assertEqual((plan["action"], plan["xy"], plan["node"] is row), ("tap", (540, 1003), True))
+        clicky = pc.walk(ET.fromstring(YT_ACCOUNTS_XML.replace(
+            'content-desc="" clickable="false" enabled="true" bounds="[333,950][600,1012]"',
+            'content-desc="" clickable="true" enabled="true" bounds="[333,950][600,1012]"')))
+        cover = pc.is_point_covered(clicky, 540, 1003, pc.snap_node(clicky, entry))
+        self.assertEqual(cover["text"], "Pat Example")
+        # a screen changed under the handle: no row named, the point's check
+        self.assertIsNone(pc.snap_node(nodes, dict(entry, label="[Something else]")))
+
+    def test_a_point_on_a_dialog_s_row_is_the_row_s_and_its_blank_part_refused(self):
+        nodes = pc.walk(ET.fromstring(YT_ACCOUNTS_XML))
+        self.assertEqual(pc.plan_tap(nodes, 1080, 2400, xy=(540, 1003))["action"], "tap")
+        self.assertEqual(pc.plan_tap(nodes, 1080, 2400, xy=(540, 1408))["action"], "tap")
+        # the dialog's title: no control of its own there
+        refused = pc.plan_tap(nodes, 1080, 2400, xy=(500, 789))
+        self.assertEqual(refused["action"], "refused")
+        self.assertEqual(refused["cover"]["bounds"], "[135,720][945,1500]")
+
+    def test_a_handle_s_row_under_a_popup_is_tapped_where_it_is_free(self):
+        # the handle names the row under the popup: the popup's item over
+        # its centre would take the touch, so a free point of the row is
+        # used; a bare point there is the popup item's
+        nodes = pc.walk(ET.fromstring(POPUP_OVER_ROW_XML))
+        row = next(n for n in nodes if n["class"].endswith("LinearLayout"))
+        plan = pc.plan_tap(nodes, 1080, 2400, xy=(540, 1100), target=row)
+        self.assertEqual((plan["action"], plan["xy"], plan["moved"]), ("tap", (810, 1100), True))
+        self.assertEqual(pc.plan_tap(nodes, 1080, 2400, xy=(540, 1100))["action"], "tap")
 
     def test_tap_stale_snap_fails(self):
         args = self.parse(["tap", "--no-evidence", "@e1"])
