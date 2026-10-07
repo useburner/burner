@@ -1443,7 +1443,7 @@ def is_ime_package(pkg):
 # assistant acts on; a Button, a field, a switch or a tab does.
 TELLING_CLASSES = ("Button", "EditText", "Switch", "CheckBox", "Radio",
                    "Spinner", "SeekBar", "Toggle", "WebView", "Tab", "Image",
-                   "Chip", "Slider")
+                   "Chip", "Slider", "ProgressBar")  # a bar's value is its text: "25.0" alone said nothing (Storage, Oct 7)
 LABEL_MAX = 120
 
 

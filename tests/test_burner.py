@@ -1381,6 +1381,14 @@ class AmbiguousTapTests(OfflineTestCase):
         self.assertIn("ambiguous tap", err)
         self.assertIn("(fuzzy)", err)
 
+    def test_a_progress_bar_row_says_it_is_one(self):
+        # Storage, Oct 7: "25.0 (540,540)" printed as a row with no word of
+        # what it was
+        bar = SAMPLE_XML.replace("</hierarchy>", '<node text="25.0" class="android.widget.ProgressBar" '
+                                 'package="com.example" bounds="[100,500][980,580]"/></hierarchy>')
+        lines, _ = pc.screen_lines(pc.walk(ET.fromstring(bar)), 1080, 2400)
+        self.assertIn("25.0 [ProgressBar] (540,540)", lines)
+
     def test_a_loose_match_taps_only_a_row_the_words_name(self):
         # YouTube, Oct 7: `tap Search` on the results page, with no row
         # reading "Search", pressed "Search with your voice", and Android
