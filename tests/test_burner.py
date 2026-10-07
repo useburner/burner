@@ -5886,6 +5886,19 @@ class WebPathTests(OfflineTestCase):
         # a key too; still the same after: kept as it is
         self.assertEqual(run({"key": 4, "idle": 1200}, SAMPLE_XML, again=SAMPLE_XML), SAMPLE_XML)
         self.assertEqual(len(batches), 2)
+        # the same words in other places, or the focus moved: the tapped bar
+        # slid before the screen it opened was drawn (Settings' search, Oct 7)
+        moved = SAMPLE_XML.replace("[100,600][900,700]", "[100,640][900,740]").replace('focused="true"', 'focused="false"')
+        self.assertNotEqual(mod.screen_sig(moved), mod.screen_sig(SAMPLE_XML))
+        self.assertEqual(run({"tap": [250, 450], "idle": 1200}, moved), results)
+        self.assertEqual(len(batches), 2)
+        # a switch's state is no place: a toggle's read is kept, one trip
+        toggled = SAMPLE_XML.replace("</hierarchy>", '<node text="Wi-Fi" checked="true" package="com.example" '
+                                     'class="android.widget.Switch" bounds="[0,1500][1080,1600]"/></hierarchy>')
+        before_toggle = toggled.replace('checked="true"', 'checked="false"')
+        self.assertNotEqual(mod.screen_words(toggled), mod.screen_words(before_toggle))
+        run({"tap": [540, 1550], "idle": 1200}, toggled, before=before_toggle)
+        self.assertEqual(len(batches), 1)
         # nothing readable on the read again: that read, not the one from
         # before the action (the CLI reads a thin screen again)
         self.assertEqual(run({"tap": [250, 450], "idle": 1200}, SAMPLE_XML, again=BARS_XML), BARS_XML)

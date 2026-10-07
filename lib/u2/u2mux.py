@@ -1409,6 +1409,20 @@ def screen_sig(xml):
         return None
 
 
+def screen_words(xml):
+    """What a read says, places and focus aside: each worded row's words
+    and its check, the system UI's aside. A tap that opens another app's
+    screen moves the row tapped, or gives it the focus, before the new
+    screen is drawn: such a read differs from the one before in places
+    alone (Settings' search, Oct 7). None for a read that can't be parsed.
+    Pure."""
+    try:
+        return sorted((n["text"], n["desc"], n["checked"]) for n in iter_nodes(xml)
+                      if n["pkg"] != SYSTEM_UI and (n["text"] or n["desc"]))
+    except Exception:
+        return None
+
+
 def worded_rows(xml):
     """How many rows of a read carry words (text or a description), the
     system UI's aside. Pure."""
@@ -2917,7 +2931,8 @@ class U2Daemon:
                                        "it was probably dropped; the screen is on now")
             if (before and acted and "set_text" not in spec and not sleeps_the_screen(spec)
                     and not chrome_in(xml)
-                    and (screen_sig(xml) == screen_sig(before) or half_drawn_after(xml, before))):
+                    and (screen_sig(xml) == screen_sig(before) or half_drawn_after(xml, before)
+                         or (screen_words(xml) is not None and screen_words(xml) == screen_words(before)))):
                 xml = self._relook(xml)
             # The action landed in Chrome: the page itself says what it
             # shows now (the screen reader's tree may lag it). The read is
