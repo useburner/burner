@@ -1879,6 +1879,37 @@ class SetupWizardTests(OfflineTestCase):
         st = pc._setup_state_load()
         self.assertIn("tailscale-phone", st["done"])
 
+    def test_apps_finds_the_apps_that_came_with_the_phone(self):
+        # Oct 7: `burner apps calendar` said "not installed" (third-party
+        # packages only), and Google Calendar ships with the phone
+        launcher = ("48 activities found:\n  Activity #0:\n    priority=0 preferredOrder=0 match=0x108000\n"
+                    "    com.android.chrome/com.google.android.apps.chrome.Main\n  Activity #1:\n"
+                    "    com.google.android.calendar/com.android.calendar.AllInOneActivity\n"
+                    "    com.google.android.apps.messaging/.ui.ConversationListActivity\n"
+                    "    com.android.settings/.Settings\n")
+        calls = []
+
+        def adb(*args, timeout=30):
+            calls.append(args)
+            out = launcher if "query-activities" in " ".join(args) else "package:com.tinder\npackage:com.vinted\n"
+            return SimpleNamespace(returncode=0, stdout=out, stderr="")
+        self.allow("adb_or_ensure", side_effect=adb)
+        for name, want in (("calendar", "com.google.android.calendar\n"),
+                           ("Google Calendar", "com.google.android.calendar\n"),
+                           ("messages", "com.google.android.apps.messaging\n"),
+                           ("tinder", "com.tinder\n")):
+            calls.clear()
+            with self.cap() as (out, err):
+                rc = pc.cmd_apps(SimpleNamespace(match=name, all=False))
+            self.assertEqual((rc, out.getvalue()), (0, want), name)
+        self.assertEqual(len(calls), 1)  # a third-party match: no launcher query
+        with self.cap() as (out, err):
+            rc = pc.cmd_apps(SimpleNamespace(match="snapchat", all=False))
+        self.assertEqual((rc, out.getvalue()), (1, ""))
+        self.assertEqual(pc.launchable_packages(launcher),
+                         {"com.android.chrome", "com.google.android.calendar",
+                          "com.google.android.apps.messaging", "com.android.settings"})
+
     def test_uninstall_without_yes_only_lists(self):
         m = self.allow("adb")
         with self.cap() as (out, err):

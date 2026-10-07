@@ -5559,7 +5559,36 @@ def _notifications_from_shade():
 APP_WORDS = {"messages": "messaging", "texts": "messaging", "sms": "messaging",
              "text": "messaging", "contacts": "contacts", "phone": "dialer",
              "calls": "dialer", "clock": "deskclock", "email": "gm",
-             "gmail": "gm", "files": "documentsui"}
+             "gmail": "gm", "files": "documentsui", "play store": "vending",
+             "drive": "apps.docs"}
+
+# The apps a person can open: the launcher's intent, as Android resolves it
+LAUNCHER_QUERY = ("cmd package query-activities --brief -a android.intent.action.MAIN "
+                  "-c android.intent.category.LAUNCHER")
+
+
+def launchable_packages(text):
+    """The packages in LAUNCHER_QUERY's output ("    com.android.settings/
+    .Settings" lines): the apps a person can open from the launcher. Pure."""
+    out = set()
+    for line in (text or "").splitlines():
+        m = re.match(r"^\s*([A-Za-z][\w.]*)/[\w.$]+\s*$", line)
+        if m:
+            out.add(m.group(1))
+    return out
+
+
+def app_matches(pkgs, name):
+    """The packages a name the user said matches (APP_WORDS for the common
+    ones, else a part of the package): the whole name first, then its last
+    word ("google calendar"). Pure."""
+    words = name.lower().split()
+    for phrase in [" ".join(words)] + (words[-1:] if len(words) > 1 else []):
+        part = APP_WORDS.get(phrase, phrase.replace(" ", ""))
+        hits = [p for p in pkgs if part in p.lower()]
+        if hits:
+            return hits
+    return []
 
 
 def cmd_apps(args):
@@ -5570,8 +5599,15 @@ def cmd_apps(args):
     pkgs = sorted(l.split(":", 1)[1].strip()
                   for l in (r.stdout or "").splitlines() if l.startswith("package:"))
     if args.match:
-        word = APP_WORDS.get(args.match.lower(), args.match.lower())
-        pkgs = [p for p in pkgs if word in p.lower()]
+        pkgs = app_matches(pkgs, args.match)
+        if not pkgs and not args.all:
+            # an app that came with the phone (Calendar, Messages, Gmail,
+            # Clock) isn't a third-party one: the apps a person can open,
+            # by the launcher's list (Google Calendar read as not installed,
+            # and the guide's `burner apps messages` found nothing on a
+            # Pixel, Oct 7)
+            r = adb_or_ensure("shell", LAUNCHER_QUERY, timeout=30)
+            pkgs = sorted(app_matches(sorted(launchable_packages(r.stdout)), args.match))
     for p in pkgs:
         print(p)
     return 0 if (pkgs or not args.match) else 1
