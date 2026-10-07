@@ -6363,10 +6363,12 @@ class EmptyScreenTests(OfflineTestCase):
         with self.assertRaises(RuntimeError):
             dm.handle("act {}")
         self.assertEqual(len(relinks), 1)
-        # not sent for another reason (the words aren't on the screen): no relink
-        answers = iter([mod.ActNotSent("act not sent: the read before it failed (RuntimeError: no read)")])
-        with self.assertRaises(mod.ActNotSent):
-            dm.handle("act {}")
+        # not sent for another reason (the server not listening right after
+        # an update, "AdbError: closed"): no relink; the server asked (its
+        # client relaunches a server that doesn't answer) and the act sent
+        # once more
+        answers = iter([mod.ActNotSent("act not sent: the UI server couldn't be reached (AdbError: closed)"), b"ok"])
+        self.assertEqual(dm.handle("act {}"), b"ok")
         self.assertEqual(len(relinks), 1)
 
     def test_a_relink_that_failed_is_not_tried_again_at_once(self):

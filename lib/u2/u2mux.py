@@ -2706,22 +2706,23 @@ class U2Daemon:
             # Return a sentinel; the caller decides what it means.
             return b"__NOT_FOUND__"
         except Exception as e:
-            if cmd in NO_RETRY:
-                if isinstance(e, ActNotSent) and device_gone(str(e)):
-                    # nothing went out, and the phone is gone from adb: the
-                    # link remade, the action once more (it can't happen twice)
-                    log("%s %s: %s" % (cmd, arg[:80], err_text(e, 160)))
-                    with self._lock:
-                        self._relink(err_text(e, 100))
-                    return fn(arg)
+            if cmd in NO_RETRY and not isinstance(e, ActNotSent):
                 # The phone may already have acted (the reply was lost, not
                 # the request). Replaying would tap or type twice.
                 log("%s %s: %s" % (cmd, arg[:80], err_text(e, 160)))
                 raise
+            if cmd in NO_RETRY:
+                # an act that never went out (its stream wasn't opened, or
+                # the read before it failed): mended like a read, and sent
+                # once more, which can't make it happen twice (right after
+                # `burner update` the server wasn't listening, "AdbError:
+                # closed", and a start's reads went the slow way, Oct 6)
+                log("%s %s: %s; sending it once more" % (cmd, arg[:80], err_text(e, 160)))
             # Maybe the on-device server died — reconnect once and retry.
             # The RLock makes concurrent handlers queue behind one reconnect.
             with self._lock:
-                gone, answers, why = phone_gone(e), False, e
+                gone = phone_gone(e) or (isinstance(e, ActNotSent) and device_gone(str(e)))
+                answers, why = False, e
                 if not gone:
                     try:
                         self.d.info
