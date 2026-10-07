@@ -2062,7 +2062,7 @@ class U2Daemon:
                 if ok:
                     self.invalidate()
                     return json.dumps({"clicked": True, "text": arg}).encode()
-        n = find_node(self._dump(), arg)
+        n = find_node(self._dump(), arg, names=True)  # a click: only rows the words name
         if n is None:
             raise U2NotFound("no such text: %r" % arg)
         self.invalidate()
@@ -2932,10 +2932,34 @@ def bar_icon(node, h):
     return y2 <= h * BAR_FRACTION or y1 >= h * (1 - BAR_FRACTION)
 
 
-def find_node(xml, needle, fuzzy=True):
+# A row whose words merely contain a tap's words stands for them only when
+# they name it: `tap Search` on YouTube's results, with no row reading
+# "Search", pressed "Search with your voice", and Android asked to record
+# audio (Oct 7); "Delete" inside "Delete account" would be worse.
+NOTE_MARKS = ",:;([|-\u2013\u2014\u00b7\u2022/"  # what starts a note after a row's name
+
+
+def fuzzy_ok(query, label):
+    """Whether `label`, a row's words that contain `query` without being
+    it, may stand for it in a tap: the words are whole words of the row
+    and a phrase of three words or more, more than half of the row's
+    words, or the row's head with a note after it ("Inbox, 3 unread",
+    "Echo Dot (5th Gen) | Smart speaker"). Pure."""
+    q, row = plain_words(query).lower(), plain_words(label).lower()
+    if not q or not re.search(r"(?<!\w)" + re.escape(q) + r"(?!\w)", row):
+        return False
+    words, row_words = len(q.split()), len(row.split())
+    if words >= 3 or 2 * words > row_words:
+        return True
+    rest = row[len(q):].lstrip() if row.startswith(q) else ""
+    return rest[:1] != "" and rest[0] in NOTE_MARKS
+
+
+def find_node(xml, needle, fuzzy=True, names=False):
     """First node whose text or content-desc matches needle: exact
     (case-insensitive) match wins, then substring if fuzzy (never on a
-    status or navigation bar icon, see bar_icon). "A || B" matches any of
+    status or navigation bar icon, see bar_icon; with `names`, for a tap,
+    only a row the words name, see fuzzy_ok). "A || B" matches any of
     the labels (the first found, in that order). None on miss."""
     needles = [plain_words(p).lower() for p in needle.split("||") if p.strip()]
     first_sub = None
@@ -2947,7 +2971,8 @@ def find_node(xml, needle, fuzzy=True):
             if nl in labels:
                 return n
             if (fuzzy and first_sub is None and any(nl in l for l in labels)
-                    and not bar_icon(n, h)):
+                    and not bar_icon(n, h)
+                    and (not names or any(fuzzy_ok(nl, l) for l in labels if nl in l))):
                 first_sub = n
         if first_sub is not None:
             return first_sub

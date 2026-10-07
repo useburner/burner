@@ -1290,8 +1290,8 @@ TYPED_XML = """<hierarchy rotation="0">
 
 FUZZY_AMBI_XML = """<hierarchy rotation="0">
   <node text="" class="android.widget.FrameLayout" bounds="[0,0][1080,2400]" clickable="false" enabled="true" focused="false" checked="false">
-    <node text="Okay" class="android.widget.Button" bounds="[100,400][400,500]" clickable="true" enabled="true" focused="false" checked="false"/>
-    <node text="OK fine" class="android.widget.Button" bounds="[100,600][400,700]" clickable="true" enabled="true" focused="false" checked="false"/>
+    <node text="OK, got it" class="android.widget.Button" bounds="[100,400][400,500]" clickable="true" enabled="true" focused="false" checked="false"/>
+    <node text="OK, fine" class="android.widget.Button" bounds="[100,600][400,700]" clickable="true" enabled="true" focused="false" checked="false"/>
   </node>
 </hierarchy>"""
 
@@ -1380,6 +1380,49 @@ class AmbiguousTapTests(OfflineTestCase):
         self.assertEqual(rc, 1)
         self.assertIn("ambiguous tap", err)
         self.assertIn("(fuzzy)", err)
+
+    def test_a_loose_match_taps_only_a_row_the_words_name(self):
+        # YouTube, Oct 7: `tap Search` on the results page, with no row
+        # reading "Search", pressed "Search with your voice", and Android
+        # asked to record audio
+        for query, label, ok in (("Search", "Search with your voice", False),
+                                 ("Delete", "Delete account", False),
+                                 ("Sign in", "Sign in with Google", False),
+                                 ("Battery", "Battery 79 percent.", False),
+                                 ("ok", "Okay", False),  # a word inside a word
+                                 ("Inbox", "Inbox, 3 unread", True),
+                                 ("Echo Dot", "Echo Dot (5th Gen) | Smart speaker with Alexa | Charcoal", True),
+                                 ("lofi hip hop radio", "lofi hip hop radio \U0001f4da beats to relax/study to - Lofi Girl", True),
+                                 ("Wi-Fi", "Wi\u2011Fi, connected", True),
+                                 ("Turn on", "Turn on now", True)):
+            self.assertEqual(pc.fuzzy_ok(query, label), ok, (query, label))
+            self.assertEqual(_u2mux().fuzzy_ok(query, label), ok, (query, label))
+        voice = ('<hierarchy rotation="0"><node text="" class="android.widget.FrameLayout" bounds="[0,0][1080,2400]" '
+                 'clickable="false" enabled="true">'
+                 '<node text="lofi hip hop radio" class="android.widget.EditText" bounds="[150,150][850,270]" clickable="true" enabled="true"/>'
+                 '<node text="" content-desc="Search with your voice" class="android.widget.ImageView" '
+                 'bounds="[880,150][1000,270]" clickable="true" enabled="true"/></node></hierarchy>')
+        plan = pc.plan_tap(pc.walk(ET.fromstring(voice)), 1080, 2400, text="Search")
+        self.assertEqual((plan["action"], plan["near"]), ("nomatch", ["Search with your voice"]))
+        rc, out, err, tc = self._tap(["tap", "Search"], xml=voice)
+        self.assertEqual(rc, 1)
+        self.assertIn('no row reads "Search"; rows with those words: "Search with your voice". '
+                      'Tap one by its full words', err)
+        tc.assert_not_called()
+        # --fuzzy asks for the loose match: taken
+        rc, out, err, tc = self._tap(["tap", "--fuzzy", "Search"], xml=voice)
+        self.assertEqual(rc, 0, err)
+        tc.assert_called_once_with(940, 210)
+        # a row the words name: tapped as before
+        rc, out, err, tc = self._tap(["tap", "Search with"], xml=voice.replace(
+            "Search with your voice", "Search with voice"))
+        self.assertEqual(rc, 0, err)
+        # the helper's click by text, its last tier: the same rule
+        mod = _u2mux()
+        self.assertIsNone(mod.find_node(voice, "Search", names=True))
+        self.assertEqual(mod.find_node(voice, "Search")["desc"], "Search with your voice")  # a wait: loose
+        self.assertEqual(mod.find_node(voice.replace("Search with your voice", "Search, voice"), "Search",
+                                       names=True)["desc"], "Search, voice")
 
     def test_typed_words_in_a_field_are_not_its_label(self):
         rc, out, err, tc = self._tap(["tap", "Pixel 7"], xml=TYPED_XML)

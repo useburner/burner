@@ -1085,6 +1085,29 @@ def _screen_height(nodes):
     return best
 
 
+# A row whose words merely contain a tap's words stands for them only when
+# they name it: `tap Search` on YouTube's results, with no row reading
+# "Search", pressed "Search with your voice", and Android asked to record
+# audio (Oct 7); "Delete" inside "Delete account" would be worse.
+NOTE_MARKS = ",:;([|-\u2013\u2014\u00b7\u2022/"  # what starts a note after a row's name
+
+
+def fuzzy_ok(query, label):
+    """Whether `label`, a row's words that contain `query` without being
+    it, may stand for it in a tap: the words are whole words of the row
+    and a phrase of three words or more, more than half of the row's
+    words, or the row's head with a note after it ("Inbox, 3 unread",
+    "Echo Dot (5th Gen) | Smart speaker"). Pure."""
+    q, row = plain_words(query).lower(), plain_words(label).lower()
+    if not q or not re.search(r"(?<!\w)" + re.escape(q) + r"(?!\w)", row):
+        return False
+    words, row_words = len(q.split()), len(row.split())
+    if words >= 3 or 2 * words > row_words:
+        return True
+    rest = row[len(q):].lstrip() if row.startswith(q) else ""
+    return rest[:1] != "" and rest[0] in NOTE_MARKS
+
+
 def find_nodes(nodes, text, exact=True):
     def label(n):
         return plain_words(n["text"] or n["desc"] or "")
@@ -2453,22 +2476,25 @@ def plan_tap(nodes, w, h, text=None, xy=None, fuzzy=False, index=None,
         return {"action": "tap", "xy": (x, y), "node": None, "moved": False}
     # Fallback selectors: "a || b" tries each label in order (first hit wins).
     selectors = [s.strip() for s in text.split("||")]
-    hits, used, fuzzy_used = [], selectors[0], False
+    hits, used, fuzzy_used, near = [], selectors[0], False, []
     for sel in selectors:
         hits = find_nodes(nodes, sel, exact=not fuzzy)
         if hits:
             used = sel
             break
     if not hits and not fuzzy:
-        # Auto-retry with fuzzy match before giving up (saves a manual retry
-        # on long labels like Amazon order titles).
+        # A looser match before giving up, for rows the words name (see
+        # fuzzy_ok: a long label shortened, such as an Amazon order's
+        # title); rows that merely contain them are named, not tapped
         for sel in selectors:
-            hits = find_nodes(nodes, sel, exact=False)
+            loose = find_nodes(nodes, sel, exact=False)
+            hits = [n for n in loose if fuzzy_ok(sel, n["text"] or n["desc"] or "")]
             if hits:
                 used, fuzzy_used = sel, True
                 break
+            near += [w for w in (_row_words(n) for n in loose) if w and w not in near]
     if not hits:
-        return {"action": "nomatch"}
+        return {"action": "nomatch", "near": near[:3]}
     controls = dedupe_same_control(hits)
     if len(controls) > 1:
         # the words typed into a field are not its label when another row
@@ -2681,7 +2707,13 @@ def cmd_tap(args):
             args.text, what, "up" if plan["edge"] == "top" else "down"))
     if plan["action"] == "nomatch":
         # what to do next, in one command: a row below the fold was looked
-        # for by a screenshot, a scroll and a tap again (the battery task, Oct 6)
+        # for by a screenshot, a scroll and a tap again (the battery task,
+        # Oct 6); rows with the words in a longer label are named, since
+        # one of them may be meant (see fuzzy_ok)
+        if plan.get("near"):
+            return _tap_fail(args, 'no row reads "{0}"; rows with those words: {1}. Tap one by its '
+                                   'full words, or `burner scroll down --to "{0}"` looks further down'.format(
+                                       args.text, ", ".join('"{}"'.format(w[:60]) for w in plan["near"])))
         return _tap_fail(args, 'no match for "{0}" on the screen; `burner scroll down --to "{0}"` '
                                'looks further down'.format(args.text))
     if plan["action"] == "ambiguous":
