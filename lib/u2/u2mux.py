@@ -1424,6 +1424,26 @@ def focused_field_selector(rid=""):
     return sel
 
 
+TAP_OPENED_S = 30.0  # a control tapped this recently may have opened the box a `type --field` names
+
+
+def lone_focused_field(xml, label):
+    """The read's one text field, when it has the focus and no row on the
+    read carries `label` (a button's words, say, that opened the box: the
+    Play Store's "Search or ask Play" opens a box reading "Search apps &
+    games", Oct 6); else None. Pure."""
+    try:
+        nodes = list(iter_nodes(xml or ""))
+    except Exception:
+        return None
+    alts = [plain_words(p).lower() for p in label.split("||") if p.strip()]
+    if any(a in (plain_words(n["text"]).lower(), plain_words(n["desc"]).lower())
+           for n in nodes for a in alts):
+        return None
+    fields = [n for n in nodes if n["field"]]
+    return fields[0] if len(fields) == 1 and fields[0]["focused"] else None
+
+
 def field_node(xml, label):
     """The text field with this label on a read (see label_node: once,
     whole, nothing over it), or None (no such row, several, or a row that
@@ -2423,6 +2443,7 @@ class U2Daemon:
             # screen and taps by coordinates instead.
             spec = dict(spec)
             label = spec.pop("tap_label")
+            spec["tapped_label"] = label  # remembered once the tap is done (see _type_into_field)
             before = self._last_xml
             tried = None
             if before and _time.monotonic() - self._last_xml_t < BY_WORDS_S:
@@ -2528,6 +2549,19 @@ class U2Daemon:
             spec["tap_first"] = list(now["center"])
             spec["field_selector"] = focused_field_selector(now.get("rid", ""))
             return self._act_batch(spec)
+        tapped, tapped_at = getattr(self, "_last_tap", ("", -1e9))
+        opened = (plain_words(tapped).lower() == plain_words(label).lower()
+                  and _time.monotonic() - tapped_at < TAP_OPENED_S)
+        lone = lone_focused_field(xml, label) if now is None and opened else None
+        if lone is not None:
+            # the control with these words was just tapped and is gone: it
+            # opened this box (Play's "Search or ask Play" opens "Search
+            # apps & games", Oct 6), and the one box on the screen, focused,
+            # takes the text. Never without that tap: a password named by
+            # a field that isn't on the screen must not go into a search box
+            log("no row reads %r; typing into the one field, which has the focus (%r)"
+                % (label, (lone["text"] or lone["desc"])[:40]))
+            return self._type_at_once(spec, lone)
         raise RuntimeError(self.NO_FIELD_TAP)
 
     def _type_at_once(self, spec, node):
@@ -2618,6 +2652,10 @@ class U2Daemon:
                 raise RuntimeError("act failed after sending: the wake before it failed "
                                    "(%s), so it may have been dropped" % results[0])
             xml = results[-1]
+            if spec.get("tapped_label"):
+                # a control tapped by its words: a `type --field` with them
+                # next types into the box it opened (see _type_into_field)
+                self._last_tap = (spec["tapped_label"], _time.monotonic())
             if spec.get("quiet"):
                 # a chained step: the action landed and the UI went quiet;
                 # no screen goes back, and the read taken is the newest one

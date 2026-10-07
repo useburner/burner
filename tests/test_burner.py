@@ -5140,6 +5140,50 @@ class WebPathTests(OfflineTestCase):
         self.assertIn("no answer from the phone's adb in 6s", str(cm.exception))
         self.assertEqual(closed, [1])
 
+    def test_a_field_named_by_the_button_that_opened_it_takes_the_text(self):
+        # Play Store, Oct 6: "Search or ask Play" (a button) opened a box
+        # reading "Search apps & games"; `type --field 'Search or ask Play'`
+        # failed, and a screenshot and a second type followed
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        dm = EmptyScreenTests._daemon(self, mod)
+        sent = []
+        dm._act_batch = lambda spec: sent.append(spec) or SAMPLE_XML.encode()
+        box = SAMPLE_XML.replace('content-desc="Search"', 'content-desc="Search apps &amp; games"')
+        dm._last_xml, dm._last_xml_t = box, mod._time.monotonic()
+        # never without that tap: a password named by a field that isn't
+        # on the screen must not go into a search box
+        dm.d = _FakeServer([box])
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"set_text": "duolingo", "field": "Search or ask Play", "idle": 1200}))
+        self.assertEqual((str(cm.exception), sent), (dm.NO_FIELD_TAP, []))
+        # the button with those words tapped a moment ago
+        dm._last_tap = ("Search or ask Play", mod._time.monotonic())
+        dm.d = _FakeServer([box])
+        self.assertEqual(dm.cmd_act(json.dumps({"set_text": "duolingo", "field": "Search or ask Play", "idle": 1200})),
+                         SAMPLE_XML.encode())
+        self.assertEqual(sent[0]["field_selector"]["resourceId"], "com.example:id/q")
+        # a tap by words is remembered once it is done
+        dm2 = EmptyScreenTests._daemon(self, mod)
+        dm2.d = _FakeServer([])
+        dm2._last_xml, dm2._last_xml_t = SAMPLE_XML, mod._time.monotonic()
+        dm2._batch = lambda calls, timeout=45.0: [None] * (len(calls) - 1) + [box]
+        dm2.cmd_act(json.dumps({"tap_label": "OK"}))
+        self.assertEqual(dm2._last_tap[0], "OK")
+        # the words still on the screen (a button that hasn't opened a box
+        # yet), two fields, or the one field without the focus: the CLI's way
+        for xml, label in ((box.replace('text="OK"', 'text="Search or ask Play"'), "Search or ask Play"),
+                           (box.replace("</hierarchy>", '<node text="" class="android.widget.EditText" '
+                                        'package="com.example" bounds="[100,1600][900,1700]" focused="false"/></hierarchy>'),
+                            "Search or ask Play"),
+                           (box.replace('focused="true"', 'focused="false"'), "Search or ask Play")):
+            sent.clear()
+            dm.d = _FakeServer([xml])
+            with self.assertRaises(RuntimeError) as cm:
+                dm.cmd_act(json.dumps({"set_text": "duolingo", "field": label, "idle": 1200}))
+            self.assertEqual(str(cm.exception), dm.NO_FIELD_TAP)
+            self.assertEqual(sent, [])
+
     def test_a_tap_then_type_batch(self):
         mod = _u2mux()
         calls = mod.act_calls({"set_text": "pudgy", "tap_first": [500, 650], "idle": 1200})
