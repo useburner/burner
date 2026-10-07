@@ -2972,7 +2972,7 @@ class U2Daemon:
                 # another app's screen read as the page before it, changed
                 # in some rows, and nothing said how, Oct 7)
                 changed = words_changed(before, xml)
-                if changed:
+                if changed and len(changed) <= 6:  # a near miss; a new screen needs no line
                     log("act read: %d rows gone, %d new; %s" % (
                         sum(1 for c in changed if c[0] == "-"), sum(1 for c in changed if c[0] == "+"),
                         "; ".join("%s%r" % c for c in changed[:4])))
