@@ -2354,6 +2354,31 @@ class FastPathTests(OfflineTestCase):
         u2.assert_called_once_with("shot", "png", timeout=30)
         waker.join.assert_called_once()
 
+    def test_a_screenshot_right_after_a_printed_screen_says_so(self):
+        # through Muse, Oct 6-7: a screenshot after most steps, 1.2-2.7s
+        # each, right after the screen's rows were printed
+        import datetime
+        now = 1_800_000_000.0
+        stamp = lambda dt: datetime.datetime.fromtimestamp(now - dt).strftime("%Y-%m-%d %H:%M:%S")
+        line = lambda dt, cmd, rc=0: "%s   1523ms exit %d burner %s\n" % (stamp(dt), rc, cmd)
+        self.assertIn("`burner tap` printed this screen's rows", pc.shot_hint([line(5, "tap Search")], now))
+        self.assertIn("`burner type`", pc.shot_hint([line(3, "type --field Search '\u2026'")], now))
+        self.assertIn("`burner open`", pc.shot_hint([line(3, "--json open https://x.com")], now))
+        for lines in ([line(60, "tap Search")],          # long ago
+                      [line(5, "tap Search", rc=1)],     # it failed: no screen printed
+                      [line(5, "shot --out /tmp/a.png")],  # a screenshot again
+                      [line(5, "log --last 20")], []):
+            self.assertEqual(pc.shot_hint(lines, now), "", lines)
+        # on the command: stderr, the path alone on stdout
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.jpg")
+            self.allow("shot_fast", return_value=path)
+            with mock.patch.object(pc, "_shot_hint_now", return_value="burner: the hint"), \
+                    self.cap() as (out, err):
+                self.assertEqual(pc.cmd_shot(self.parse(["shot", "--out", path])), 0)
+        self.assertEqual(out.getvalue(), os.path.abspath(path) + "\n")
+        self.assertEqual(err.getvalue(), "burner: the hint\n")
+
     def test_shot_fast_none_when_mux_down(self):
         self.allow("wake_async", return_value=mock.Mock())
         self.allow("u2sock", return_value=None)

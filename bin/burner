@@ -3824,7 +3824,45 @@ def shot_fast(out):
     return out
 
 
+SHOT_HINT_S = 20  # a screenshot this soon after a command that printed the screen earns the hint
+PRINTING_VERBS = ("tap", "type", "press", "open", "start", "scroll", "wait", "dismiss",
+                  "settings", "state", "do", "recipe")
+
+
+def shot_hint(lines, now):
+    """The line printed with a screenshot taken right after a command that
+    printed the screen's rows (the last logged command, by its verb, with
+    exit 0, within SHOT_HINT_S of `now`, a time.time()): the rows hold the
+    screen's words, and a screenshot is for pictures (Muse took one after
+    most steps, 1.2-2.7s each, Oct 6-7). "" otherwise. `lines` are
+    run/commands.log lines (see log_line). Pure."""
+    import datetime
+    last = next((l for l in reversed(lines) if l.strip()), "")
+    m = re.match(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\s+\d+ms exit 0 burner (?:--\S+ )*(\w+)", last)
+    if not m or m.group(2) not in PRINTING_VERBS:
+        return ""
+    try:
+        t = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
+    except ValueError:
+        return ""
+    if not 0 <= now - t <= SHOT_HINT_S:
+        return ""
+    return ("burner: `burner {}` printed this screen's rows a moment ago, and they hold its words; "
+            "a screenshot is for pictures (a photo, a map, a chart).".format(m.group(2)))
+
+
+def _shot_hint_now():
+    """shot_hint on the command log; "" when there is no log."""
+    try:
+        with open(COMMANDS_LOG, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()[-3:]
+    except OSError:
+        return ""
+    return shot_hint(lines, time.time())
+
+
 def cmd_shot(args):
+    hint = _shot_hint_now()  # before this shot is logged
     cmd = [os.path.join(ROOT, "screenshot.sh")]
     out = getattr(args, "out", None)
     named = False  # True when we picked the file name ourselves
@@ -3846,6 +3884,8 @@ def cmd_shot(args):
         time.strftime("%Y%m%d-%H%M%S")))
     if shot_fast(fast_out):
         print(fast_out)
+        if hint:
+            print(hint, file=sys.stderr)  # the path stays alone on stdout
         return 0
     if out:
         if named:
