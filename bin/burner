@@ -5135,8 +5135,9 @@ def cmd_notifications(args):
         adb_or_ensure("shell", "input keyevent 224; cmd statusbar expand-notifications")
     u2_invalidate()  # a dump cached before the shade opened would show no rows
     lines = []
+    via_scrcpy, retried = False, False
     try:
-        for i in range(3):
+        for i in range(4):
             # afresh every time: the shade opens in milliseconds now, and a
             # read served from the helper's cache showed the screen before it
             rows = notification_rows(ui_dump(fresh=True))
@@ -5147,12 +5148,26 @@ def cmd_notifications(args):
                 continue
             fresh = [t for t, _y in rows if t not in lines]
             if not fresh:
+                if via_scrcpy and not retried:
+                    # the scrcpy helper's swipe may have been dropped (right
+                    # after `burner update` its swipes moved nothing, Oct 7):
+                    # once more over adb before the list is taken as read
+                    retried, via_scrcpy = True, False
+                    _scroll_swipe("down")
+                    continue
                 break
             lines += fresh
             # Only a list that reaches the bottom of the screen can go on.
             if max(y for _t, y in rows) < screen_dims()[1] * 0.85:
                 break
-            _scroll_swipe("down")
+            # the next page: the scrcpy helper's swipe (milliseconds) and a
+            # wait for the list to go quiet, where adb's swipe and a 0.6s
+            # pause took 1.6s a page (5.5s for twelve notifications, Oct 7)
+            via_scrcpy = _scrcpy_swipe("down")
+            if via_scrcpy:
+                settle_only(idle_ms=IDLE_SCROLL_MS, delay=0.15)
+            else:
+                _scroll_swipe("down")
     finally:
         if not _shade("collapse"):
             adb_or_ensure("shell", "cmd", "statusbar", "collapse")

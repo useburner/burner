@@ -4311,6 +4311,35 @@ class HelperStalenessTests(OfflineTestCase):
 
 
 class NotificationsTests(OfflineTestCase):
+    def test_the_shade_pages_over_the_scrcpy_helper(self):
+        # Oct 7: twelve notifications took 5.5s, two adb swipes and pauses
+        sc = self.allow("scrcpy_send", return_value=True)
+        self.allow("wake")
+        self.allow("u2_invalidate")
+        self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
+        self.allow("screen_dims", return_value=(1080, 2400))
+        adb_swipe = self.allow("_scroll_swipe")
+        settle = self.allow("settle_only")
+        pages = [[("Muse: done", 400), ("Amazon: shipped", 2300)],  # reaches the bottom
+                 [("Amazon: shipped", 600), ("Weawow: 71\u00b0", 900)]]
+        self.allow("notification_rows", side_effect=lambda root: pages.pop(0))
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_notifications(self.parse(["notifications"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertIn("3 notifications", out.getvalue())
+        self.assertEqual(sum(1 for c in sc.call_args_list if c[0][0].startswith("swipe")), 1)
+        adb_swipe.assert_not_called()
+        settle.assert_called_once()
+        # a scrcpy swipe that brought nothing new: once more over adb
+        sc.reset_mock()
+        pages[:] = [[("Muse: done", 400), ("Amazon: shipped", 2300)],
+                    [("Muse: done", 400), ("Amazon: shipped", 2300)],  # it didn't move
+                    [("Weawow: 71\u00b0", 900)]]
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_notifications(self.parse(["notifications"]))
+        self.assertIn("3 notifications", out.getvalue())
+        adb_swipe.assert_called_once_with("down")
+
     def test_the_shade_opens_and_closes_through_the_scrcpy_helper(self):
         sc = self.allow("scrcpy_send", return_value=True)
         adb = self.allow("adb_or_ensure")
