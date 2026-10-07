@@ -9929,6 +9929,7 @@ class CoordinateTapTests(OfflineTestCase):
         fake.LOAD_PROBE_S = 6.0
         fake.front_page = lambda dev, current=None, first_probe_s=None, **kw: (
             calls.append(("front_page", kw.get("quick"), kw.get("hint"))) or _FakePage())
+        fake.visible = lambda page, timeout=1.5: False  # a page in hand from before: a tab in the background
         dm = EmptyScreenTests._daemon(self, mod)
         mod.log = lambda *a: None
         # one read of the screen first: Chrome's window is in front (asking
@@ -9983,10 +9984,34 @@ class CoordinateTapTests(OfflineTestCase):
         mod.log = lambda *a: None
         old = _FakePage()
         old.visible_at = 1e9
+        # an open after the launch: its tab says it is visible on the first
+        # probe, Chrome is in front on it, and no read of the screen is
+        # needed (one took 1.6s, Oct 7); the link is loaded into it
+        probes, loaded = [], []
+        fake.visible = lambda page, timeout=1.5: probes.append((page.visible_at, timeout)) or True
+        fake.navigate = lambda page, url, idle_ms=1000: loaded.append((page, url)) or {"screen": WEB_SCREEN}
         dm._web = old
         launcher = SAMPLE_XML.replace("com.example", "com.google.android.apps.nexuslauncher")
-        dm.d = _FakeServer([launcher, CHROME_XML])
+        dm.d = _FakeServer([])
         dm._last_xml, dm._last_xml_t = launcher, mod._time.monotonic()
+        xml = dm.cmd_act(json.dumps({"open": "https://coinmarketcap.com", "launched": True})).decode()
+        self.assertIn('text="Box Score"', xml)
+        self.assertEqual((probes, given, dm.d.calls, loaded),
+                         ([(0.0, fake.QUICK_PROBE_S)], [], [], [(old, "https://coinmarketcap.com")]))
+        # after a launch by intent the link may not have started loading in
+        # it: no such shortcut there
+        old.visible_at = 1e9
+        probes.clear()
+        dm._web = old
+        dm.d = _FakeServer([CHROME_XML])
+        dm.cmd_dump("page https://coinmarketcap.com")
+        self.assertEqual((probes, given), ([], [old]))
+        given.clear()
+        # still in the background (the launcher in front): the screen read,
+        # and once Chrome is in front the page in hand is asked with the scan
+        fake.visible = lambda page, timeout=1.5: False
+        dm._web = old
+        dm.d = _FakeServer([launcher, CHROME_XML])
         self.assertIn('text="Box Score"', dm.cmd_dump("page https://coinmarketcap.com").decode())
         self.assertEqual(given, [old])  # asked once, with the page in hand
         self.assertEqual(old.visible_at, 0.0)  # and asked for real: no proof from before Chrome left
@@ -10016,6 +10041,7 @@ class CoordinateTapTests(OfflineTestCase):
         fake.LOAD_PROBE_S = 6.0
         fake.front_page = lambda dev, current=None, first_probe_s=None, **kw: (
             calls.append(("front_page", kw.get("quick"), kw.get("hint"))) or _FakePage())
+        fake.visible = lambda page, timeout=1.5: False  # a page in hand from before: a tab in the background
         dm = EmptyScreenTests._daemon(self, mod)
         mod.log = lambda *a: None
         link = "https://en.m.wikipedia.org/wiki/Main_Page"
@@ -10426,6 +10452,7 @@ class AirbnbRoundTests(OfflineTestCase):
         fake = WebPathTests._fake_cdp(self, mod, calls)
         hints = []
         fake.front_page = lambda dev, current=None, **kw: hints.append(kw.get("hint")) or _FakePage()
+        fake.visible = lambda page, timeout=1.5: False  # a page in hand from before: a tab in the background
         dm = EmptyScreenTests._daemon(self, mod)
         dm.d = _FakeServer([CHROME_XML] * 3)  # the launch check's reads
         mod.log = lambda *a: None
@@ -10450,6 +10477,7 @@ class AirbnbRoundTests(OfflineTestCase):
         self.assertEqual(hints[-1], "https://www.airbnb.com/rooms/1")
         self.assertEqual(dm._address_hint(SAMPLE_XML), "https://www.airbnb.com/rooms/1")
         # no bar, nothing opened lately: no hint (an older cdp module takes none)
+        fake.visible = lambda page, timeout=1.5: True  # Chrome in front on the page in hand again
         dm._opened_at = -1e9
         fake.front_page = lambda dev, current=None: _FakePage()
         dm._last_xml = CHROME_XML

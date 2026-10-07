@@ -1929,7 +1929,7 @@ class U2Daemon:
             return getattr(self, "_opened", "")
         return ""
 
-    def _page(self, assume_chrome=False, hint=None):
+    def _page(self, assume_chrome=False, hint=None, reuse=False):
         """The visible page in Chrome, when Chrome is the app in front on
         the newest read and the page can be reached (cdp.front_page);
         else None: a native screen, or Chrome out of reach, and the
@@ -1940,7 +1940,10 @@ class U2Daemon:
         few seconds, and only once its window is in front (one read of
         the screen first: asking the tabs of a Chrome still coming up
         kept it from coming up, 16-33s cold opens, Oct 5). hint: the
-        link's address, for the scan (see _address_hint)."""
+        link's address, for the scan (see _address_hint). reuse: the
+        caller loads the link into the page itself (an open), so the page
+        in hand, once visible, is the one (not after a launch by intent,
+        whose link may not have started loading in it yet)."""
         last = getattr(self, "_last_xml", "")
         cached = getattr(self, "_front_cache", None)
         if cached is not None and cached[0] is last:
@@ -1979,6 +1982,16 @@ class U2Daemon:
                 current.visible_at = 0.0
             for i in range(self.LAUNCH_CONTACT_TRIES):
                 try:
+                    if current is not None and reuse:
+                        # the page in hand, asked first: when it says it is
+                        # visible, Chrome is in front on it, and no read of
+                        # the screen is needed (one took 1.6s while Chrome
+                        # came up, Oct 7); a tab still in the background
+                        # answers only on the probe's bound
+                        with _t("web page (probe after a launch)"):
+                            if _cdp().visible(current, _cdp().QUICK_PROBE_S):
+                                self._web = current
+                                return current
                     # Chrome's window in front first (its address bar, when
                     # it is, is the hint): the tabs are asked only then
                     with _t("dump rpc (launch check)"):
@@ -2760,7 +2773,7 @@ class U2Daemon:
             # CLI launches the link (remembered: the tab it lands in is
             # the one to look for).
             link = str(spec["open"])
-            page = (self._page(assume_chrome=True, hint=link) if spec.get("launched")
+            page = (self._page(assume_chrome=True, hint=link, reuse=True) if spec.get("launched")
                     else self._page())
             if page is None:
                 self._opened, self._opened_at = link, _time.monotonic()
