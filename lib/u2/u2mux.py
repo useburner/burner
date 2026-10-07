@@ -1494,8 +1494,11 @@ def hid_itself(before, now, node, why=None):
     def worded(n):
         return n["pkg"] != SYSTEM_UI and bool((n["text"] or n["desc"]).strip())
 
+    def name(n):
+        return n["text"] or n["desc"] or n["cls"].split(".")[-1]
+
     def said(n):
-        return repr((n["text"] or n["desc"] or n["cls"].split(".")[-1])[:40])
+        return repr(name(n)[:40])
 
     at = next((i for i, n in enumerate(old) if key(n) == key(node)), None)
     if at is None:
@@ -1525,8 +1528,7 @@ def hid_itself(before, now, node, why=None):
         return no("its point is outside the box around it, %s" % said(old[box[0]]))
 
     def in_box(nodes, n, b):
-        x1, y1, x2, y2 = n["rect"]
-        return (bx1 <= x1 and by1 <= y1 and x2 <= bx2 and y2 <= by2) or b in chain(nodes, n["parent"])
+        return contains(old[box[0]]["rect"], n["rect"]) or b in chain(nodes, n["parent"])
 
     gone = [n for n in old if n["pkg"] != SYSTEM_UI and key(n) not in where and not in_box(old, n, box[0])]
     if gone:
@@ -1547,11 +1549,11 @@ def hid_itself(before, now, node, why=None):
     if takers:
         top = takers[-1]
         x1, y1, x2, y2 = top["rect"]
-        if not (not worded(top) and not top["field"] and in_box(new, top, box[1])
-                and (x2 - x1) * (y2 - y1) >= SURFACE_SHARE * (bx2 - bx1) * (by2 - by1)):
+        surface = (not worded(top) and not top["field"] and in_box(new, top, box[1])
+                   and (x2 - x1) * (y2 - y1) >= SURFACE_SHARE * (bx2 - bx1) * (by2 - by1))
+        if not surface:
             return no("%s is at its point now" % said(top))
-    b = new[box[1]]
-    return b["text"] or b["desc"] or b["cls"].split(".")[-1]
+    return name(new[box[1]])
 
 
 def marked_revealed(xml, box):
@@ -3226,8 +3228,9 @@ class U2Daemon:
             try:
                 node, alt = label_node(xml, label, loose=True)
             except RuntimeError as e:
-                why = []
-                box = hid_itself(before, xml, shown, why) if shown is not None and str(e) == "not on the last read" else None
+                why, box = [], None
+                if shown is not None and str(e) == "not on the last read":
+                    box = hid_itself(before, xml, shown, why)
                 if box is None:
                     if why:
                         log("%r went from the screen since the last read, not hidden by its app: %s" % (label, why[0]))
@@ -3303,17 +3306,7 @@ class U2Daemon:
                  ("dumpWindowHierarchy", [False, DUMP_DEPTH])]
         with self._lock:
             self.invalidate()
-            with _t("act batch (the text, before an Enter)"):
-                try:
-                    results = self._batch(calls, timeout=20)
-                except StreamUnavailable as e:
-                    raise ActNotSent("act not sent: the UI server couldn't be reached (%s)" % e)
-                except LinkDead as e:
-                    if not e.sent:
-                        raise ActNotSent("act not sent: the UI server couldn't be reached (%s)" % e)
-                    raise RuntimeError("act failed after sending: %s" % str(e)[:120])
-                except Exception as e:
-                    raise RuntimeError("act failed after sending: %s" % str(e)[:120])
+            results = self._send_act(calls, 20, "act batch (the text, before an Enter)")
         typed, mid = results[1], results[-1]
         if isinstance(typed, Exception):
             raise RuntimeError("act failed after sending: %s" % typed)
@@ -3542,6 +3535,24 @@ class U2Daemon:
         except RuntimeError as e:
             return None, str(e)
 
+    def _send_act(self, calls, timeout, label):
+        """An act's calls in one trip (see _batch), timed as `label`: their
+        results. ActNotSent when nothing went out, RuntimeError "act failed
+        after sending" for any other error (the action may have happened)."""
+        with _t(label):
+            try:
+                return self._batch(calls, timeout=timeout)
+            except StreamUnavailable as e:
+                # no stream to the server could be opened: nothing went
+                # out, and the caller acts its own way
+                raise ActNotSent("act not sent: the UI server couldn't be reached (%s)" % e)
+            except LinkDead as e:
+                if not e.sent:
+                    raise ActNotSent("act not sent: the UI server couldn't be reached (%s)" % e)
+                raise RuntimeError("act failed after sending: %s" % str(e)[:120])
+            except Exception as e:
+                raise RuntimeError("act failed after sending: %s" % str(e)[:120])
+
     def _act_batch(self, spec):
         """The act's calls (see act_calls) in one round trip, and what
         came back: the read after the action, cached, or "ok" for a
@@ -3555,19 +3566,7 @@ class U2Daemon:
         before = last if last and _time.monotonic() - last_t < BY_WORDS_S else None
         with self._lock:
             self.invalidate()
-            with _t("act batch" + (" (by words)" if "tap_selector" in spec else "")):
-                try:
-                    results = self._batch(calls, timeout=timeout)
-                except StreamUnavailable as e:
-                    # no stream to the server could be opened: nothing went
-                    # out, and the caller acts its own way
-                    raise ActNotSent("act not sent: the UI server couldn't be reached (%s)" % e)
-                except LinkDead as e:
-                    if not e.sent:
-                        raise ActNotSent("act not sent: the UI server couldn't be reached (%s)" % e)
-                    raise RuntimeError("act failed after sending: %s" % str(e)[:120])
-                except Exception as e:
-                    raise RuntimeError("act failed after sending: %s" % str(e)[:120])
+            results = self._send_act(calls, timeout, "act batch" + (" (by words)" if "tap_selector" in spec else ""))
             if touch is not None:
                 # the tap on the control decides what is said: it may have
                 # come back late, or after a touch that answered an error
@@ -3575,13 +3574,14 @@ class U2Daemon:
                 # and the assistant's tap again played the video)
                 clicked, words, box = results[acted[0]], spec.get("words"), spec["reveal_on"]
                 waited = next(i for i in range(touch, len(calls)) if calls[i][0] == "waitForExists")
+                touch_failed = isinstance(results[touch], Exception)
                 if clicked is not True:
                     after = results[-1]
                     if isinstance(after, str) and has_words(after):
                         self._remember(after)
                     if isinstance(clicked, Exception) and ("UiObjectNotFound" in str(clicked)
                                                            or "-32002" in str(clicked)):
-                        if isinstance(results[touch], Exception):
+                        if touch_failed:
                             raise RuntimeError("act failed after sending: %r had hidden itself; the touch to "
                                                "bring it back failed (%s), and it wasn't tapped"
                                                % (words, err_text(results[touch], 80)))
@@ -3592,10 +3592,11 @@ class U2Daemon:
                                            "phone's tap on it didn't go in" % (words, box))
                     raise RuntimeError("act failed after sending: %r came back after a touch on %r and may have "
                                        "been tapped (%s); it isn't tapped again" % (words, box, err_text(clicked, 80)))
-                if isinstance(results[touch], Exception) or results[waited] is not True:
-                    log("%r tapped after a touch on %r, though %s" % (
-                        words, box, "that touch answered an error (%s)" % err_text(results[touch], 60)
-                        if isinstance(results[touch], Exception) else "it came back late"))
+                if touch_failed:
+                    log("%r tapped after a touch on %r, though that touch answered an error (%s)"
+                        % (words, box, err_text(results[touch], 60)))
+                elif results[waited] is not True:
+                    log("%r tapped after a touch on %r, though it came back late" % (words, box))
             if acted and isinstance(results[acted[0]], Exception):
                 err = results[acted[0]]
                 if "tap_selector" in spec and ("UiObjectNotFound" in str(err) or "-32002" in str(err)):
@@ -3603,8 +3604,8 @@ class U2Daemon:
                     # after it is the screen as it is (a read of its own
                     # cost a trip more, YouTube, Oct 7)
                     after = results[-1]
-                    raise _NotThere(err_text(err, 80), after if isinstance(after, str) and has_words(after)
-                                    and not chrome_in(after) else None)
+                    read = after if isinstance(after, str) and has_words(after) and not chrome_in(after) else None
+                    raise _NotThere(err_text(err, 80), read)
                 # any other error (a NullPointerException on a web node, Oct
                 # 4) may have come after the touch went in: no second tap
                 raise RuntimeError("act failed after sending: %s" % err)

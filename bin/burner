@@ -2133,8 +2133,8 @@ def act_and_read(action, prev_root=None, idle_ms=IDLE_ACT_MS, rereads=2):
     if marked.get("revealed"):
         # the control had hidden itself since the read the assistant had
         # (a video's controls): a touch where it was brought it back first
-        note = (note + " " if note else "") + '(it had hidden itself, as a video\'s controls do; a touch on "{}" ' \
-            'brought it back first)'.format(marked.get("revealed"))
+        note = (note + " " if note else "") + ('(it had hidden itself, as a video\'s controls do; a touch on "{}" '
+                                               'brought it back first)').format(marked.get("revealed"))
     if marked.get("unjudged"):
         # the page saw nothing of the touch: a frame over the target took it
         # (an ad that slid in, review of Oct 7)
@@ -2603,8 +2603,10 @@ def held_words(node):
 
 def _tap_ambiguous(args, used, hits, fuzzy_used):
     """Refuse an ambiguous tap: list up to 5 candidates, exit 1."""
-    lines = ["  [{}] {}{}".format(i, format_compact(h), " holding " + held_words(h) if held_words(h) else "")
-             for i, h in enumerate(hits[:5])]
+    lines = []
+    for i, h in enumerate(hits[:5]):
+        held = held_words(h)
+        lines.append("  [{}] {}{}".format(i, format_compact(h), " holding " + held if held else ""))
     if len(hits) > 5:
         lines.append("  ... and {} more".format(len(hits) - 5))
     msg = ('ambiguous tap: "{}" matched {} candidates{}:\n{}\n'
@@ -2952,10 +2954,12 @@ def cmd_tap(args):
             # point is something else now (a player's controls hide, and the
             # touch there brought them back instead, the review of Oct 7)
             words = re.sub(r"^\[(.*)\]$", r"\1", snap.get("label") or "")
-            return _tap_fail(args, "{}'s row{} is no longer on the screen (it moved, or hid itself); {}".format(
-                args.text.strip(), ' "{}"'.format(words) if words else "",
-                "tap it by its words (`burner tap {}`), which brings back controls that hide themselves, "
-                "or `burner snap` again".format(_shell_words(words)) if words else "`burner snap` again"))
+            gone = "{}'s row{} is no longer on the screen (it moved, or hid itself); ".format(
+                args.text.strip(), ' "{}"'.format(words) if words else "")
+            if not words:
+                return _tap_fail(args, gone + "`burner snap` again")
+            return _tap_fail(args, gone + "tap it by its words (`burner tap {}`), which brings back controls that "
+                                          "hide themselves, or `burner snap` again".format(_shell_words(words)))
         plan = plan_tap(nodes, w, h, xy=(x, y), check=not args.no_occlusion_check, target=target)
         if plan["action"] == "refused":
             return _tap_refused(args, x, y, plan["cover"])
@@ -3591,8 +3595,10 @@ def cmd_type(args):
     # last text field). Elsewhere: focus the field first, then type.
     page_fields = ""
     if args.field and not args.slow and not quiet:
-        status, root, note = act_and_read(dict({"set_text": args.text, "field": args.field},
-                                               **({"enter": True} if enter else {})))
+        spec = {"set_text": args.text, "field": args.field}
+        if enter:
+            spec["enter"] = True
+        status, root, note = act_and_read(spec)
         if status == "unsent" and "; its fields: " in _u2_status:
             # the page's own fields, said if nothing else has the label
             page_fields = _u2_status.split("; its fields: ", 1)[1]
@@ -3629,7 +3635,10 @@ def cmd_type(args):
     if not args.slow and not quiet:
         # One round trip: the text into the focused field, the wait, the read
         # (and the Enter, with --enter and a field with the focus).
-        status, root, note = act_and_read(dict({"set_text": args.text}, **({"enter": True} if enter else {})))
+        spec = {"set_text": args.text}
+        if enter:
+            spec["enter"] = True
+        status, root, note = act_and_read(spec)
         if status == "ok":
             print("typed {} chars".format(len(args.text)))
             return typed(status, root, note)
