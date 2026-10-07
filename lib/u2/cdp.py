@@ -1100,7 +1100,9 @@ def page_xml(screen, top, screen_h=0, pkg="com.android.chrome"):
         parts.append(_node(2, "", "", "android.widget.FrameLayout",
                            "[0,%d][%d,%d]" % (top + H, W, int(screen_h)),
                            "com.android.systemui"))
-    return ('<?xml version="1.0" encoding="UTF-8"?>\n<hierarchy rotation="0">\n'
+    # page="1": a page's read, not the screen reader's (it holds neither
+    # the keyboard nor Chrome's own views, such as its address bar's focus)
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n<hierarchy rotation="0" page="1">\n'
             + "\n".join(parts) + "\n</hierarchy>")
 
 

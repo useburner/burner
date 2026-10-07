@@ -1415,7 +1415,14 @@ class AmbiguousTapTests(OfflineTestCase):
         rc, out, err, tc = self._tap(["tap", "Search"], xml=voice)
         self.assertEqual(rc, 1)
         self.assertIn('no row reads "Search"; rows with those words: "Search with your voice". '
-                      'Tap one by its full words', err)
+                      'If one of these is the row you mean, tap it by its full words', err)
+        # `scroll --to` finds rows as the tap does: not the voice button
+        # (it answered "found" at once there, review of Oct 7)
+        nodes = pc.walk(ET.fromstring(voice))
+        self.assertEqual(pc.rows_named(nodes, "Search"), [])
+        self.assertEqual([n["desc"] for n in pc.rows_named(nodes, "Nope || Search with your voice")],
+                         ["Search with your voice"])
+        self.assertEqual([n["text"] for n in pc.rows_named(nodes, "lofi hip hop radio")], ["lofi hip hop radio"])
         tc.assert_not_called()
         # --fuzzy asks for the loose match: taken
         rc, out, err, tc = self._tap(["tap", "--fuzzy", "Search"], xml=voice)
@@ -3669,13 +3676,15 @@ class OneRoundTripTests(OfflineTestCase):
             calls.append((cmd, arg))
             return screen[0]
         self.allow("u2sock", side_effect=u2)
-        for key in ("enter", "ENTER", "KEYCODE_ENTER", "66", "DPAD_CENTER", "NUMPAD_ENTER"):
+        for key in ("enter", "ENTER", "KEYCODE_ENTER", "66", "DPAD_CENTER", "NUMPAD_ENTER", "SPACE"):
             calls.clear()
             with self.cap() as (out, err):
                 rc = pc.cmd_press(self.parse(["press", key]))
             self.assertEqual(rc, 1, key)
-            self.assertIn("no text field has the focus and the keyboard is closed", err.getvalue())
+            self.assertIn("the screen's newest read shows no text field with the focus and no keyboard",
+                          err.getvalue())
             self.assertIn("nothing was pressed", err.getvalue())
+            self.assertIn("`--force` sends the key anyway", err.getvalue())
             self.assertEqual([c for c, _ in calls], ["dump"], key)  # the helper's newest read; no key sent
         sc.assert_not_called()
         adb.assert_not_called()
@@ -3692,6 +3701,40 @@ class OneRoundTripTests(OfflineTestCase):
         with self.cap() as (out, err):
             rc = pc.cmd_press(self.parse(["press", "BACK"]))
         self.assertEqual((rc, [c for c, _ in calls]), (0, ["act"]))
+        # --force sends it whatever the read shows
+        calls.clear()
+        with self.cap() as (out, err):
+            rc = pc.cmd_press(self.parse(["press", "enter", "--force"]))
+        self.assertEqual((rc, [c for c, _ in calls]), (0, ["act"]))
+        # a page's read in Chrome (no keyboard, the address bar never
+        # focused there): the screen reader's read decides (review, Oct 7)
+        page = '<hierarchy rotation="0" page="1">' + TAP_XML.split(">", 1)[1]
+        native = [kbd]
+
+        def u2_page(cmd, arg="", timeout=30):
+            calls.append((cmd, arg))
+            return native[0] if (cmd, arg) == ("dump", "native") else (page if cmd == "dump" else SAMPLE_XML)
+        self.allow("u2sock", side_effect=u2_page)
+        calls.clear()
+        with self.cap() as (out, err):
+            rc = pc.cmd_press(self.parse(["press", "enter"]))
+        self.assertEqual((rc, [(c, a) for c, a in calls][:2]), (0, [("dump", "cached"), ("dump", "native")]))
+        native[0] = TAP_XML  # the screen reader sees no field and no keyboard either: refused
+        calls.clear()
+        with self.cap() as (out, err):
+            rc = pc.cmd_press(self.parse(["press", "enter"]))
+        self.assertEqual((rc, [c for c, _ in calls]), (1, ["dump", "dump"]))
+        native[0] = page  # an older helper answers with the page again: can't tell, the key goes
+        with self.cap() as (out, err):
+            self.assertEqual(pc.cmd_press(self.parse(["press", "enter"])), 0)
+        # the screen can't be read: the key goes, and a line says why
+        self.allow("_cached_root", return_value=None)
+        self.allow("ui_dump", side_effect=RuntimeError("the phone is unreachable"))
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30: SAMPLE_XML)
+        with self.cap() as (out, err):
+            self.assertEqual(pc.cmd_press(self.parse(["press", "enter"])), 0)
+        self.assertIn("couldn't be read to look for a text field (the phone is unreachable); the key goes",
+                      err.getvalue())
 
     def test_press_with_modifiers_keeps_the_old_path(self):
         self.allow("u2_invalidate")
@@ -5307,6 +5350,34 @@ class WebPathTests(OfflineTestCase):
             self.assertEqual(str(cm.exception), dm.NO_FIELD_TAP)
             self.assertEqual(sent, [])
 
+    def test_a_tap_s_box_is_forgotten_after_another_action(self):
+        # the review of Oct 7: the control tapped by words was taken for
+        # the opener of the one focused field for 30s, whatever came next
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        dm = EmptyScreenTests._daemon(self, mod)
+        box = SAMPLE_XML.replace('content-desc="Search"', 'content-desc="Search apps &amp; games"')
+        dm._last_tap = ("Search or ask Play", mod._time.monotonic())
+        dm.cmd_invalidate("")  # the CLI acted its own way (scrcpy, adb)
+        self.assertIsNone(dm._last_tap)
+        dm._last_tap = ("Search or ask Play", mod._time.monotonic())
+        dm._batch = lambda calls, timeout=45.0: [None] * (len(calls) - 1) + [box]
+        dm._last_xml, dm._last_xml_t = box, mod._time.monotonic()
+        dm.d = _FakeServer([box], screen_on=True)
+        dm.cmd_act(json.dumps({"key": 4, "idle": 1200}))  # BACK
+        self.assertIsNone(dm._last_tap)
+        # a type naming that control is then the CLI's way, not the lone field
+        dm.d = _FakeServer([box])
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"set_text": "duolingo", "field": "Search or ask Play", "idle": 1200}))
+        self.assertEqual(str(cm.exception), dm.NO_FIELD_TAP)
+        # a page's open or scroll ends it too
+        dm._last_tap = ("Search or ask Play", mod._time.monotonic())
+        dm._page = lambda **kw: None
+        with self.assertRaises(RuntimeError):
+            dm.cmd_act(json.dumps({"open": "https://example.com"}))
+        self.assertIsNone(dm._last_tap)
+
     def test_a_field_named_by_its_own_hint_takes_the_text(self):
         # Play Store, Oct 6: the search box is an empty field under the
         # words "Search apps & games", a TextView of their own; a type by
@@ -5817,16 +5888,16 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(calls[-1], ("open", "https://www.espn.com/nfl/", 1000))
         self.assertIn('text="Box Score"', xml)
         woke = []
-        dm.d.jsonrpc.wakeUp = lambda: woke.append(1)
+        dm.d.jsonrpc_call = lambda method, params, timeout=10: woke.append((method, timeout))
         dm._last_xml = SAMPLE_XML  # not Chrome: launched by the CLI instead
         with self.assertRaises(RuntimeError) as cm:
             dm.cmd_act(json.dumps({"open": "https://example.com"}))
         self.assertEqual(str(cm.exception), "act not sent: not a page")
         # the screen woken for the launch that follows (Chrome came up
         # behind an off screen: an 11s open, Oct 7)
-        self.assertEqual(woke, [1])
+        self.assertEqual(woke, [("wakeUp", mod.WAKE_RPC_S)])  # bounded: it holds the lock
         # a wake that fails says so in the log, and the answer stands
-        dm.d.jsonrpc.wakeUp = mock.Mock(side_effect=OSError("link down"))
+        dm.d.jsonrpc_call = mock.Mock(side_effect=OSError("link down"))
         with self.assertRaises(RuntimeError) as cm:
             dm.cmd_act(json.dumps({"open": "https://example.com"}))
         self.assertEqual(str(cm.exception), "act not sent: not a page")

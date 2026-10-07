@@ -1108,6 +1108,25 @@ def fuzzy_ok(query, label):
     return rest[:1] != "" and rest[0] in NOTE_MARKS
 
 
+def rows_named(nodes, text):
+    """The rows a tap's words name (see plan_tap): an exact match of the
+    first "a || b" alternative that has one, else the rows the words
+    name loosely (see fuzzy_ok). `scroll --to` stops on them: it stopped
+    on any row holding the words, the one a tap had just refused ("Voice
+    search" for `Search`, review of Oct 7). Pure."""
+    sels = [s.strip() for s in (text or "").split("||") if s.strip()]
+    for sel in sels:
+        hits = find_nodes(nodes, sel, exact=True)
+        if hits:
+            return hits
+    for sel in sels:
+        hits = [n for n in find_nodes(nodes, sel, exact=False)
+                if fuzzy_ok(sel, n["text"] or n["desc"] or "")]
+        if hits:
+            return hits
+    return []
+
+
 def find_nodes(nodes, text, exact=True):
     def label(n):
         return plain_words(n["text"] or n["desc"] or "")
@@ -2709,8 +2728,9 @@ def cmd_tap(args):
         # Oct 6); rows with the words in a longer label are named, since
         # one of them may be meant (see fuzzy_ok)
         if plan.get("near"):
-            return _tap_fail(args, 'no row reads "{0}"; rows with those words: {1}. Tap one by its '
-                                   'full words, or `burner scroll down --to "{0}"` looks further down'.format(
+            return _tap_fail(args, 'no row reads "{0}"; rows with those words: {1}. If one of these is '
+                                   'the row you mean, tap it by its full words; `burner scroll down --to "{0}"` '
+                                   'looks further down'.format(
                                        args.text, ", ".join('"{}"'.format(w[:60]) for w in plan["near"])))
         return _tap_fail(args, 'no match for "{0}" on the screen; `burner scroll down --to "{0}"` '
                                'looks further down'.format(args.text))
@@ -3411,9 +3431,10 @@ def type_keys(text, slow=False):
                           "".join(esc_char(c) for c in part))
 
 
-# Keys that press the control with the focus when no text field has it:
-# Enter, the numpad's Enter, the D-pad's centre.
-ENTER_KEYS = {66: "ENTER", 160: "NUMPAD_ENTER", 23: "DPAD_CENTER"}
+# Keys that press the control with the focus when no text field has it
+# (Android's confirm keys): Enter, the numpad's Enter, the D-pad's centre
+# and Space.
+ENTER_KEYS = {66: "ENTER", 160: "NUMPAD_ENTER", 23: "DPAD_CENTER", 62: "SPACE"}
 
 
 def enter_target(nodes):
@@ -3428,16 +3449,42 @@ def enter_target(nodes):
     return False
 
 
+def _native_root():
+    """The screen reader's read now, never a page's (see the helper's
+    `dump native`), parsed; None when there is none (an older helper
+    answers with the page's read)."""
+    try:
+        xml = u2sock("dump", "native", timeout=20)
+        if not xml or "<node" not in xml:
+            return None
+        root = ET.fromstring(xml)
+    except Exception:
+        return None
+    return None if root.get("page") else root
+
+
 def _enter_has_a_field():
-    """enter_target on the helper's newest read, else on a read now; True
-    when the screen can't be read (the key goes as it always did)."""
-    root = _cached_root()
-    if root is None:
-        try:
+    """enter_target on the helper's newest read, else on a read now. A
+    page's read in Chrome holds neither the keyboard nor Chrome's own
+    address bar: when it shows no focused field, the screen reader's read
+    decides (Enter after typing into the address bar was refused, review
+    of Oct 7), and with none to be had the key goes. When the screen
+    can't be read at all the key goes too, and a line says the check
+    couldn't be made."""
+    try:
+        root = _cached_root()
+        if root is None:
             root = ui_dump()
-        except Exception:
+        if enter_target(walk(root)):
             return True
-    return enter_target(walk(root))
+        if root.get("page"):
+            native = _native_root()
+            return native is None or enter_target(walk(native))
+        return False
+    except Exception as e:
+        print("burner: the screen couldn't be read to look for a text field ({}); the key goes"
+              .format(" ".join(str(e).split())[:80]), file=sys.stderr)
+        return True
 
 
 def cmd_press(args):
@@ -3458,14 +3505,15 @@ def cmd_press(args):
     code = key_code(args.key)
     name = (args.key or "").strip().upper()
     if (code in ENTER_KEYS or name.replace("KEYCODE_", "") in ENTER_KEYS.values()) \
-            and not _enter_has_a_field():
+            and not getattr(args, "force", False) and not _enter_has_a_field():
         # On a phone, Enter is a key of the keyboard, up only while a text
         # field has the focus; with none, the key presses whatever control
         # has the focus (YouTube's account list: "Add account", and Google's
         # sign-in opened, Oct 7)
-        print("burner: press {}: no text field has the focus and the keyboard is closed, so the key "
-              "would press whatever control has the focus; nothing was pressed. Tap the button you "
-              "mean, or type into the field first.".format(args.key), file=sys.stderr)
+        print("burner: press {}: the screen's newest read shows no text field with the focus and no "
+              "keyboard, so the key would press whatever control has the focus; nothing was pressed. "
+              "Tap the button you mean, or type into the field first (`--force` sends the key anyway)."
+              .format(args.key), file=sys.stderr)
         return 1
     if not mods and repeat == 1 and code is not None and not quiet:
         # One round trip: the key, the wait for the screen, the read.
@@ -4823,7 +4871,7 @@ def cmd_scroll(args):
     root = ui_dump()  # also refreshes the screen size
     pkg = dump_package(root)
     for i in range(times + 1):
-        if find_nodes(walk(root), args.to, exact=False):
+        if rows_named(walk(root), args.to):
             print("found: {}".format(args.to))
             if not quiet:
                 print_screen(root)
@@ -5323,6 +5371,8 @@ def build_parser():
     p.add_argument("--shift", action="store_true", help="hold Shift (KEYCODE_SHIFT_LEFT)")
     p.add_argument("--alt", action="store_true", help="hold Alt (KEYCODE_ALT_LEFT)")
     p.add_argument("--meta", action="store_true", help="hold Meta/Win (KEYCODE_META_LEFT)")
+    p.add_argument("--force", action="store_true",
+                   help="send Enter or Space even with no text field focused")
     p.add_argument("--quiet", "-q", action="store_true",
                    help="don't print the screen afterwards")
     p.set_defaults(fn=cmd_press)

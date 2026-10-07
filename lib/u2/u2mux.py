@@ -1432,6 +1432,7 @@ def focused_field_selector(rid=""):
 
 
 TAP_OPENED_S = 30.0  # a control tapped this recently may have opened the box a `type --field` names
+WAKE_RPC_S = 3.0     # the wake before a launch: a no-op, or 500ms on the phone
 
 
 def lone_focused_field(xml, label):
@@ -1905,7 +1906,7 @@ class U2Daemon:
         an off screen then."""
         try:
             with self._lock:
-                self.d.jsonrpc.wakeUp()
+                self.d.jsonrpc_call("wakeUp", [], timeout=WAKE_RPC_S)
         except Exception as e:
             log("the wake before a launch failed (%s)" % err_text(e, 80))
 
@@ -1983,6 +1984,16 @@ class U2Daemon:
         if arg.strip() == "cached":
             young = _time.monotonic() - self._last_xml_t < self.CACHED_READ_S
             return self._last_xml.encode() if young and has_words(self._last_xml) else b""
+        if arg.strip() == "native":
+            # the screen reader's read now, never the page's: a keyboard's
+            # window and Chrome's own address bar are only there (the CLI's
+            # check before Enter, review of Oct 7); an off screen is woken
+            with self._lock:
+                with _t("dump rpc (native)"):
+                    xml = read_screen(self.d)
+                if blank_screen(xml):
+                    xml, _woke = self._fix_blank_read(xml, "blank native read")
+            return (xml or "").encode()
         if arg.strip() == "page" or arg.startswith("page "):
             # Chrome was just launched with a link ("page <link>": that
             # link, the hint for finding its tab): the page, asked at once
@@ -2000,6 +2011,9 @@ class U2Daemon:
                            for t in tabs]).encode()
 
     def cmd_invalidate(self, _):
+        # the CLI acted its own way (scrcpy, adb): a control tapped by
+        # words before it no longer opened what is on the screen
+        self._last_tap = None
         self.invalidate()
         return b""
 
@@ -2136,6 +2150,13 @@ class U2Daemon:
                     n = dict(n, waited_ms=waited, polls=polls)
                     return json.dumps(n).encode()
                 if _time.monotonic() + POLL_S > deadline:
+                    # the page as the last poll saw it is the newest read
+                    # (a failed wait's evidence showed the page from before
+                    # the wait, review of Oct 7)
+                    xml = self._page_xml(screen) if screen else None
+                    if xml is not None:
+                        with self._lock:
+                            self._remember(xml)
                     raise U2NotFound("timeout waiting for %r" % text)
                 _time.sleep(POLL_S)
         while True:
@@ -2293,6 +2314,8 @@ class U2Daemon:
         returned and cached. Never replayed after an error: the action may
         have happened. "act failed after sending: ..." means just that."""
         spec = json.loads(arg) if arg.strip() else {}
+        if "open" in spec or "scroll" in spec:
+            self._last_tap = None  # another action: see _type_into_field
         if "open" in spec:
             # A link opened in the page in Chrome (cdp.navigate): its
             # current tab loads it. No tab for every link, no first
@@ -2352,6 +2375,7 @@ class U2Daemon:
             # scrolled into view and touched by the page itself (cdp.tap),
             # which has the current layout.
             label = spec["tap_label"]
+            self._last_tap = None  # a page's field is filled by its label (cdp.fill)
             with self._lock:
                 self.invalidate()
                 try:
@@ -2605,7 +2629,7 @@ class U2Daemon:
             spec["tap_first"] = list(now["center"])
             spec["field_selector"] = focused_field_selector(now.get("rid", ""))
             return self._act_batch(spec)
-        tapped, tapped_at = getattr(self, "_last_tap", ("", -1e9))
+        tapped, tapped_at = getattr(self, "_last_tap", None) or ("", -1e9)
         opened = (plain_words(tapped).lower() == plain_words(label).lower()
                   and _time.monotonic() - tapped_at < TAP_OPENED_S)
         lone = lone_focused_field(xml, label) if now is None and opened else None
@@ -2615,8 +2639,8 @@ class U2Daemon:
             # apps & games", Oct 6), and the one box on the screen, focused,
             # takes the text. Never without that tap: a password named by
             # a field that isn't on the screen must not go into a search box
-            log("no row reads %r; typing into the one field, which has the focus (%r)"
-                % (label, (lone["text"] or lone["desc"])[:40]))
+            log("no row reads %r; typing into the one field, which has the focus (%s)"
+                % (label, lone.get("rid") or lone["cls"]))  # its id: its text is what was typed
             return self._type_at_once(spec, lone)
         raise RuntimeError(self.NO_FIELD_TAP)
 
@@ -2712,6 +2736,12 @@ class U2Daemon:
                 # a control tapped by its words: a `type --field` with them
                 # next types into the box it opened (see _type_into_field)
                 self._last_tap = (spec["tapped_label"], _time.monotonic())
+            elif acted:
+                # any other action: what the tapped control opened may be
+                # gone (BACK, a tap elsewhere), review of Oct 7
+                self._last_tap = None
+            if not acted and calls and calls[0][0] == "wakeUp" and isinstance(results[0], Exception):
+                log("the wake before the read failed (%s)" % err_text(results[0], 80))
             if spec.get("quiet"):
                 # a chained step: the action landed and the UI went quiet;
                 # no screen goes back, and the read taken is the newest one
