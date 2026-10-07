@@ -830,6 +830,16 @@ FIND_JS = r"""
   const seen = controls.filter(el => inView(box(el)));
   if (seen.length) controls = seen;
   const pick = (index === null || index === undefined) ? null : index;
+  if (controls.length > 1 && pick === null) {
+    // the same words on links to one address (a story listed twice, its
+    // card and its line further down: bbc.com, Oct 7) go to one place:
+    // the first is touched. A link within the page or to a script stays
+    // ambiguous (two "Edit" links may each do their own thing)
+    const dest = el => { const a = el.closest('a[href]'); const h = a && a.getAttribute('href');
+      return h && h[0] !== '#' && /^https?:$/.test(a.protocol) ? a.href : null; };
+    const d0 = dest(controls[0]);
+    if (d0 && controls.every(el => dest(el) === d0)) controls = [controls[0]];
+  }
   if (controls.length > 1 && (pick === null || pick >= controls.length)) {
     return {found: true, count: controls.length, used: used, labels: controls.slice(0, 6).map(el => (names(el)[0] || '').slice(0, 60)),
             tags: controls.slice(0, 6).map(el => el.tagName.toLowerCase() + (el.id ? '#' + el.id : ''))};

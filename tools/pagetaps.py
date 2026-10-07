@@ -73,6 +73,7 @@ HEAD = ("<html><head><meta name='viewport' content='width=device-width'><style>b
         "window.__clicks.push(a?a.textContent:e.target.tagName)});</script>")
 STORIES = "".join("<a href='#r%d'>Story %d</a>" % (i, i) for i in range(150))
 TAIL = "".join("<a href='#z%d'>Tail %d</a>" % (i, i) for i in range(40)) + "</body></html>"
+MIDDLE = "".join("<a href='#m%d'>Middle %d</a>" % (i, i) for i in range(30))
 PAGES = {
     "/lazy": HEAD + STORIES + "<a href='#a'>Story A</a><img loading=lazy src='/img.png?d=100' alt=''>"
              "<a href='#b'>Story B</a><a href='#c'>Story C</a><a id=t href='#more'>More</a>" + TAIL,
@@ -98,15 +99,20 @@ PAGES = {
                "<div style='position:fixed;left:0;right:0;bottom:0;height:900px;background:#eee'>Cookies? "
                "<button>OK</button></div>",
     "/away": HEAD + STORIES + "<a href='/plain?from=away'>More</a>" + TAIL,
+    "/twice": HEAD + STORIES + "<a href='/plain?from=twice'><h2>Bishop jailed</h2></a>" + MIDDLE +
+              "<a href='/plain?from=twice'><h2>Bishop jailed</h2></a>" + TAIL,
+    "/twodests": HEAD + STORIES + "<a href='/plain?from=a'>Edit</a>" + MIDDLE +
+                 "<a href='/plain?from=b'>Edit</a>" + TAIL,
 }
-# (page, the words tapped, what the page must see: the link's text, or
-# the address it goes to; a target that never stops moving may be left
-# untapped, never tapped wrong)
+# (page, the words tapped, what the page must see: the link's text, the
+# address it goes to, or "ambiguous": nothing touched, the rows counted;
+# a target that never stops moving may be left untapped, never tapped wrong)
 CASES = [("plain", "More", "More"), ("lazy", "More", "More"), ("slot", "More", "More"),
          ("carousel", "More", "More"), ("overlay", "Cabin in the woods", ""), ("nested", "More stories", "More stories"),
          ("slotted", "Read more", "Read more"), ("wrapped", "a long link that wraps across lines",
                                                   "a long link that wraps across lines"),
-         ("banner", "More", "More"), ("away", "More", "/plain?from=away")]
+         ("banner", "More", "More"), ("away", "More", "/plain?from=away"),
+         ("twice", "Bishop jailed", "/plain?from=twice"), ("twodests", "Edit", "ambiguous")]
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -204,22 +210,28 @@ def main():
                 page.wait_parsed(5)
                 time.sleep(0.3)
                 delayed(page, trip)
-                t0, held, err = time.monotonic(), 0, ""
+                t0, r, err = time.monotonic(), {}, ""
                 try:
-                    held = cdp.tap(page, label).get("held", 0)
+                    r = cdp.tap(page, label)
                 except cdp.Held as e:
                     err = str(e)
+                held = r.get("held", 0)
                 took = time.monotonic() - t0
                 page.call_many = lambda cmds, timeout=10.0, raise_errors=True: cdp.Page.call_many(
                     page, cmds, timeout, raise_errors)
                 time.sleep(0.3)
                 seen = page.eval("[location.pathname + location.search].concat(window.__clicks || [])")
                 address, clicks = seen[0], seen[1:]
-                right = (address == want and not clicks) if want.startswith("/") else (
-                    clicks == [want] or (not clicks and err))
+                if want == "ambiguous":
+                    right = r.get("count", 1) > 1 and not clicks and address.startswith("/" + case)
+                elif want.startswith("/"):
+                    right = address == want and not clicks
+                else:
+                    right = clicks == [want] or bool(not clicks and err)
                 wrong += not right
                 print("%-9s %4dms trip: %-6s %.2fs, %s%s%s" % (
                     case, trip, "ok" if right else "WRONG", took,
+                    "%d rows, nothing touched" % r.get("count", 1) if want == "ambiguous" and right else
                     address if want.startswith("/") else "clicked %s" % json.dumps(clicks),
                     ", %d held" % held if held else "", "; " + err if err else ""))
     finally:
