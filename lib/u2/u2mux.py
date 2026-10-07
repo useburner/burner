@@ -1439,6 +1439,8 @@ def loose_label_node(nodes, alts):
     return None
 
 
+NEW_WORDS_MAX = 4  # rows with words new in that box: captions change as a video plays,
+                   # and a page the app switched to inside a big box has more (review, Oct 7)
 BOX_AREA_MAX = 0.6  # a box around a hidden control with no words of its own is
                     # smaller than this share of the screen (a page's whole body is no box)
 SURFACE_SHARE = 0.5  # a wordless clickable view in that box this big is its touch surface
@@ -1457,11 +1459,13 @@ def hid_itself(before, now, node, why=None):
     - every row gone from `before`, and every row new on `now`, is in that
       box: inside it, or within its rectangle (the captions over a video
       change as it plays, beside the player's own rows);
-    - nothing that takes a tap is at the control's point on `now` but the
-      box, what holds it, or its touch surface (wordless, in the box, and
+    - what would take a touch at the control's point on `now`, if
+      anything, is the box's touch surface (wordless, in the box, and
       SURFACE_SHARE of it at least: YouTube's player has one, the live
-      check); a button that took the control's place ("Play video") would
-      take the touch.
+      check); a button that took the control's place ("Play video"), or a
+      clickable row with words around it, would take the touch;
+    - NEW_WORDS_MAX rows with words at most came in the box (a page the
+      app switched to there brings more).
     Then a touch where the control was brings it back. Returns the box's
     words (its class when it has none), or None, with the reason added to
     the list `why` when one is given (the helper logs it). Pure."""
@@ -1530,15 +1534,22 @@ def hid_itself(before, now, node, why=None):
     came = [n for n in new if n["pkg"] != SYSTEM_UI and key(n) not in was and not in_box(new, n, box[1])]
     if came:
         return no("%s came outside %s" % (said(came[0]), said(new[box[1]])))
-    holds = set(chain(new, box[1]))
-    for i, n in enumerate(new):
-        x1, y1, x2, y2 = n["rect"]
-        if not (x1 <= cx <= x2 and y1 <= cy <= y2 and (n["clickable"] or n["field"])) or i in holds:
-            continue
-        if (not worded(n) and not n["field"] and in_box(new, n, box[1])
+    fresh = [n for n in new if worded(n) and key(n) not in was]
+    if len(fresh) > NEW_WORDS_MAX:
+        return no("%d rows with words came in %s (a new screen there)" % (len(fresh), said(new[box[1]])))
+    # what takes a touch at the point now: the last drawn of what takes taps
+    # there. It must be the box's own touch surface; a clickable row with
+    # words around the control (a calendar entry whose Join went) would be
+    # opened by the touch (the review of Oct 7). YouTube's player isn't
+    # clickable; its wordless surface over all of it is (the live dump)
+    takers = [n for n in new if (n["clickable"] or n["field"])
+              and n["rect"][0] <= cx <= n["rect"][2] and n["rect"][1] <= cy <= n["rect"][3]]
+    if takers:
+        top = takers[-1]
+        x1, y1, x2, y2 = top["rect"]
+        if not (not worded(top) and not top["field"] and in_box(new, top, box[1])
                 and (x2 - x1) * (y2 - y1) >= SURFACE_SHARE * (bx2 - bx1) * (by2 - by1)):
-            continue  # the box's touch surface
-        return no("%s is at its point now" % said(n))
+            return no("%s is at its point now" % said(top))
     b = new[box[1]]
     return b["text"] or b["desc"] or b["cls"].split(".")[-1]
 
@@ -1570,6 +1581,8 @@ def marked_named(xml, words):
 BY_WORDS_S = 20.0  # a read this young still says what the screen is: a tap
                    # by words on it needs no read first
 REVEAL_WAIT_MS = 1500  # a control a touch brings back (see hid_itself) is given this long
+REVEAL_SETTLE_MS = 700  # ... after the screen's wait for it: a tap on it right after the touch
+                        # would be a double tap, which a player takes for a seek (review, Oct 7)
 
 
 def act_calls(spec):
@@ -1592,6 +1605,7 @@ def act_calls(spec):
             # hid_itself): a touch where it was, and the wait for it
             x, y = spec["reveal"]
             calls.append(("click", [int(x), int(y)]))
+            calls.append(("waitForIdle", [REVEAL_SETTLE_MS]))
             calls.append(("waitForExists", [spec["tap_selector"], REVEAL_WAIT_MS]))
         # how many controls carry the words now (the check after the tap),
         # then the click, by its words at tap time
@@ -1612,10 +1626,6 @@ def act_calls(spec):
             calls.append(("waitForIdle", [int(spec.get("idle", 2000))]))
         sel = spec.get("field_selector") or focused_field_selector()
         calls.append(("setText", [sel, str(spec["set_text"])]))
-        if spec.get("enter_now"):
-            # `type --enter` into the field with the focus: the key in the
-            # same trip (see U2Daemon.cmd_act)
-            calls.append(("pressKeyCode", [66]))
     if calls:
         if not sleeps_the_screen(spec):
             calls.insert(0, ("wakeUp", []))
@@ -3273,12 +3283,55 @@ class U2Daemon:
             if lone is not None:
                 spec["field_selector"] = field_selector(lone.get("rid", ""))
             elif spec.get("enter") and self._focused_field():
-                # a search typed and submitted: with a field focused on the
-                # newest read, the text and the Enter go to it in one trip
-                # (the typing's own wait and read cost about 1.3s, YouTube's
-                # search, Oct 7)
-                spec["enter_now"] = True
+                # a search typed and submitted into the field with the focus
+                return self._type_then_enter(spec)
         return self._act_batch(spec)
+
+    def _type_then_enter(self, spec):
+        """`type --enter` into the field with the focus: the text alone, with
+        a read after it and no wait for the screen (a typing's own act
+        waited and read for about 1.3s, YouTube's search, Oct 7), then,
+        only once the phone says the text went in, the Enter as a key's act,
+        whose second look compares with that read. The two can't share a
+        batch: a batch runs every call, and the Enter went out when the
+        text had gone nowhere (the review of Oct 7). The text that didn't
+        go in is said as a typing's own act says it (the CLI types its
+        other ways and presses Enter itself after); the read is marked
+        entered="1"."""
+        sel = spec.get("field_selector") or focused_field_selector()
+        calls = [("wakeUp", []), ("setText", [sel, str(spec["set_text"])]),
+                 ("dumpWindowHierarchy", [False, DUMP_DEPTH])]
+        with self._lock:
+            self.invalidate()
+            with _t("act batch (the text, before an Enter)"):
+                try:
+                    results = self._batch(calls, timeout=20)
+                except StreamUnavailable as e:
+                    raise ActNotSent("act not sent: the UI server couldn't be reached (%s)" % e)
+                except LinkDead as e:
+                    if not e.sent:
+                        raise ActNotSent("act not sent: the UI server couldn't be reached (%s)" % e)
+                    raise RuntimeError("act failed after sending: %s" % str(e)[:120])
+                except Exception as e:
+                    raise RuntimeError("act failed after sending: %s" % str(e)[:120])
+        typed, mid = results[1], results[-1]
+        if isinstance(typed, Exception):
+            raise RuntimeError("act failed after sending: %s" % typed)
+        if typed is False:
+            raise RuntimeError("act failed after sending: no editable field took the text "
+                               "(the phone's setText said no)")
+        if isinstance(mid, str) and has_words(mid):
+            self._remember(mid)  # the screen with the text in: the Enter's second look starts from it
+        self._last_tap = None
+        try:
+            xml = self._act_batch({"key": 66, "idle": int(spec.get("idle", 2000))})
+        except ActNotSent as e:
+            raise RuntimeError("act failed after sending: the text went in; the Enter after it wasn't "
+                               "sent (%s)" % err_text(e, 100))
+        except RuntimeError as e:
+            raise RuntimeError("act failed after sending: the text went in; the Enter after it: %s"
+                               % str(e).replace("act failed after sending: ", "", 1)[:160])
+        return re.sub(rb"<hierarchy\b", b'<hierarchy entered="1"', xml, count=1)
 
     def _focused_field(self):
         """Whether the newest read (BY_WORDS_S old at most) has an enabled
@@ -3461,10 +3514,8 @@ class U2Daemon:
         the field doesn't have the focus after all (the phone found no
         such field, and nothing was typed)."""
         spec["field_selector"] = focused_field_selector(node.get("rid", ""))
-        if spec.get("enter"):
-            spec["enter_now"] = True  # the field has the focus: the key goes with the text
         try:
-            return self._act_batch(spec)
+            return self._type_then_enter(spec) if spec.get("enter") else self._act_batch(spec)
         except RuntimeError as e:
             if "UiObjectNotFound" in str(e) or "-32002" in str(e):
                 raise RuntimeError(self.NO_FIELD_TAP)
@@ -3518,28 +3569,33 @@ class U2Daemon:
                 except Exception as e:
                     raise RuntimeError("act failed after sending: %s" % str(e)[:120])
             if touch is not None:
-                after = results[-1]
-                if isinstance(results[touch], Exception):
-                    raise RuntimeError("act failed after sending: the touch to bring %r back failed (%s)"
-                                       % (spec.get("words"), err_text(results[touch], 80)))
-                if results[touch + 1] is not True or isinstance(results[acted[0]], Exception):
+                # the tap on the control decides what is said: it may have
+                # come back late, or after a touch that answered an error
+                # (the review of Oct 7: a tapped Pause said "not tapped",
+                # and the assistant's tap again played the video)
+                clicked, words, box = results[acted[0]], spec.get("words"), spec["reveal_on"]
+                waited = next(i for i in range(touch, len(calls)) if calls[i][0] == "waitForExists")
+                if clicked is not True:
+                    after = results[-1]
                     if isinstance(after, str) and has_words(after):
                         self._remember(after)
-                    raise RuntimeError("act failed after sending: %r had hidden itself, and a touch where "
-                                       "it was (on %r) didn't bring it back" % (spec.get("words"), spec["reveal_on"]))
-            if spec.get("enter_now"):
-                # the text and the Enter went out together: a text that
-                # didn't go in is said with the key that went anyway, in
-                # words the CLI doesn't take for "type another way"
-                typed_at = next(i for i in acted if calls[i][0] == "setText")
-                if isinstance(results[typed_at], Exception) or results[typed_at] is False:
-                    log("the typing before an Enter failed: %s" % (
-                        "setText said no" if results[typed_at] is False else err_text(results[typed_at], 120)))
-                    raise RuntimeError("act failed after sending: no text field took the text, and Enter "
-                                       "went to the screen as it was")
-                if isinstance(results[typed_at + 1], Exception):
-                    raise RuntimeError("act failed after sending: the text went in; the Enter after it "
-                                       "failed (%s)" % err_text(results[typed_at + 1], 80))
+                    if isinstance(clicked, Exception) and ("UiObjectNotFound" in str(clicked)
+                                                           or "-32002" in str(clicked)):
+                        if isinstance(results[touch], Exception):
+                            raise RuntimeError("act failed after sending: %r had hidden itself; the touch to "
+                                               "bring it back failed (%s), and it wasn't tapped"
+                                               % (words, err_text(results[touch], 80)))
+                        raise RuntimeError("act failed after sending: %r had hidden itself, and a touch where "
+                                           "it was (on %r) didn't bring it back" % (words, box))
+                    if clicked is False:
+                        raise RuntimeError("act failed after sending: %r came back after a touch on %r, and the "
+                                           "phone's tap on it didn't go in" % (words, box))
+                    raise RuntimeError("act failed after sending: %r came back after a touch on %r and may have "
+                                       "been tapped (%s); it isn't tapped again" % (words, box, err_text(clicked, 80)))
+                if isinstance(results[touch], Exception) or results[waited] is not True:
+                    log("%r tapped after a touch on %r, though %s" % (
+                        words, box, "that touch answered an error (%s)" % err_text(results[touch], 60)
+                        if isinstance(results[touch], Exception) else "it came back late"))
             if acted and isinstance(results[acted[0]], Exception):
                 err = results[acted[0]]
                 if "tap_selector" in spec and ("UiObjectNotFound" in str(err) or "-32002" in str(err)):
@@ -3676,8 +3732,6 @@ class U2Daemon:
                 xml = marked_named(xml, spec["named"])
             if spec.get("reveal_on"):
                 xml = marked_revealed(xml, spec["reveal_on"])
-            if spec.get("enter_now"):
-                xml = re.sub(r"<hierarchy\b", '<hierarchy entered="1"', xml, count=1)
         return xml.encode()
 
     def _relook(self, xml):

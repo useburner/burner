@@ -1733,6 +1733,7 @@ class SnapTests(OfflineTestCase):
         self.assertIn("@e2", out.getvalue())
         # the helper away: the tap over scrcpy, as before
         self.allow("u2sock", return_value=None)
+        self.allow("_u2_status", new="unsent")  # alone, the default read as a failure (review of Oct 7)
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_tap(self.parse(["tap", "--quiet", "@e2"]))
         self.assertEqual(rc, 0)
@@ -1751,6 +1752,7 @@ class SnapTests(OfflineTestCase):
         self.allow("ui_dump", return_value=ET.fromstring(YT_ACCOUNTS_XML))
         tc = self.allow("tap_center")
         self.allow("u2sock", return_value=None)
+        self.allow("_u2_status", new="unsent")  # the helper away (alone, the default read as a failure)
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_tap(self.parse(["tap", "--quiet", "--no-evidence", handle]))
         self.assertEqual(rc, 0, err.getvalue())
@@ -1780,6 +1782,38 @@ class SnapTests(OfflineTestCase):
         refused = pc.plan_tap(nodes, 1080, 2400, xy=(500, 789))
         self.assertEqual(refused["action"], "refused")
         self.assertEqual(refused["cover"]["bounds"], "[135,720][945,1500]")
+
+    def test_a_handle_whose_row_is_gone_is_refused(self):
+        # the review of Oct 7: the row a handle named (a player's control)
+        # hid since the snap; the point is the player now, and a touch
+        # there only brings the controls back
+        numbered = self._save(PLAYER_SHOWN_XML)
+        handle = self._handle(numbered, "[Pause video]")
+        self.allow("wake_async")
+        self.allow("ui_dump", return_value=ET.fromstring(PLAYER_HIDDEN_XML))
+        self.allow("u2sock", return_value=None)
+        self.allow("_u2_status", new="unsent")
+        tc = self.allow("tap_center")
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_tap(self.parse(["tap", "--quiet", "--no-evidence", handle]))
+        self.assertEqual(rc, 1)
+        tc.assert_not_called()
+        self.assertIn("{}'s row \"Pause video\" is no longer on the screen (it moved, or hid itself); tap it by "
+                      "its words (`burner tap \"Pause video\"`), which brings back controls that hide themselves, "
+                      "or `burner snap` again".format(handle), err.getvalue())
+
+    def test_a_dialog_is_cleared_only_by_its_own_control(self):
+        # the review of Oct 7: the windows of a read aren't in their order on
+        # the screen, so a row of the app listed after a dialog's window is
+        # no control of the dialog's
+        dialog = ('<node class="android.widget.FrameLayout" package="com.android.systemui" '
+                  'bounds="[200,900][880,1500]"><node text="Allow?" class="android.widget.TextView" '
+                  'package="com.android.systemui" bounds="[240,940][840,1000]"/></node>')
+        app = ('<node class="android.widget.FrameLayout" package="com.example" bounds="[0,0][1080,2400]">'
+               '<node text="Row" class="android.widget.LinearLayout" package="com.example" clickable="true" '
+               'bounds="[0,1100][1080,1300]"/></node>')
+        nodes = pc.walk(ET.fromstring('<hierarchy rotation="0">%s%s</hierarchy>' % (dialog, app)))
+        self.assertEqual(pc.plan_tap(nodes, 1080, 2400, xy=(540, 1200))["action"], "refused")
 
     def test_a_handle_s_row_under_a_popup_is_tapped_where_it_is_free(self):
         # the handle names the row under the popup: the popup's item over
@@ -4534,6 +4568,35 @@ class HiddenControlTests(OfflineTestCase):
         self.assertIsNone(mod.hid_itself(PLAYER_SHOWN_XML, moved, node))
         # the control still there, or never on the read: not this case
         self.assertIsNone(mod.hid_itself(PLAYER_HIDDEN_XML, PLAYER_HIDDEN_XML, node))
+        # a page the app switched to inside the box: more new rows with words
+        # than captions bring (the review of Oct 7)
+        page = PLAYER_HIDDEN_XML.replace('<node text="What It Takes"', "".join(
+            '<node text="Row %d" class="android.widget.TextView" package="com.google.android.youtube" '
+            'content-desc="" clickable="false" enabled="true" bounds="[100,%d][980,%d]"/>'
+            % (i, 300 + 100 * i, 340 + 100 * i) for i in range(5)) + '<node text="What It Takes"')
+        why = []
+        self.assertIsNone(mod.hid_itself(PLAYER_SHOWN_XML, page, node, why))
+        self.assertEqual(why, ["5 rows with words came in 'Video player' (a new screen there)"])
+
+    def test_a_clickable_row_around_a_control_that_went_is_not_touched(self):
+        # the review of Oct 7: a calendar entry (clickable, with words) whose
+        # "Join" became "Ended"; a touch where Join was would open the entry
+        mod = _u2mux()
+
+        def entry(button):
+            return ('<hierarchy rotation="0"><node class="android.widget.FrameLayout" package="com.cal" '
+                    'bounds="[0,0][1080,2400]"><node class="android.widget.FrameLayout" package="com.cal" '
+                    'content-desc="Today" bounds="[0,200][1080,1400]"><node class="android.view.ViewGroup" '
+                    'package="com.cal" content-desc="Team sync, 3:00 PM" clickable="true" '
+                    'bounds="[40,300][1040,600]">%s</node></node><node text="Tomorrow" '
+                    'class="android.widget.TextView" package="com.cal" bounds="[40,1500][1040,1600]"/></node>'
+                    '</hierarchy>' % button)
+        join = '<node text="Join" class="android.widget.Button" package="com.cal" clickable="true" bounds="[820,400][1000,500]"/>'
+        ended = '<node text="Ended" class="android.widget.TextView" package="com.cal" bounds="[820,400][1000,500]"/>'
+        node, _ = mod.label_node(entry(join), "Join")
+        why = []
+        self.assertIsNone(mod.hid_itself(entry(join), entry(ended), node, why))
+        self.assertEqual(why, ["'Team sync, 3:00 PM' is at its point now"])
 
     def _daemon(self, mod, batches):
         EmptyScreenTests.no_sleep(self, mod)
@@ -4550,20 +4613,23 @@ class HiddenControlTests(OfflineTestCase):
         dm._batch = batch
         return dm, sent
 
+    @staticmethod
+    def miss(calls):  # the phone finds no "Pause video": nothing tapped
+        return [None, 0, RuntimeError("UiObjectNotFoundException")] + [None] * (len(calls) - 4) + [PLAYER_HIDDEN_XML]
+
     def test_the_tap_brings_it_back_and_taps_it_in_one_trip(self):
         mod = _u2mux()
 
-        def miss(calls):  # the phone finds no "Pause video": nothing tapped
-            return [None, 0, RuntimeError("UiObjectNotFoundException")] + [None] * (len(calls) - 4) + [PLAYER_HIDDEN_XML]
-
-        def back(calls):  # the touch, the control back, its tap, the read
-            return [None, None, True, 1, None, None, PLAYER_PAUSED_XML]
-        dm, sent = self._daemon(mod, [miss, back])
+        def back(calls):  # the touch, the screen's wait, the control back, its tap, the read
+            return [None, None, None, True, 1, True, None, PLAYER_PAUSED_XML]
+        dm, sent = self._daemon(mod, [self.miss, back])
         xml = dm.cmd_act(json.dumps({"tap_label": "Pause video", "idle": 1200})).decode()
-        self.assertEqual([m for m, _ in sent[1]], ["wakeUp", "click", "waitForExists", "count", "click",
-                                                   "waitForIdle", "dumpWindowHierarchy"])
+        self.assertEqual([m for m, _ in sent[1]], ["wakeUp", "click", "waitForIdle", "waitForExists", "count",
+                                                   "click", "waitForIdle", "dumpWindowHierarchy"])
         self.assertEqual(sent[1][1], ("click", [539, 554]))  # where the control was
-        self.assertEqual(sent[1][2][1], [{"mask": 64, "childOrSibling": [], "childOrSiblingSelector": [],
+        # the controls' own wait before the tap on them: no double tap (a seek)
+        self.assertEqual(sent[1][2], ("waitForIdle", [mod.REVEAL_SETTLE_MS]))
+        self.assertEqual(sent[1][3][1], [{"mask": 64, "childOrSibling": [], "childOrSiblingSelector": [],
                                           "description": "Pause video"}, mod.REVEAL_WAIT_MS])
         self.assertEqual(dm.d.calls, [])  # no read of its own: the miss's read said it all
         self.assertIn('<hierarchy revealed="Video player"', xml)
@@ -4576,21 +4642,39 @@ class HiddenControlTests(OfflineTestCase):
         self.assertIn('it had hidden itself, as a video\'s controls do; a touch on "Video player" brought it back',
                       note)
 
-    def test_a_control_the_touch_did_not_bring_back_is_said(self):
+    def test_what_the_tap_on_it_did_decides_what_is_said(self):
+        # the review of Oct 7: a tapped Pause said "not tapped" when the
+        # touch before it answered an error, and a tap again played the video
         mod = _u2mux()
+        late = lambda calls: [None, RuntimeError("touch: injection failed"), None, False, 1, True, None,
+                              PLAYER_PAUSED_XML]
+        dm, sent = self._daemon(mod, [self.miss, late])
+        xml = dm.cmd_act(json.dumps({"tap_label": "Pause video", "idle": 1200})).decode()
+        self.assertIn('revealed="Video player"', xml)  # tapped: the read, as any tap's
+        cases = (
+            ([None, None, None, False, 0, RuntimeError("UiObjectNotFoundException"), None, PLAYER_HIDDEN_XML],
+             "act failed after sending: 'Pause video' had hidden itself, and a touch where it was (on 'Video "
+             "player') didn't bring it back"),
+            ([None, RuntimeError("touch: injection failed"), None, False, 0,
+              RuntimeError("UiObjectNotFoundException"), None, PLAYER_HIDDEN_XML],
+             "act failed after sending: 'Pause video' had hidden itself; the touch to bring it back failed "
+             "(RuntimeError: touch: injection failed), and it wasn't tapped"),
+            ([None, None, None, True, 1, False, None, PLAYER_SHOWN_XML],
+             "act failed after sending: 'Pause video' came back after a touch on 'Video player', and the "
+             "phone's tap on it didn't go in"),
+            ([None, None, None, True, 1, RuntimeError("java.lang.NullPointerException"), None, PLAYER_SHOWN_XML],
+             "act failed after sending: 'Pause video' came back after a touch on 'Video player' and may have "
+             "been tapped (RuntimeError: java.lang.NullPointerException); it isn't tapped again"))
+        for results, said in cases:
+            with self.subTest(said=said[:60]):
+                dm, sent = self._daemon(mod, [self.miss, lambda calls, r=results: r])
+                with self.assertRaises(RuntimeError) as cm:
+                    dm.cmd_act(json.dumps({"tap_label": "Pause video", "idle": 1200}))
+                self.assertEqual(str(cm.exception), said)
+        self.assertEqual(dm._last_xml, PLAYER_SHOWN_XML)  # the read after it is the newest
 
-        def miss(calls):
-            return [None, 0, RuntimeError("UiObjectNotFoundException")] + [None] * (len(calls) - 4) + [PLAYER_HIDDEN_XML]
-
-        def gone(calls):  # touched; the control never came back
-            return [None, None, False, 0, RuntimeError("UiObjectNotFoundException"), None, PLAYER_HIDDEN_XML]
-        dm, sent = self._daemon(mod, [miss, gone])
-        with self.assertRaises(RuntimeError) as cm:
-            dm.cmd_act(json.dumps({"tap_label": "Pause video", "idle": 1200}))
-        self.assertEqual(str(cm.exception), "act failed after sending: 'Pause video' had hidden itself, and a "
-                                            "touch where it was (on 'Video player') didn't bring it back")
-        self.assertEqual(dm._last_xml, PLAYER_HIDDEN_XML)
-        # a button took its place: no touch, "not on the last read" as before
+    def test_a_button_in_the_control_s_place_gets_no_touch(self):
+        mod = _u2mux()
         took = PLAYER_HIDDEN_XML.replace(
             'content-desc="Video player" clickable="false" enabled="true" bounds="[0,250][1080,858]">',
             'content-desc="Video player" clickable="false" enabled="true" bounds="[0,250][1080,858]">'
@@ -4622,37 +4706,63 @@ class TypeEnterTests(OfflineTestCase):
         dm._batch = lambda calls, timeout=45.0: sent.append(calls) or results(calls)
         return dm, sent
 
-    def test_a_search_typed_into_the_focused_field_is_submitted_in_the_same_trip(self):
+    def test_the_enter_goes_once_the_text_went_in(self):
         # YouTube's search, Oct 7: `type NASA --enter` after `tap Search`
-        # was the typing's trip (its wait and read, ~1.3s), then the key's
+        # was the typing's trip (its wait and read, ~1.3s), then the key's.
+        # The text goes alone with a read after it and no wait; the Enter
+        # only once the phone says the text went in (in one batch it went
+        # out when the text had gone nowhere, the review of Oct 7)
         mod = _u2mux()
-        self.assertEqual([m for m, _ in mod.act_calls({"set_text": "nasa", "enter_now": True, "idle": 1200})],
-                         ["wakeUp", "setText", "pressKeyCode", "dumpWindowHierarchy", "waitForIdle",
-                          "dumpWindowHierarchy"])
-        results = lambda calls: [None, True, None, None, None, SAMPLE_XML]
+        typed = SAMPLE_XML.replace('text="" resource-id="com.example:id/q"', 'text="nasa" resource-id="com.example:id/q"')
+
+        def results(calls):
+            if calls[1][0] == "setText":
+                return [None, True, typed]
+            return [None, True, None, None, SAMPLE_XML.replace('text="Hello"', 'text="Results"')]
         dm, sent = self._daemon(mod, SAMPLE_XML, results)  # its search box has the focus
         xml = dm.cmd_act(json.dumps({"set_text": "nasa", "enter": True, "idle": 1200})).decode()
-        self.assertEqual(sent[0][2], ("pressKeyCode", [66]))
+        self.assertEqual([[m for m, _ in c] for c in sent],
+                         [["wakeUp", "setText", "dumpWindowHierarchy"],
+                          ["wakeUp", "pressKeyCode", "dumpWindowHierarchy", "waitForIdle", "dumpWindowHierarchy"]])
+        self.assertEqual(sent[1][1], ("pressKeyCode", [66]))
         self.assertIn('<hierarchy entered="1"', xml)
-        # no field with the focus on the newest read: the typing alone (the
-        # CLI presses Enter after it, with its own look for a field)
-        unfocused = SAMPLE_XML.replace('focused="true"', 'focused="false"')
-        dm, sent = self._daemon(mod, unfocused, lambda calls: [None, True, None, None, unfocused])
-        xml = dm.cmd_act(json.dumps({"set_text": "nasa", "enter": True, "idle": 1200})).decode()
-        self.assertNotIn("pressKeyCode", [m for m, _ in sent[0]])
-        self.assertNotIn("entered", xml)
-        # the text didn't go in: said with the key that went anyway, in words
-        # the CLI doesn't take for "type another way"
-        dm, sent = self._daemon(mod, SAMPLE_XML, lambda calls: [None, RuntimeError(
-            "androidx.test.uiautomator.UiObjectNotFoundException"), None, None, None, SAMPLE_XML])
+        self.assertIn("Results", xml)
+        # the text didn't go in: no Enter, and the words a typing's own act
+        # has (the CLI types its other ways, then presses Enter itself)
+        for failed, said in ((RuntimeError("androidx.test.uiautomator.UiObjectNotFoundException"),
+                              "act failed after sending: androidx.test.uiautomator.UiObjectNotFoundException"),
+                             (False, "act failed after sending: no editable field took the text (the phone's "
+                                     "setText said no)")):
+            dm, sent = self._daemon(mod, SAMPLE_XML, lambda calls, f=failed: [None, f, SAMPLE_XML])
+            with self.assertRaises(RuntimeError) as cm:
+                dm.cmd_act(json.dumps({"set_text": "nasa", "enter": True, "idle": 1200}))
+            self.assertEqual(str(cm.exception), said)
+            self.assertEqual(len(sent), 1)  # no Enter
+        # the text went in, the Enter's trip failed: said so, nothing again
+        def key_failed(calls):
+            if calls[1][0] == "setText":
+                return [None, True, typed]
+            raise OSError("connection reset")
+        dm, sent = self._daemon(mod, SAMPLE_XML, key_failed)
         with self.assertRaises(RuntimeError) as cm:
             dm.cmd_act(json.dumps({"set_text": "nasa", "enter": True, "idle": 1200}))
-        self.assertEqual(str(cm.exception), "act failed after sending: no text field took the text, and Enter "
-                                            "went to the screen as it was")
+        self.assertEqual(str(cm.exception), "act failed after sending: the text went in; the Enter after it: "
+                                            "connection reset")
+        # no field with the focus on the newest read: the typing alone (the
+        # CLI presses Enter after it, with its own look for a field)
+        unfocused = SAMPLE_XML.replace('focused="true"', 'focused="false"').replace(
+            "</hierarchy>", '<node text="" class="android.widget.EditText" package="com.example" '
+                            'bounds="[100,800][900,900]" enabled="true" focused="false"/></hierarchy>')
+        dm, sent = self._daemon(mod, unfocused, lambda calls: [None, True, None, None, unfocused])
+        xml = dm.cmd_act(json.dumps({"set_text": "nasa", "enter": True, "idle": 1200})).decode()
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn("pressKeyCode", [m for m, _ in sent[0]])
+        self.assertNotIn("entered", xml)
 
     def test_the_cli_prints_the_key_s_screen_once(self):
         self.allow("u2_invalidate")
         self.allow("nav_record")
+        self.allow("_u2_status", new="ok")
         entered = SAMPLE_XML.replace("<hierarchy ", '<hierarchy entered="1" ', 1)
         calls = []
 
@@ -4668,19 +4778,19 @@ class TypeEnterTests(OfflineTestCase):
         lines = out.getvalue().splitlines()
         self.assertEqual(lines[:2], ["typed 4 chars", "pressed ENTER"])
         self.assertEqual(sum(1 for l in lines if l.startswith("screen: ")), 1)
-        # the typing failed after the key went: said, nothing typed again
+        # the Enter's trip failed after the text went in: said, nothing again
         calls.clear()
 
         def u2_failed(cmd, arg="", timeout=30):
             calls.append(json.loads(arg) if cmd == "act" else cmd)
-            pc._u2_status = ("err act failed after sending: no text field took the text, and Enter went to "
-                             "the screen as it was")
+            pc._u2_status = "err act failed after sending: the text went in; the Enter after it: connection reset"
             return None
         self.allow("u2sock", side_effect=u2_failed)
         with self.cap() as (out, err):
             self.assertEqual(pc.cmd_type(self.parse(["type", "nasa", "--enter"])), 1)
         self.assertEqual(len([c for c in calls if isinstance(c, dict)]), 1)
-        self.assertIn("no text field took the text, and Enter went to the screen as it was", err.getvalue())
+        self.assertIn("burner: the typing and its Enter failed on the phone (the text went in; the Enter after "
+                      "it: connection reset)", err.getvalue())
 
 
 class HelperStalenessTests(OfflineTestCase):
@@ -11203,22 +11313,35 @@ class AirbnbRoundTests(OfflineTestCase):
         with mock.patch.object(pc, "COMMANDS_LOG", log), mock.patch.object(pc, "_screen_pkg", "com.example"), \
                 mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             self.assertEqual(pc._scroll_plain("up", 1), 0)
-        self.assertIn("scrolled up x1\n  (nothing moved: this is the top. In a feed of videos or posts, the next "
-                      "one is `burner scroll down`)", out.getvalue())
-        # one row in five may differ (a Short's song name scrolling by: the
-        # live check printed no note); the same rows in other places moved
-        def rows(*words, dy=0):
-            return ET.fromstring('<hierarchy rotation="0"><node class="android.widget.FrameLayout" '
-                                 'bounds="[0,0][1080,2400]">' + "".join(
-                                     '<node text="%s" class="android.widget.TextView" bounds="[100,%d][900,%d]"/>'
-                                     % (w, 300 + 200 * i + dy, 380 + 200 * i + dy) for i, w in enumerate(words))
-                                 + '</node></hierarchy>')
-        short = ("@vikings", "Game day", "40K likes", "View 120 comments", "Original sound - artist")
-        self.assertTrue(pc.moved_nothing(rows(*short), rows("@vikings", "Game day", "41K likes", "View 121 comments",
-                                                            "nal sound - artist  Origi")))
-        self.assertFalse(pc.moved_nothing(rows(*short), rows(*short, dy=-200)))
-        self.assertFalse(pc.moved_nothing(rows(*short), rows("@BenGtalks", "Tips", "2K likes", "View 9 comments",
-                                                             "Original sound - artist")))
+        self.assertIn("scrolled up x1\n  (nothing moved: the top of the list this way, or the swipe was dropped. "
+                      "In a feed of videos or posts, the next one is `burner scroll down`)", out.getvalue())
+        # what scrolls decides, exactly (digits aside): the Shorts pager keeps
+        # its bars and its like and comment column in place from one Short to
+        # the next, and a share of rows allowed to differ called a real swipe
+        # "nothing moved" (the review of Oct 7)
+        def short(handle, title, likes, pager='scrollable="true"'):
+            fixed = "".join('<node content-desc="%s" class="android.widget.Button" bounds="[%d,2200][%d,2337]"/>'
+                            % (tab, 216 * i, 216 * i + 200) for i, tab in
+                            enumerate(("Home", "Shorts", "Create", "Subscriptions", "You")))
+            column = "".join('<node content-desc="%s" class="android.widget.Button" bounds="[950,%d][1060,%d]"/>'
+                             % (w, 1200 + 150 * i, 1300 + 150 * i) for i, w in
+                             enumerate(("like this video along with %s other people" % likes, "Dislike",
+                                        "View 120 comments", "Share", "Remix")))
+            return ET.fromstring(
+                '<hierarchy rotation="0"><node class="android.widget.FrameLayout" bounds="[0,0][1080,2400]">'
+                '<node class="androidx.viewpager2.widget.ViewPager2" %s bounds="[0,0][1080,2200]">'
+                '<node class="android.widget.FrameLayout" bounds="[0,0][1080,2200]">'
+                '<node content-desc="Go to channel %s" class="android.widget.ImageView" bounds="[40,2000][130,2090]"/>'
+                '<node text="%s" class="android.widget.TextView" bounds="[40,2100][900,2150]"/>%s</node></node>%s'
+                '</node></hierarchy>' % (pager, handle, title, column, fixed))
+        first = short("@vikings", "Game day", "40 thousand")
+        self.assertTrue(pc.moved_nothing(first, short("@vikings", "Game day", "41 thousand")))  # digits aside
+        self.assertFalse(pc.moved_nothing(first, short("@BenGtalks", "Tips", "2 thousand")))  # the next Short
+        # with nothing that scrolls on the read, all its rows decide, exactly
+        self.assertFalse(pc.moved_nothing(short("@vikings", "Game day", "40", pager=""),
+                                          short("@BenGtalks", "Tips", "2", pager="")))
+        self.assertTrue(pc.moved_nothing(short("@vikings", "Game day", "40", pager=""),
+                                         short("@vikings", "Game day", "40", pager="")))
         # it moved: nothing said
         self.allow("_cached_root", return_value=ET.fromstring(SAMPLE_XML.replace('text="Hello"', 'text="Earlier"')))
         with mock.patch.object(pc, "COMMANDS_LOG", log), mock.patch.object(pc, "_screen_pkg", "com.example"), \

@@ -1451,7 +1451,10 @@ def topmost_occluder(nodes, x, y, w, h):
         if r and r[0] <= x <= r[2] and r[1] <= y <= r[3]:
             if not _covers_screen(n, w, h) and _looks_like_overlay(n, w, h):
                 cover = n
-            elif cover is not None and is_interactive(n):
+            elif cover is not None and is_interactive(n) and _inside(n, cover):
+                # its own control: a row of another window listed after the
+                # dialog's (the order of windows in a read isn't theirs on
+                # the screen) clears nothing (review of Oct 7)
                 cover = None
     return cover
 
@@ -1904,10 +1907,11 @@ def asked_line(asked):
         asked["text"], " / ".join(asked["options"]))
 
 
-def _cached_root():
+def _cached_root(update=True):
     """The helper's newest read of the screen, parsed (its CACHED_READ_S
     old at most; no round trip to the phone), or None: the helper is
-    away, or its read is too old to be the screen now."""
+    away, or its read is too old to be the screen now. `update`: the
+    screen's size and app are taken from it."""
     try:
         xml = u2sock("dump", "cached", timeout=5)
         if not xml or "<node" not in xml:
@@ -1915,7 +1919,8 @@ def _cached_root():
         root = ET.fromstring(xml)
     except Exception:
         return None
-    _update_screen_from_dump(root)
+    if update:
+        _update_screen_from_dump(root)
     return root
 
 
@@ -2941,8 +2946,17 @@ def cmd_tap(args):
             nx, ny = xy_norm
             x, y = int(nx * w), int(ny * h)
             tap_label = "--xy {}".format(args.xy)
-        plan = plan_tap(nodes, w, h, xy=(x, y), check=not args.no_occlusion_check,
-                        target=snap_node(nodes, snap) if snap else None)
+        target = snap_node(nodes, snap) if snap else None
+        if snap and target is None and not args.no_occlusion_check:
+            # the row the handle named is gone from the newest read: its
+            # point is something else now (a player's controls hide, and the
+            # touch there brought them back instead, the review of Oct 7)
+            words = re.sub(r"^\[(.*)\]$", r"\1", snap.get("label") or "")
+            return _tap_fail(args, "{}'s row{} is no longer on the screen (it moved, or hid itself); {}".format(
+                args.text.strip(), ' "{}"'.format(words) if words else "",
+                "tap it by its words (`burner tap {}`), which brings back controls that hide themselves, "
+                "or `burner snap` again".format(_shell_words(words)) if words else "`burner snap` again"))
+        plan = plan_tap(nodes, w, h, xy=(x, y), check=not args.no_occlusion_check, target=target)
         if plan["action"] == "refused":
             return _tap_refused(args, x, y, plan["cover"])
         x, y = plan["xy"]  # a handle's row partly covered: a free point of it
@@ -3539,17 +3553,18 @@ def cmd_type(args):
         use_unicode = needs_unicode_route(args.text)
     quiet = getattr(args, "quiet", False)
     enter = getattr(args, "enter", False)
+    what = "typing and its Enter" if enter else "typing"  # a failure's words: the Enter may have gone too
 
     def typed(status, root, note):
-        # the typing's screen; with --enter, the key's instead: pressed in
-        # the typing's own trip when a field had the focus (the helper says
-        # so), else now
+        # the typing's screen; with --enter, the key's instead: pressed by
+        # the helper right after the text went into the field with the
+        # focus (it says so: entered="1"), else now
         if enter and status == "ok":
             if root is not None and root.get("entered"):
                 print("pressed ENTER")
                 return print_act(status, root, note, "key press")
             return _enter_after_typing(args, into_field=True)
-        return print_act(status, root, note, "typing")
+        return print_act(status, root, note, what)
     if use_unicode:
         nodes = walk(ui_dump())
         xy = None
@@ -3586,7 +3601,7 @@ def cmd_type(args):
             return typed(status, root, note)
         if status == "lost" or (status.startswith("failed") and "no editable field" not in status):
             # the helper had it: its word on what happened, no claim of typing
-            return print_act(status, root, note, "typing")
+            return print_act(status, root, note, what)
         if status == "unsent" and "no text box has the focus yet" in _u2_status:
             # the words were tapped a moment ago and the box they open
             # hasn't come: a tap on them again lands on the screen that is
@@ -3620,7 +3635,7 @@ def cmd_type(args):
             return typed(status, root, note)
         if status == "lost" or (status.startswith("failed") and "no editable field" not in status
                                 and "UiObjectNotFound" not in status):
-            return print_act(status, root, note, "typing")  # the helper's word; no claim of typing
+            return print_act(status, root, note, what)  # the helper's word; no claim of typing
         # "unsent" (an older helper) or no focused field: the paths below
     if not args.slow:
         out = u2sock("set_text", json.dumps({"text": args.text}), timeout=40)
@@ -5193,8 +5208,10 @@ def _scroll_plain(direction, times, quiet=False):
     # the screen before the swipes, the helper's newest read (no trip):
     # a scroll that moved nothing is said (a `scroll up` on the first of
     # YouTube's Shorts printed the same Short, unremarked, and the next
-    # swipes the same way were taken for the next one, Oct 7)
-    before = None if quiet else _cached_root()
+    # swipes the same way were taken for the next one, Oct 7); read
+    # without taking the screen's size from it, which the swipes take from
+    # the phone now (a read in the other rotation, review of Oct 7)
+    before = None if quiet else _cached_root(update=False)
     for i in range(times):
         if not _scrcpy_swipe(direction):
             return _scroll_plain_adb(direction, times - i, quiet=quiet)
@@ -5239,23 +5256,28 @@ def _scroll_plain(direction, times, quiet=False):
 # Said when a scroll moved nothing: the end of the list that way. A feed
 # of videos or posts shows its next one with `scroll down` (the finger
 # swipes up); `scroll up` on its first one moves nothing.
-SCROLL_STILL = {"up": "(nothing moved: this is the top. In a feed of videos or posts, the next one "
-                      "is `burner scroll down`)",
+SCROLL_STILL = {"up": "(nothing moved: the top of the list this way, or the swipe was dropped. In a "
+                      "feed of videos or posts, the next one is `burner scroll down`)",
                 "down": "(nothing moved: the end of the list this way, or the swipe was dropped)"}
 
 
 def moved_nothing(before, after):
-    """Whether a scroll left the screen where it was: nearly all the rows
-    with words on the read before it are on the read after it, in the same
-    places, their digits aside (a video's time and its likes go on
-    changing) and one in five may differ (a Short's song name scrolling
-    by: an exact match of every row missed the first Short, the live
-    check). Pure."""
+    """Whether a scroll left the screen where it was: the rows with words
+    in what scrolls (inside a view that can scroll, when the read has one;
+    else all, the system UI's aside) are the same on both reads, by their
+    words (digits aside: a video's time and its likes go on changing),
+    class and place. Exactly: a pager of Shorts keeps its bars and its
+    like and comment column in place from one Short to the next, and a
+    share of rows allowed to differ called a real swipe "nothing moved"
+    (the review of Oct 7). Pure."""
     def rows(root):
+        nodes = [n for n in walk(root) if compact_visible(n, False) and node_label(n)
+                 and n.get("package") != SYSTEM_UI_PKG]
+        scrolls = [n for n in nodes if any(p.attrib.get("scrollable") == "true" for p in n["parents"])]
         return {(re.sub(r"\d+", "#", node_label(n)), (n["class"] or "").split(".")[-1], tuple(n["center"]))
-                for n in walk(root) if compact_visible(n, False) and node_label(n)}
+                for n in (scrolls or nodes)}
     a, b = rows(before), rows(after)
-    return bool(a) and len(a & b) >= len(a) - len(a) // 5
+    return bool(a) and a == b
 
 
 def _scroll_plain_adb(direction, times, quiet=False):
