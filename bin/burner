@@ -736,6 +736,16 @@ HELPER_START_WAIT_S = 12.0  # a command waits this long for a helper that is sta
 _helper_waited = False      # once per process: a start that never comes isn't waited for twice
 
 
+def _helper_log(line):
+    """A line in the UI helper's own log (run/u2mux.log), with the time of
+    day, for what the CLI did about the helper. Never raises."""
+    try:
+        with open(os.path.join(ROOT, "run", "u2mux.log"), "a", encoding="utf-8") as f:
+            f.write("{} {}\n".format(time.strftime("%H:%M:%S"), line))
+    except OSError:
+        pass
+
+
 def helper_starting():
     """True while a helper start began in the last 30s (u2_start_background
     stamps it): its socket appears once it has connected to the phone."""
@@ -752,6 +762,7 @@ def connect_helper(s, timeout):
     one command costs more than the wait (an `open` took 14.6s there and
     opened a new Chrome tab besides, Oct 5), and the commands after it
     would go that way too."""
+    import socket
     global _helper_waited
     s.settimeout(timeout)
     try:
@@ -760,8 +771,16 @@ def connect_helper(s, timeout):
     except OSError as e:
         if _helper_waited:
             raise
-        dead = not isinstance(e, FileNotFoundError) and os.path.exists(U2_SOCK)
+        # refused: nobody listens on the file, the helper is gone. A full
+        # queue or a timeout is a helper too busy to take the call (one
+        # relinking the phone): waited for, never replaced, since a second
+        # helper would drive the phone beside the first (an `open` took
+        # 20.7s with a helper started again mid-relink, Oct 7)
+        dead = isinstance(e, ConnectionRefusedError) and os.path.exists(U2_SOCK)
+        busy = isinstance(e, (BlockingIOError, socket.timeout, TimeoutError))
         if dead:
+            _helper_log("burner: the UI helper's socket refused a connection ({}); "
+                        "starting it again".format(type(e).__name__))
             # the socket file is there but nobody listens: the helper
             # died (a crash, a kill) and left it, and nothing started it
             # again since the file looked like a live helper, so every
@@ -779,6 +798,9 @@ def connect_helper(s, timeout):
             u2_start_background(force=True)
             print("burner: the UI helper wasn't running; starting it again (this command "
                   "may take longer)", file=sys.stderr)
+        elif busy:
+            _helper_log("burner: the UI helper didn't take a connection ({}); waiting for it"
+                        .format(type(e).__name__))
         elif not helper_starting():
             raise
     _helper_waited = True

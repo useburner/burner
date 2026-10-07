@@ -4188,6 +4188,31 @@ class HelperStalenessTests(OfflineTestCase):
             pc.connect_helper(Sock(), 5)
         self.assertEqual((len(attempts), started), (1, [True]))
 
+    def test_a_busy_helper_is_waited_for_not_replaced(self):
+        # Oct 7: a helper relinking the phone took no call for a moment; the
+        # CLI took it for dead and started a second one (a 20.7s `open`)
+        attempts, removed, started, notes = [], [], [], []
+
+        class Sock:
+            def settimeout(self, t):
+                pass
+
+            def connect(self, path):
+                attempts.append(path)
+                if len(attempts) < 3:
+                    raise BlockingIOError(11, "Resource temporarily unavailable")
+        with mock.patch.object(pc, "helper_starting", return_value=False), \
+                mock.patch.object(pc, "_helper_waited", False), \
+                mock.patch.object(pc.os.path, "exists", lambda path: path == pc.U2_SOCK), \
+                mock.patch.object(pc.os, "remove", lambda path: removed.append(path)), \
+                mock.patch.object(pc, "u2_start_background", lambda force=False: started.append(force)), \
+                mock.patch.object(pc, "_helper_log", notes.append), \
+                mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            pc.connect_helper(Sock(), 5)
+        self.assertEqual((len(attempts), started, removed), (3, [], []))
+        self.assertIn("didn't take a connection (BlockingIOError); waiting for it", notes[0])
+        self.assertNotIn("starting it again", err.getvalue())
+
     def test_helper_restarts_when_any_file_under_lib_u2_is_newer(self):
         # the helper loads cdp.py once: an update that changed only the
         # page scripts must restart it too
