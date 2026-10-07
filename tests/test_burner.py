@@ -7342,6 +7342,18 @@ class WebPathTests(OfflineTestCase):
         self.assertNotIn("moved=", cdp.page_xml(r["screen"], 283, 2400))
         self.assertEqual(pc.page_stuck(ET.fromstring(cdp.page_xml(r["screen"], 283, 2400))), "")
 
+    def test_a_target_scrolled_into_view_is_placed_in_the_finds_trip(self):
+        # Hacker News, Oct 7: `tap More` paid a trip for the link's place
+        # after the find had scrolled it into view
+        cdp = _cdp()
+        page = _ScriptedPage(cdp, {"PLACE_JS": {"x": 1, "y": 2}})
+        touched = []
+        with mock.patch.object(cdp, "touch", lambda pg, x, y, then=(): touched.append((x, y)) or ("touch", [])):
+            cdp.touch_hit(page, {"x": 30, "y": 400, "moved": True, "settled": True})
+            self.assertEqual((touched[-1], page.calls), ((30, 400), []))  # no trip for the place
+            cdp.touch_hit(page, {"x": 30, "y": 400, "moved": True})  # an older find: placed afresh
+            self.assertEqual((touched[-1], page.calls), ((1, 2), [("eval", "PLACE_JS")]))
+
     def test_a_tap_that_opens_a_new_tab_follows_it(self):
         # weather.gov, Oct 7: 'Get Detailed info' opened a new tab; the tap
         # waited 1s for the old page, printed it, and `text` read it again

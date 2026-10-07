@@ -880,6 +880,7 @@ FIND_JS = r"""
   let blurred = false;
   const act = document.activeElement;
   if (act && act !== el && !el.contains(act) && act.matches('input,textarea,[contenteditable=true]')) { act.blur(); blurred = true; }
+  const answer = () => {
   const vv = window.visualViewport;
   // what is under the aimed point: a widget's popup (a date field's
   // calendar) over the target swallows the touch; a part of the same
@@ -901,6 +902,18 @@ FIND_JS = r"""
           moved: moved, blurred: blurred, covered: covered, notField: notField, tag: (over || el).tagName.toLowerCase(),
           over: over ? over.tagName.toLowerCase() : '', href: link ? link.href : '',
           cover: covered ? (top.tagName + ' ' + squash(top.innerText).slice(0, 40)) : '', url: location.href};
+  };
+  if (!moved) return answer();
+  // scrolled into view: the page's answer to the scroll (a sticky header,
+  // a list filling in) comes a frame or two later; the place is taken
+  // after it, in this same trip (a trip of its own for it, Oct 7)
+  return new Promise(done => {
+    let frames = 0, sent = false;
+    const finish = () => { if (sent) return; sent = true; r = box(el); done(Object.assign(answer(), {settled: true})); };
+    const tick = () => { if (++frames >= 2) finish(); else requestAnimationFrame(tick); };
+    requestAnimationFrame(tick);
+    setTimeout(finish, 120);
+  });
 })"""
 
 # After a touch on what opens a field (a search icon): the field the text
@@ -1676,11 +1689,12 @@ def touch_hit(page, hit, then=()):
                                                     "windowsVirtualKeyCode": 27}),
                         ("Input.dispatchKeyEvent", {"type": "keyUp", "key": "Escape", "code": "Escape",
                                                     "windowsVirtualKeyCode": 27})], timeout=5.0)
-    if hit.get("moved") or hit.get("blurred") or hit.get("covered"):
+    if (hit.get("moved") and not hit.get("settled")) or hit.get("blurred") or hit.get("covered"):
         # the place taken afresh: the page's scroll into view is instant
-        # (its reflow is in by the time this trip reaches it); the keyboard
-        # going and a popup closing take a moment more (a link below the
-        # fold paid 0.35s for nothing, Oct 7)
+        # (its reflow is in by the time this trip reaches it; the find
+        # takes it itself, "settled"); the keyboard going and a popup
+        # closing take a moment more (a link below the fold paid 0.35s for
+        # nothing, Oct 7)
         if hit.get("blurred") or hit.get("covered"):
             time.sleep(0.35)
         place = page.eval(_js(PLACE_JS)) or {}
