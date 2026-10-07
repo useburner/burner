@@ -5891,6 +5891,15 @@ class WebPathTests(OfflineTestCase):
         act(unfocused, moved)
         self.assertEqual((reads, sent[0]["tap_first"]), ([True, True], [500, 950]))
         self.assertEqual(sent[0]["field_selector"], mod.focused_field_selector())
+        # a password field: pinned to its id whatever took the focus (review, Oct 7)
+        pw_before = unfocused.replace('password="false" selected="false" bounds="[100,600]',
+                                      'password="true" selected="false" bounds="[100,600]')
+        pw_now = moved.replace('password="false" selected="false" bounds="[100,900]',
+                               'password="true" selected="false" bounds="[100,900]')
+        self.assertTrue(pw_before != unfocused and pw_now != moved)
+        act(pw_before, pw_now)
+        self.assertEqual((sent[0]["tap_first"], sent[0]["field_selector"].get("resourceId")),
+                         ([500, 950], "com.example:id/q"))
         # another field with the focus before the tap: pinned to this one
         other = moved.replace("</hierarchy>", '<node text="" resource-id="com.example:id/other" '
                               'class="android.widget.EditText" package="com.example" bounds="[100,1500][900,1600]" '
@@ -5984,6 +5993,7 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(mod.log_arg('{"set_text": "hunter2-secret", "field": "Password"}'),
                          '{"set_text": "<14 characters>", "field": "Password"}')
         self.assertEqual(mod.log_arg("cached"), "cached")
+        self.assertEqual(mod.log_arg("hunter2-raw", "set_text"), "<11 characters>")  # not JSON: still out
         lines = []
         failing = mock.Mock(side_effect=RuntimeError("act failed after sending: the field was tapped"))
         with mock.patch.object(mod, "log", lambda *a: lines.append(" ".join(str(x) for x in a))),                 mock.patch.object(dm, "cmd_act", failing), self.assertRaises(RuntimeError):
@@ -6034,6 +6044,22 @@ class WebPathTests(OfflineTestCase):
         out = run({"tap": [100, 250], "inert": True, "idle": 1200}, SAMPLE_XML, again=SAMPLE_XML)
         self.assertIn('<hierarchy unchanged="inert"', out)
         self.assertNotIn("unchanged", run({"tap": [250, 450], "idle": 1200}, SAMPLE_XML))  # changed
+        # the volume panel, the system UI's own: a change (review, Oct 7); the
+        # status bar's clock isn't
+        panel = SAMPLE_XML.replace("</hierarchy>", '<node text="Media volume" class="android.widget.TextView" '
+                                   'package="com.android.systemui" bounds="[900,800][1060,1400]"/></hierarchy>')
+        self.assertNotIn("unchanged", run({"key": 24, "idle": 1200}, panel, again=panel))
+        clock = SAMPLE_XML.replace("</hierarchy>", '<node text="12:01" class="android.widget.TextView" '
+                                   'package="com.android.systemui" bounds="[0,0][120,60]"/></hierarchy>')
+        self.assertEqual(mod.system_rows(clock), mod.system_rows(SAMPLE_XML))
+        # the CLI says "(unchanged)" only with the read the helper marked: its
+        # own re-read can find the new screen (review, Oct 7)
+        self.allow("u2sock", return_value=mod.marked_unchanged(SAMPLE_XML))
+        self.allow("ui_dump", return_value=ET.fromstring(results))
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (o, e):
+            status, root, note = pc.act_and_read({"tap": [250, 450]}, prev_root=ET.fromstring(SAMPLE_XML))
+        self.assertEqual(note, "")
+        self.assertIn("Search results", ET.tostring(root, encoding="unicode"))
         # a heading, and nothing around it that takes a click; a row in a
         # clickable box
         heading = ('<hierarchy rotation="0"><node text="" class="android.widget.FrameLayout" package="com.x" '
@@ -6381,6 +6407,15 @@ class WebPathTests(OfflineTestCase):
                             'class="android.widget.TextView" package="com.android.vending" '
                             'bounds="[150,470][900,540]"/></node>')
         self.assertIn('`burner tap "Search or ask Play"`', pc.nowhere_to_type(ET.fromstring(boxed)))
+        # no box to name (the Calculator takes key events): key events, as
+        # before (review, Oct 7)
+        calc = ('<hierarchy rotation="0"><node text="" class="android.widget.FrameLayout" package="com.google.android.'
+                'calculator" bounds="[0,0][1080,2400]"><node text="7" class="android.widget.Button" package="com.google.'
+                'android.calculator" bounds="[0,1500][270,1700]" clickable="true"/></node></hierarchy>')
+        self.assertEqual(pc.nowhere_to_type(ET.fromstring(calc)), "")
+        # a focused AutoCompleteTextView is a field with the focus
+        auto = focused.replace('class="android.widget.EditText"', 'class="android.widget.AutoCompleteTextView"')
+        self.assertEqual(pc.nowhere_to_type(ET.fromstring(auto)), "")
         keyboard = tab.replace("</node></hierarchy>", '</node><node text="q" class="android.widget.Button" '
                                'package="com.google.android.inputmethod.latin" bounds="[0,1800][100,1900]"/></hierarchy>')
         self.assertEqual(pc.nowhere_to_type(ET.fromstring(keyboard)), "")
@@ -6431,6 +6466,25 @@ class WebPathTests(OfflineTestCase):
         dm._last_xml, dm._last_xml_t = bar.replace("[150,470][900,540]", "[150,670][900,740]"), mod._time.monotonic()
         dm.cmd_act(json.dumps({"set_text": "espn", "field": "Search or ask Play", "idle": 1200}))
         self.assertEqual((reads, sent[0]["tap_first"]), ([True, True], [525, 505]))
+        # review, Oct 7: still moving between the two reads just taken: not tapped
+        sent.clear()
+        moving = iter([bar.replace("[150,470][900,540]", "[150,270][900,340]"), bar])
+        dm._dump = lambda fresh=False, **kw: next(moving)
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"set_text": "espn", "field": "Search or ask Play", "idle": 1200}))
+        self.assertEqual((str(cm.exception), sent), (dm.NO_FIELD_TAP, []))
+        # the agent just tapped it (its box still coming): not tapped again
+        dm._dump = lambda fresh=False, **kw: bar
+        dm._last_xml, dm._last_xml_t = bar, mod._time.monotonic()
+        dm._last_tap = ("Search or ask Play", mod._time.monotonic())
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"set_text": "espn", "field": "Search or ask Play", "idle": 1200}))
+        self.assertEqual((str(cm.exception), sent), (dm.NO_FIELD_TAP, []))
+        dm._last_tap = None
+        # a SearchView's AutoCompleteTextView is a field, not a bar
+        auto = bar.replace('<node text="Search or ask Play" class="android.widget.TextView"',
+                           '<node text="Search or ask Play" class="android.widget.AutoCompleteTextView"')
+        self.assertIsNone(dm._bar_named(auto, "Search or ask Play"))
         # a secret's label, a row that takes no tap, a field with the focus: the CLI's way
         self.assertIsNone(dm._bar_named(bar.replace("Search or ask Play", "Password"), "Password"))
         self.assertIsNone(dm._bar_named(bar.replace('clickable="true"><node', 'clickable="false"><node'),

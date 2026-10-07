@@ -1183,8 +1183,10 @@ def fuzzy_ok(query, label):
 
 
 def _is_text_field(n):
-    """Whether a walk() node is a text field. Pure."""
-    return "EditText" in (n.get("class") or "")
+    """Whether a walk() node is a text field (an AutoCompleteTextView, a
+    SearchView's box, is one too). Pure."""
+    cls = n.get("class") or ""
+    return "EditText" in cls or "AutoCompleteTextView" in cls
 
 
 # A label for a secret names only a password field loosely: a search box
@@ -2076,10 +2078,12 @@ def act_and_read(action, prev_root=None, idle_ms=IDLE_ACT_MS, rereads=2):
     _trace("act {:.2f}s".format(time.time() - t0))
     # the helper's word that the action left the screen as it was (after
     # its second look): said, so the screen isn't read again to be sure
-    unchanged = root.get("unchanged")
+    unchanged, marked = root.get("unchanged"), root
     root, note = settled_read(prev_root, idle_ms=idle_ms, rereads=rereads,
                               first_root=root)
-    if unchanged and not note:
+    # said only with the read the helper marked: a re-read here can find
+    # the new screen (a slow one), review Oct 7
+    if unchanged and not note and root is marked:
         note = ("(unchanged: the row tapped is a heading or a label, which opens nothing)"
                 if unchanged == "inert" else "(unchanged)")
     return "ok", root, note
@@ -3514,7 +3518,9 @@ def nowhere_to_type(root):
                 and words not in boxes:
             boxes.append(words)
     if not boxes:
-        return "no text field has the focus and the keyboard is closed: tap the box first"
+        # no box to name (the Calculator, a terminal, a game take key
+        # events with no text field): key events, as before (review, Oct 7)
+        return ""
     return ("no text field has the focus and the keyboard is closed: tap the box first "
             "(`burner tap {0}`), or both at once: `burner type --field {0} TEXT`".format(_shell_words(boxes[0])))
 

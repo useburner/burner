@@ -1185,7 +1185,8 @@ SCROLL_TO_JS = r"""
     const x0 = scrollX, y0 = scrollY;
     for (const go of tries.slice(0, 4)) {
       const top = go.rect.top, sc = scrollerOf(go.range ? go.el : go.el.parentElement || go.el);
-      const at = sc && [sc.scrollLeft, sc.scrollTop];
+      const kept = [];  // every box around it, as it was: a scroll into view moves them all
+      for (let a = go.el; a; a = a.parentElement) kept.push([a, a.scrollLeft, a.scrollTop]);
       go.el.scrollIntoView({block: go.rect.top < vh && go.rect.bottom > 0 ? 'nearest' : 'center',
                             inline: 'nearest', behavior: 'instant'});
       if (!inView(measure(go))) {
@@ -1196,7 +1197,8 @@ SCROLL_TO_JS = r"""
       }
       if (inView(go)) return {found: true, moved: Math.round(top - go.rect.top), used: want, text: say(go)};
       window.scrollTo({left: x0, top: y0, behavior: 'instant'});
-      if (at) sc.scrollTo({left: at[0], top: at[1], behavior: 'instant'});
+      for (const [a, l, t] of kept)
+        if (a.scrollLeft !== l || a.scrollTop !== t) a.scrollTo({left: l, top: t, behavior: 'instant'});
       for (const c of tries) measure(c);
     }
     if (!hidden) hidden = {found: false, hidden: true, used: want};

@@ -53,14 +53,14 @@ LOG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
 LOG_CAP = 1 << 20  # the log starts over past this size
 
 
-def log_arg(arg):
+def log_arg(arg, cmd=""):
     """A command's argument as the log shows it: typed text as its length
     (a failed act logged its arguments, a password sent to a field with
     them, review Oct 7), cut to 80 characters. Pure."""
     try:
         spec = json.loads(arg)
     except ValueError:
-        return arg[:80]
+        return "<%d characters>" % len(arg) if cmd == "set_text" else arg[:80]
     if isinstance(spec, dict):
         for k in ("set_text", "text"):
             if isinstance(spec.get(k), str):
@@ -1507,6 +1507,23 @@ def inert_row(xml, node):
         n = nodes[p] if isinstance(p, int) and 0 <= p < len(nodes) else None
         steps += 1
     return True
+
+
+def system_rows(xml):
+    """The system UI's worded rows on a read away from its bars (a volume
+    panel, a system dialog): what screen_sig leaves out, so that a key
+    that only opened the volume panel isn't "unchanged" (review, Oct 7).
+    None for a read that can't be parsed. Pure."""
+    try:
+        nodes = list(iter_nodes(xml))
+    except Exception:
+        return None
+    size = screen_size(nodes)
+    band = 0.07 * size[1] if size else 0
+    bottom = size[1] - band if size else 1e9
+    return sorted((n["text"], n["desc"]) for n in nodes
+                  if n["pkg"] == SYSTEM_UI and (n["text"] or n["desc"])
+                  and not (n["rect"][3] <= band or n["rect"][1] >= bottom))
 
 
 def marked_unchanged(xml, inert=False):
@@ -2972,7 +2989,13 @@ class U2Daemon:
         now = field_node(xml, label)
         if now is not None and now["focused"]:
             return self._type_at_once(spec, now)
-        if now is None and last:
+        # the control with these words was just tapped: the box it opens
+        # may still be coming, and it isn't tapped again (review, Oct 7)
+        tapped, tapped_at = getattr(self, "_last_tap", None) or ("", -1e9)
+        opened = (plain_words(tapped).lower() == plain_words(label).lower()
+                  and _time.monotonic() - tapped_at < TAP_OPENED_S)
+        first = xml  # the read just taken: a bar is tapped where two reads agree
+        if now is None and last and not opened:
             # a bar that opens its box, in the same place on the assistant's
             # read and this one: still, so tapped and typed now (the second
             # look below cost about 1s, Oct 7)
@@ -3006,11 +3029,12 @@ class U2Daemon:
                 other = any(n["field"] and n["focused"] for n in iter_nodes(xml))
             except Exception:
                 other = True
-            spec["field_selector"] = focused_field_selector(now.get("rid", "") if other else "")
+            # a password stays pinned to its field whatever took the focus
+            # (it would show in a plain one, review Oct 7)
+            secret = now.get("password") or any(w in SECRET_WORDS for w in
+                                                re.findall(r"[a-z]+", plain_words(label).lower()))
+            spec["field_selector"] = focused_field_selector(now.get("rid", "") if other or secret else "")
             return self._act_batch(spec)
-        tapped, tapped_at = getattr(self, "_last_tap", None) or ("", -1e9)
-        opened = (plain_words(tapped).lower() == plain_words(label).lower()
-                  and _time.monotonic() - tapped_at < TAP_OPENED_S)
         lone = lone_focused_field(xml, label) if now is None and opened else None
         if lone is not None:
             # the control with these words was just tapped and is gone: it
@@ -3021,8 +3045,11 @@ class U2Daemon:
             log("no row reads %r; typing into the one field, which has the focus (%s)"
                 % (label, lone.get("rid") or lone["cls"]))  # its id: its text is what was typed
             return self._type_at_once(spec, lone)
-        bar = self._bar_named(xml, label) if now is None else None
-        if bar is not None:
+        # a bar, in the same place on both reads just taken (a bar seen on
+        # one read alone may still be moving, review Oct 7)
+        bar = self._bar_named(xml, label) if now is None and not opened else None
+        was = self._bar_named(first, label) if bar is not None else None
+        if bar is not None and was is not None and bar["center"] == was["center"]:
             return self._tap_bar_and_type(spec, bar, label)
         raise RuntimeError(self.NO_FIELD_TAP)
 
@@ -3049,7 +3076,9 @@ class U2Daemon:
             node, _alt = label_node(xml, label)
         except Exception:
             return None
-        if node["field"] or inert_row(xml, node):
+        # an AutoCompleteTextView (a SearchView's box) is a field, not a bar
+        # (the typing after a tap on it failed with no fallback, review Oct 7)
+        if node["field"] or "autocomplete" in node["cls"] or inert_row(xml, node):
             return None
         return node
 
@@ -3204,7 +3233,8 @@ class U2Daemon:
             # said with the read (an agent read it again twice to be sure,
             # Oct 7); not on the read kept for later
             unchanged = bool(looked and not sleeps_the_screen(spec) and not chrome_in(xml)
-                             and screen_sig(xml) == screen_sig(before))
+                             and screen_sig(xml) == screen_sig(before)
+                             and system_rows(xml) == system_rows(before))
             if again:
                 pass
             elif looked:
@@ -3288,7 +3318,7 @@ class U2Daemon:
             if cmd in NO_RETRY and not isinstance(e, ActNotSent):
                 # The phone may already have acted (the reply was lost, not
                 # the request). Replaying would tap or type twice.
-                log("%s %s: %s" % (cmd, log_arg(arg), err_text(e, 160)))
+                log("%s %s: %s" % (cmd, log_arg(arg, cmd), err_text(e, 160)))
                 raise
             if cmd in NO_RETRY:
                 # an act that never went out (its stream wasn't opened, or
@@ -3296,7 +3326,7 @@ class U2Daemon:
                 # once more, which can't make it happen twice (right after
                 # `burner update` the server wasn't listening, "AdbError:
                 # closed", and a start's reads went the slow way, Oct 6)
-                log("%s %s: %s; sending it once more" % (cmd, log_arg(arg), err_text(e, 160)))
+                log("%s %s: %s; sending it once more" % (cmd, log_arg(arg, cmd), err_text(e, 160)))
             # Maybe the on-device server died — reconnect once and retry.
             # The RLock makes concurrent handlers queue behind one reconnect.
             with self._lock:
