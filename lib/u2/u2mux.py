@@ -1639,11 +1639,47 @@ def loose_field(xml, label):
     return None
 
 
+# Words a label may add that say "a field" and nothing of which one
+FIELD_WORDS = {"box", "field", "input", "text", "edit", "bar", "the"}
+
+
+def id_field(xml, label):
+    """The one text field whose resource id holds the label's words, a
+    field's kind aside ("Search" or "search box":
+    search_omnibox_edit_text), whole on the screen with nothing over it;
+    a secret's label names only a password field; None when none or
+    several are. Google Maps' search box read the query before ("Tulsa,
+    OK"), and `type --field Search` took 9.2s the slow way (Oct 7). Pure."""
+    try:
+        nodes = list(iter_nodes(xml or ""))
+    except Exception:
+        return None
+    size = screen_size(nodes)
+    for a in [plain_words(p).lower() for p in label.split("||") if p.strip()]:
+        words = [w for w in re.findall(r"[a-z0-9]+", a) if w not in FIELD_WORDS]
+        if not words:
+            continue
+        secret = any(w in SECRET_WORDS for w in words)
+        hits = []
+        for n in nodes:
+            if not n["field"] or not n["rid"] or (secret and not n.get("password")):
+                continue
+            local = n["rid"].split(":id/")[-1]
+            parts = {p.lower() for p in re.split(r"[_\W]+|(?<=[a-z])(?=[A-Z])", local) if p}
+            if all(w in parts for w in words) and not cut_off(n) \
+                    and row_over(nodes, [n], tuple(n["center"]), size) is None:
+                hits.append(n)
+        if hits:
+            return hits[0] if len(hits) == 1 else None
+    return None
+
+
 def field_node(xml, label):
     """The text field with this label on a read (see label_node: once,
     whole, nothing over it), or the one whose hint reads it (see
-    hint_field), or the one field whose words hold it (see loose_field);
-    None otherwise. Pure."""
+    hint_field), or the one field whose words hold it (see loose_field),
+    or the one whose resource id does (see id_field); None otherwise.
+    Pure."""
     if not xml:
         return None
     try:
@@ -1658,7 +1694,7 @@ def field_node(xml, label):
     hint = hint_field(xml, label)
     if hint is not None or refused:
         return hint
-    return loose_field(xml, label)
+    return loose_field(xml, label) or id_field(xml, label)
 SLEEP_KEYS = (26, 223, 276)  # POWER, SLEEP, SOFT_SLEEP
 
 

@@ -6282,6 +6282,31 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(pc.plan_tap(pc.walk(ET.fromstring(box)), 1080, 2400, text="Spanish")["node"]["text"],
                          "Spanish")
 
+    def test_a_field_is_named_by_its_resource_id_last(self):
+        # Google Maps, Oct 7: the search box read the query before, so
+        # `type --field Search` found no field and took the slow way (9.2s)
+        mod = _u2mux()
+        maps = ('<hierarchy rotation="0"><node text="Tulsa, OK" resource-id="com.google.android.apps.maps:id/'
+                'search_omnibox_edit_text" class="android.widget.EditText" package="com.google.android.apps.maps" '
+                'bounds="[150,170][900,270]" clickable="true" enabled="true" focused="false"/>'
+                '<node text="Search" class="android.widget.Button" package="com.google.android.apps.maps" '
+                'bounds="[100,2200][400,2300]" clickable="true" enabled="true"/></hierarchy>')
+        node = mod.field_node(maps, "Search")
+        self.assertEqual(node["rid"], "com.google.android.apps.maps:id/search_omnibox_edit_text")
+        self.assertEqual(mod.field_node(maps, "search box")["text"], "Tulsa, OK")
+        self.assertIsNone(mod.field_node(maps, "box"))  # a field's kind alone names none
+        self.assertIsNone(mod.field_node(maps, "Directions"))
+        two = maps.replace("</hierarchy>", '<node text="" resource-id="com.example:id/searchField" '
+                           'class="android.widget.EditText" package="com.google.android.apps.maps" '
+                           'bounds="[150,400][900,500]" clickable="true" enabled="true"/></hierarchy>')
+        self.assertIsNone(mod.id_field(two, "Search"))  # two: neither
+        self.assertEqual(mod.id_field(two.replace("search_omnibox", "query_omnibox"), "Search")["rid"],
+                         "com.example:id/searchField")  # camelCase parts
+        pw = maps.replace("search_omnibox_edit_text", "password_edit")
+        self.assertIsNone(mod.id_field(pw, "Password"))  # a secret's label: password fields only
+        self.assertIsNotNone(mod.id_field(pw.replace('focused="false"', 'focused="false" password="true"'),
+                                          "Password"))
+
     def test_a_native_type_with_a_field_label_is_not_sent_by_the_helper(self):
         mod = _u2mux()
         EmptyScreenTests.no_sleep(self, mod)
