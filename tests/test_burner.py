@@ -6339,6 +6339,23 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(pc.plan_tap(pc.walk(ET.fromstring(box)), 1080, 2400, text="Spanish")["node"]["text"],
                          "Spanish")
 
+    def test_a_query_typed_into_a_box_is_no_label_when_rows_hold_the_words(self):
+        # Maps, Oct 7: `tap Target --index 0` on the results tapped the search
+        # box, which held the query "Target Woodbury MN"
+        results = ('<hierarchy rotation="0"><node text="Target Woodbury MN" class="android.widget.EditText" '
+                   'package="com.google.android.apps.maps" bounds="[150,170][900,270]" clickable="true" '
+                   'focused="false"/><node text="Target Woodbury MN" class="android.widget.TextView" '
+                   'package="com.google.android.apps.maps" bounds="[100,720][700,790]"/></hierarchy>')
+        for index in (None, 0):
+            plan = pc.plan_tap(pc.walk(ET.fromstring(results)), 1080, 2400, text="Target", index=index)
+            self.assertEqual(plan["action"], "nomatch", index)
+            self.assertIn("Target Woodbury MN", plan["near"])
+        # a box alone with the words: still named by them ("Email or phone")
+        email = ('<hierarchy rotation="0"><node text="Email or phone" class="android.widget.EditText" '
+                 'package="com.example" bounds="[100,600][900,700]" clickable="true" focused="false"/></hierarchy>')
+        plan = pc.plan_tap(pc.walk(ET.fromstring(email)), 1080, 2400, text="Email")
+        self.assertEqual((plan["action"], plan["node"]["text"]), ("tap", "Email or phone"))
+
     def test_a_type_with_nowhere_to_go_says_so(self):
         # Play Store, Oct 7: `type` right after the Search tab (its bar takes
         # a tap first) went out as key events into nothing, exit 0

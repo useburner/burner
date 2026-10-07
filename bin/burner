@@ -2648,10 +2648,16 @@ def plan_tap(nodes, w, h, text=None, xy=None, fuzzy=False, index=None,
             # focuses it): a search box holding more than the words made
             # `tap "Echo Dot"` ambiguous with the product's row (review, Oct 7)
             # (a field with the focus last: an auto-focused "Email or
-            # phone" reads its hint, review of Oct 7)
-            hits = ([n for n in loose if not _is_text_field(n) and fuzzy_ok(sel, n["text"] or n["desc"] or "")]
-                    or [n for n in loose if field_named(sel, n)]
-                    or [n for n in loose if field_named(sel, n, focused_ok=True)])
+            # phone" reads its hint, review of Oct 7). A field only when no
+            # other row holds the words: then they are the screen's
+            # content, and the field's words a query typed into it (`tap
+            # Target --index 0` on Maps' results tapped its search box,
+            # which held "Target Woodbury MN", Oct 7)
+            words_rows = [n for n in loose if not _is_text_field(n)]
+            hits = ([n for n in words_rows if fuzzy_ok(sel, n["text"] or n["desc"] or "")]
+                    or ([] if words_rows else
+                        [n for n in loose if field_named(sel, n)]
+                        or [n for n in loose if field_named(sel, n, focused_ok=True)]))
             if hits:
                 used, fuzzy_used = sel, True
                 break
