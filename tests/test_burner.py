@@ -112,10 +112,11 @@ class OfflineTestCase(unittest.TestCase):
             "OFFLINE GUARD TRIPPED: socket.socket called (live I/O attempted)")
         self._guards["socket.socket"] = p
         self.addCleanup(p.stop)
-        # No test writes the real run/commands.log.
-        p = mock.patch.object(pc, "log_command")
-        p.start()
-        self.addCleanup(p.stop)
+        # No test writes the real run/commands.log, or the helper's log.
+        for name in ("log_command", "_helper_log"):
+            p = mock.patch.object(pc, name)
+            p.start()
+            self.addCleanup(p.stop)
         # The reason the phone's helper app last gave doesn't leak between tests.
         p = mock.patch.object(pc, "_phone_api_why", "")
         p.start()
@@ -1409,7 +1410,10 @@ class AmbiguousTapTests(OfflineTestCase):
                                  ("Add", "Add-ons", False),
                                  ("Next", "Next >", True),
                                  ("Continue", "Continue \u2192", True),
-                                 ("Starred", "\u2605 Starred", True)):
+                                 ("Starred", "\u2605 Starred", True),
+                                 ("@tropoFarmer", "@tropoFarmer \u00b7 2h", True),
+                                 ("#general", "#general, 5 new messages", True),
+                                 ("Inbox", "Inbox\u20143 unread", True)):
             self.assertEqual(pc.fuzzy_ok(query, label), ok, (query, label))
             self.assertEqual(_u2mux().fuzzy_ok(query, label), ok, (query, label))
         voice = ('<hierarchy rotation="0"><node text="" class="android.widget.FrameLayout" bounds="[0,0][1080,2400]" '
@@ -1422,14 +1426,15 @@ class AmbiguousTapTests(OfflineTestCase):
         rc, out, err, tc = self._tap(["tap", "Search"], xml=voice)
         self.assertEqual(rc, 1)
         self.assertIn('no row reads "Search"; rows with those words: "Search with your voice". '
-                      'If one of these is the row you mean, tap it by its full words', err)
-        # `scroll --to` finds rows as the tap does: not the voice button
-        # (it answered "found" at once there, review of Oct 7)
+                      'If one of these is the row you mean, tap it by its full words; else '
+                      '`burner scroll down` and tap again', err)
+        # `scroll --to` stops on any row holding the words ("Delivered" in
+        # "Delivered Oct 5"), alternatives split (review of Oct 7)
         nodes = pc.walk(ET.fromstring(voice))
-        self.assertEqual(pc.rows_named(nodes, "Search"), [])
-        self.assertEqual([n["desc"] for n in pc.rows_named(nodes, "Nope || Search with your voice")],
+        self.assertEqual([n["desc"] for n in pc.rows_holding(nodes, "Search")], ["Search with your voice"])
+        self.assertEqual([n["desc"] for n in pc.rows_holding(nodes, "Nope || Search with your voice")],
                          ["Search with your voice"])
-        self.assertEqual([n["text"] for n in pc.rows_named(nodes, "lofi hip hop radio")], ["lofi hip hop radio"])
+        self.assertEqual([n["text"] for n in pc.rows_holding(nodes, "lofi hip hop radio")], ["lofi hip hop radio"])
         # a text field is taken loosely: a tap only focuses it (`type --field
         # Email` on "Email or phone" failed once taps matched strictly,
         # review of Oct 7)
@@ -1440,6 +1445,33 @@ class AmbiguousTapTests(OfflineTestCase):
         self.assertEqual(mod.find_node(email, "Email", names=True)["text"], "Email or phone")
         self.assertEqual(mod.field_node(email, "Email")["text"], "Email or phone")
         self.assertIsNone(mod.field_node(email, "mail"))  # whole words
+        self.assertIsNone(mod.find_node(email, "mail", names=True))
+        self.assertIsNone(mod.field_node(email, "phone"))  # the head of its words (review of Oct 7)
+        # a field's words while it has the focus may be what was typed: a
+        # search box holding "password manager" took a password (review, Oct 7)
+        typed = email.replace('text="Email or phone"', 'text="password manager" focused="true"')
+        self.assertIsNone(mod.field_node(typed, "Password"))
+        self.assertIsNone(mod.find_node(typed, "Password", names=True))
+        self.assertEqual(pc.plan_tap(pc.walk(ET.fromstring(typed)), 1080, 2400, text="Password")["action"],
+                         "nomatch")
+        # unfocused, a secret's label names only a password field
+        shown = typed.replace(' focused="true"', '')
+        self.assertIsNone(mod.field_node(shown, "Password"))
+        self.assertEqual(mod.field_node(shown.replace('class="android.widget.EditText"',
+                                                      'class="android.widget.EditText" password="true"'),
+                                        "Password")["text"], "password manager")
+        # a sheet over the field: no loose match (its button took the tap)
+        sheet = email.replace('</node></hierarchy>', '<node text="Continue as Zach" class="android.widget.Button" '
+                              'bounds="[0,100][1080,400]" clickable="true" enabled="true"/></node></hierarchy>')
+        self.assertIsNone(mod.field_node(sheet, "Email"))
+        self.assertIsNone(mod.find_node(sheet, "Email", names=True))
+        # "Add" is not "Address"; rows the words name come before a field
+        addr = email.replace('text="Email or phone"', 'text="Address"')
+        self.assertEqual(pc.plan_tap(pc.walk(ET.fromstring(addr)), 1080, 2400, text="Add")["action"], "nomatch")
+        box = email.replace('text="Email or phone"', 'text="echo dot 5th gen"').replace(
+            "Search with your voice", "Echo Dot (5th Gen) | Smart speaker")
+        plan = pc.plan_tap(pc.walk(ET.fromstring(box)), 1080, 2400, text="Echo Dot")
+        self.assertEqual((plan["action"], plan["node"]["desc"]), ("tap", "Echo Dot (5th Gen) | Smart speaker"))
         two = email.replace('</node></hierarchy>', '<node text="Email again" class="android.widget.EditText" '
                             'bounds="[150,400][850,520]" clickable="true" enabled="true"/></node></hierarchy>')
         self.assertIsNone(mod.field_node(two, "Email"))  # two fields hold it
@@ -2403,7 +2435,10 @@ class FastPathTests(OfflineTestCase):
         line = lambda dt, cmd, rc=0: "%s   1523ms exit %d burner %s\n" % (stamp(dt), rc, cmd)
         self.assertIn("`burner tap` printed this screen's rows", pc.shot_hint([line(5, "tap Search")], now))
         self.assertIn("`burner type`", pc.shot_hint([line(3, "type --field Search '\u2026'")], now))
-        self.assertIn("`burner open`", pc.shot_hint([line(3, "--json open https://x.com")], now))
+        self.assertIn("`burner open`", pc.shot_hint([line(3, "open https://x.com")], now))
+        # quiet or --json: no rows were printed (review of Oct 7)
+        for cmd in ("tap Search -q", "tap Search --quiet", "--json tap Search", "press back --json"):
+            self.assertEqual(pc.shot_hint([line(3, cmd)], now), "", cmd)
         for lines in ([line(60, "tap Search")],          # long ago
                       [line(5, "tap Search", rc=1)],     # it failed: no screen printed
                       [line(5, "shot --out /tmp/a.png")],  # a screenshot again
@@ -3758,7 +3793,7 @@ class OneRoundTripTests(OfflineTestCase):
         with self.cap() as (out, err):
             rc = pc.cmd_press(self.parse(["press", "enter"]))
         self.assertEqual((rc, [c for c, _ in calls]), (1, ["dump", "dump"]))
-        native[0] = page  # an older helper answers with the page again: can't tell, the key goes
+        native[0] = page  # a page's read again (defensive: can't tell), the key goes
         self.allow("ui_dump", return_value=ET.fromstring(page))
         with self.cap() as (out, err):
             self.assertEqual(pc.cmd_press(self.parse(["press", "enter"])), 0)
@@ -4178,7 +4213,7 @@ class HelperStalenessTests(OfflineTestCase):
                     raise ConnectionRefusedError("nobody listens")
         # even right after a start (the stamp says one is under way): a
         # helper that listens has its socket, so a refused one is dead
-        with mock.patch.object(pc, "helper_starting", return_value=True),                 mock.patch.object(pc, "_helper_waited", False),                 mock.patch.object(pc.os.path, "exists", lambda path: path == pc.U2_SOCK),                 mock.patch.object(pc.os, "remove", lambda path: removed.append(path)),                 mock.patch.object(pc, "u2_start_background", lambda force=False: started.append(force)),                 mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+        with mock.patch.object(pc, "helper_starting", return_value=True),                 mock.patch.object(pc, "helper_alive", return_value=False),                 mock.patch.object(pc, "_helper_waited", False),                 mock.patch.object(pc.os.path, "exists", lambda path: path == pc.U2_SOCK),                 mock.patch.object(pc.os, "remove", lambda path: removed.append(path)),                 mock.patch.object(pc, "u2_start_background", lambda force=False: started.append(force)),                 mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             pc.connect_helper(Sock(), 5)
         self.assertEqual((len(attempts), started, sorted(removed)), (3, [True], sorted([pc.U2_SOCK, pc.U2_PID])))
         self.assertIn("the UI helper wasn't running; starting it again", err.getvalue())
@@ -5420,7 +5455,9 @@ class WebPathTests(OfflineTestCase):
         dm = EmptyScreenTests._daemon(self, mod)
         box = SAMPLE_XML.replace('content-desc="Search"', 'content-desc="Search apps &amp; games"')
         dm._last_tap = ("Search or ask Play", mod._time.monotonic())
-        dm.cmd_invalidate("")  # the CLI acted its own way (scrcpy, adb)
+        dm.cmd_invalidate("")  # a read's invalidate (`dump --fresh`): kept (review of Oct 7)
+        self.assertEqual(dm._last_tap[0], "Search or ask Play")
+        dm.cmd_invalidate("acted")  # the CLI acted its own way (scrcpy, adb)
         self.assertIsNone(dm._last_tap)
         dm._last_tap = ("Search or ask Play", mod._time.monotonic())
         dm._batch = lambda calls, timeout=45.0: [None] * (len(calls) - 1) + [box]

@@ -1484,21 +1484,44 @@ def hint_field(xml, label):
     return field
 
 
+# A label for a secret names only a password field loosely: a search box
+# holding "password manager" took a password for `--field Password`
+# (review of Oct 7).
+SECRET_WORDS = ("password", "passcode", "passphrase", "pin", "code", "cvv", "cvc", "otp")
+
+
+def field_named(label, n):
+    """Whether text field `n` is named loosely by `label` (any "a || b"
+    alternative): the head of its words, a leading symbol aside, is the
+    label's as whole words ("Email or phone" for `Email`: an empty field
+    reads its hint); it doesn't have the focus (its words may be what is
+    being typed); a secret's label names only a password field. Pure."""
+    if not n.get("field") or n.get("focused"):
+        return False
+    for a in [plain_words(p).lower() for p in label.split("||") if p.strip()]:
+        if any(w in SECRET_WORDS for w in a.split()) and not n.get("password"):
+            continue
+        for s in (n.get("text"), n.get("desc")):
+            head = re.sub(r"^[^\w]+", "", plain_words(s).lower())
+            if re.match(re.escape(a) + r"(?![\w-])", head):
+                return True
+    return False
+
+
 def loose_field(xml, label):
-    """The one text field whose words hold `label`'s as whole words (an
-    empty field reads its hint: "Email or phone" for `Email`), whole on
-    the screen; None when none or several do. A field only takes the
-    focus when tapped, so a loose match is safe here where a button's
-    isn't (`type --field Email` failed on "Email or phone" once taps
-    matched strictly, review of Oct 7). Pure."""
+    """The one text field a label names loosely (see field_named), whole
+    on the screen with nothing drawn over it (a sheet's "Continue as Zach"
+    over an "Email or phone" field took the tap, review of Oct 7); None
+    when none or several are. A field only takes the focus when tapped,
+    so a loose match is safe here where a button's isn't (`type --field
+    Email` failed on "Email or phone" once taps matched strictly). Pure."""
     try:
         nodes = list(iter_nodes(xml or ""))
     except Exception:
         return None
-    alts = [plain_words(p).lower() for p in label.split("||") if p.strip()]
-    pats = [re.compile(r"(?<![\w-])" + re.escape(a) + r"(?![\w-])") for a in alts]
-    hits = [n for n in nodes if n["field"] and not cut_off(n) and any(
-        p.search(plain_words(s).lower()) for p in pats for s in (n["text"], n["desc"]) if s)]
+    size = screen_size(nodes)
+    hits = [n for n in nodes if field_named(label, n) and not cut_off(n)
+            and row_over(nodes, [n], tuple(n["center"]), size) is None]
     return hits[0] if len(hits) == 1 else None
 
 
@@ -1511,11 +1534,17 @@ def field_node(xml, label):
         return None
     try:
         node, _ = label_node(xml, label)
-    except RuntimeError:
-        node = None
+        refused = False
+    except RuntimeError as e:
+        # a row with the label refused (under a cover, cut off, several):
+        # no loose match stands in for it (review of Oct 7)
+        node, refused = None, str(e) != "not on the last read"
     if node is not None and node.get("field"):
         return node
-    return hint_field(xml, label) or loose_field(xml, label)
+    hint = hint_field(xml, label)
+    if hint is not None or refused:
+        return hint
+    return loose_field(xml, label)
 SLEEP_KEYS = (26, 223, 276)  # POWER, SLEEP, SOFT_SLEEP
 
 
@@ -2031,10 +2060,12 @@ class U2Daemon:
         return json.dumps([{"id": t.get("id", ""), "url": t.get("url", ""), "title": t.get("title", "")}
                            for t in tabs]).encode()
 
-    def cmd_invalidate(self, _):
-        # the CLI acted its own way (scrcpy, adb): a control tapped by
-        # words before it no longer opened what is on the screen
-        self._last_tap = None
+    def cmd_invalidate(self, arg):
+        if arg.strip() == "acted":
+            # the CLI acted its own way (scrcpy, adb): a control tapped by
+            # words before it no longer opened what is on the screen (a
+            # read's invalidate, `dump --fresh`, keeps it: review of Oct 7)
+            self._last_tap = None
         self.invalidate()
         return b""
 
@@ -2921,6 +2952,7 @@ def iter_nodes(xml):
                        "selected": n.get("selected") == "true", "focused": n.get("focused") == "true",
                        "checked": n.get("checked") == "true", "pkg": n.get("package") or "",
                        "rid": n.get("resource-id") or "", "web": web,
+                       "password": n.get("password") == "true",
                        "field": "edittext" in cls, "cls": cls, "parent": parent}
                 parent = count[0]
                 count[0] += 1
@@ -3001,6 +3033,9 @@ def fuzzy_ok(query, label):
     more than half of the row's words, or the row's head with a note
     after it ("Inbox, 3 unread", "Echo Dot (5th Gen) | Smart speaker",
     "Next >"); a symbol before the head is no word ("\u2605 Starred"). Pure."""
+    # an em or en dash is a note's start, not a hyphen joining words
+    # ("Inbox\u20143 unread", review of Oct 7)
+    label = (label or "").replace("\u2014", " - ").replace("\u2013", " - ")
     q, row = plain_words(query).lower(), plain_words(label).lower()
     m = re.search(r"(?<![\w-])" + re.escape(q) + r"(?![\w-])", row) if q else None
     if not m:
@@ -3011,11 +3046,13 @@ def fuzzy_ok(query, label):
     words, row_words = len(q.split()), len(row.split())
     if words >= 3 or 2 * words > row_words:
         return True
-    head = re.sub(r"^[^\w]+", "", row)
-    if not head.startswith(q):
-        return False
-    rest = head[len(q):].strip()
-    return rest == "" or rest[0] in NOTE_MARKS or not any(ch.isalnum() for ch in rest)
+    # the head: the row as it is, or past a leading symbol the query lacks
+    # ("\u2605 Starred"); a query's own symbol stays ("@tropoFarmer \u00b7 2h")
+    for head in (row, re.sub(r"^[^\w]+", "", row)):
+        if head.startswith(q):
+            rest = head[len(q):].strip()
+            return rest == "" or rest[0] in NOTE_MARKS or not any(ch.isalnum() for ch in rest)
+    return False
 
 
 def find_node(xml, needle, fuzzy=True, names=False):
@@ -3028,15 +3065,21 @@ def find_node(xml, needle, fuzzy=True, names=False):
     first_sub = None
     nodes = list(iter_nodes(xml))
     h = max((n["rect"][3] for n in nodes), default=0)
+
+    def named(nl, n, labels):
+        # for a tap: a row the words name, or a field they name with
+        # nothing over it (a field only takes the focus; review of Oct 7)
+        if any(fuzzy_ok(nl, l) for l in labels if nl in l):
+            return True
+        return field_named(nl, n) and row_over(nodes, [n], tuple(n["center"]), screen_size(nodes)) is None
     for nl in needles:
         for n in nodes:
             labels = (plain_words(n["text"]).lower(), plain_words(n["desc"]).lower())
             if nl in labels:
                 return n
             if (fuzzy and first_sub is None and any(nl in l for l in labels)
-                    and not bar_icon(n, h)
-                    and (not names or n["field"] or any(fuzzy_ok(nl, l) for l in labels if nl in l))):
-                first_sub = n  # a field only takes the focus: loosely, as before (review of Oct 7)
+                    and not bar_icon(n, h) and (not names or named(nl, n, labels))):
+                first_sub = n
         if first_sub is not None:
             return first_sub
     return None

@@ -746,6 +746,18 @@ def _helper_log(line):
         pass
 
 
+def helper_alive():
+    """Whether the process named by the helper's pid file still runs.
+    False when there is none, or it can't be told."""
+    try:
+        with open(U2_PID) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError, OverflowError):
+        return False
+
+
 def helper_starting():
     """True while a helper start began in the last 30s (u2_start_background
     stamps it): its socket appears once it has connected to the phone."""
@@ -776,8 +788,9 @@ def connect_helper(s, timeout):
         # relinking the phone): waited for, never replaced, since a second
         # helper would drive the phone beside the first (an `open` took
         # 20.7s with a helper started again mid-relink, Oct 7)
-        dead = isinstance(e, ConnectionRefusedError) and os.path.exists(U2_SOCK)
-        busy = isinstance(e, (BlockingIOError, socket.timeout, TimeoutError))
+        refused = isinstance(e, ConnectionRefusedError) and os.path.exists(U2_SOCK)
+        dead = refused and not helper_alive()  # macOS refuses a full queue too
+        busy = isinstance(e, (BlockingIOError, socket.timeout, TimeoutError)) or (refused and not dead)
         if dead:
             _helper_log("burner: the UI helper's socket refused a connection ({}); "
                         "starting it again".format(type(e).__name__))
@@ -877,9 +890,10 @@ def u2_action(cmd, arg):
     return True
 
 
-def u2_invalidate():
-    """Tell the u2 mux the screen changed (drops its 2s dump cache)."""
-    u2sock("invalidate", timeout=5)
+def u2_invalidate(acted=True):
+    """Tell the u2 mux the screen changed (drops its 2s dump cache); by an
+    action of the CLI's own unless `acted` is false (a read's)."""
+    u2sock("invalidate", "acted" if acted else "", timeout=5)
     snap_invalidate()  # @eN handles from burner snap are now stale
 
 
@@ -1015,6 +1029,7 @@ def walk(root):
             "checked": node.attrib.get("checked") == "true",
             "checkable": node.attrib.get("checkable") == "true",
             "selected": node.attrib.get("selected") == "true",
+            "password": node.attrib.get("password") == "true",
             "package": node.attrib.get("package", ""),
             "parents": list(parents),
             "elem": node,
@@ -1125,6 +1140,9 @@ def fuzzy_ok(query, label):
     more than half of the row's words, or the row's head with a note
     after it ("Inbox, 3 unread", "Echo Dot (5th Gen) | Smart speaker",
     "Next >"); a symbol before the head is no word ("\u2605 Starred"). Pure."""
+    # an em or en dash is a note's start, not a hyphen joining words
+    # ("Inbox\u20143 unread", review of Oct 7)
+    label = (label or "").replace("\u2014", " - ").replace("\u2013", " - ")
     q, row = plain_words(query).lower(), plain_words(label).lower()
     m = re.search(r"(?<![\w-])" + re.escape(q) + r"(?![\w-])", row) if q else None
     if not m:
@@ -1135,11 +1153,13 @@ def fuzzy_ok(query, label):
     words, row_words = len(q.split()), len(row.split())
     if words >= 3 or 2 * words > row_words:
         return True
-    head = re.sub(r"^[^\w]+", "", row)
-    if not head.startswith(q):
-        return False
-    rest = head[len(q):].strip()
-    return rest == "" or rest[0] in NOTE_MARKS or not any(ch.isalnum() for ch in rest)
+    # the head: the row as it is, or past a leading symbol the query lacks
+    # ("\u2605 Starred"); a query's own symbol stays ("@tropoFarmer \u00b7 2h")
+    for head in (row, re.sub(r"^[^\w]+", "", row)):
+        if head.startswith(q):
+            rest = head[len(q):].strip()
+            return rest == "" or rest[0] in NOTE_MARKS or not any(ch.isalnum() for ch in rest)
+    return False
 
 
 def _is_text_field(n):
@@ -1147,29 +1167,40 @@ def _is_text_field(n):
     return "EditText" in (n.get("class") or "")
 
 
-def loosely_named(sel, n):
-    """Whether the words `sel`, held by row `n` without being its words,
-    stand for it: a row they name (see fuzzy_ok), or a text field, which
-    a tap only focuses (`type --field Email` on "Email or phone" failed
-    once taps matched strictly, review of Oct 7). Pure."""
-    return _is_text_field(n) or fuzzy_ok(sel, n["text"] or n["desc"] or "")
+# A label for a secret names only a password field loosely: a search box
+# holding "password manager" took a password for `--field Password`
+# (review of Oct 7).
+SECRET_WORDS = ("password", "passcode", "passphrase", "pin", "code", "cvv", "cvc", "otp")
 
 
-def rows_named(nodes, text):
-    """The rows a tap's words name (see plan_tap): an exact match of the
-    first "a || b" alternative that has one, else the rows the words
-    name loosely (see fuzzy_ok). `scroll --to` stops on them: it stopped
-    on any row holding the words, the one a tap had just refused ("Voice
-    search" for `Search`, review of Oct 7). Pure."""
+def field_named(sel, n):
+    """Whether text field `n` is named loosely by the words `sel`: the head
+    of its words, a leading symbol aside, is theirs as whole words ("Email
+    or phone" for `Email`); it doesn't have the focus (its words may be
+    what is being typed); a secret's label names only a password field
+    (the helper's field_named, the same rule). Pure."""
+    if not _is_text_field(n) or n.get("focused"):
+        return False
+    a = plain_words(sel).lower()
+    if not a or (any(w in SECRET_WORDS for w in a.split()) and not n.get("password")):
+        return False
+    for s in (n.get("text"), n.get("desc")):
+        head = re.sub(r"^[^\w]+", "", plain_words(s).lower())
+        if re.match(re.escape(a) + r"(?![\w-])", head):
+            return True
+    return False
+
+
+def rows_holding(nodes, text):
+    """The rows `scroll --to` stops on: those reading the words exactly
+    (the first "a || b" alternative that has one), else those holding them
+    ("Delivered" in "Delivered Oct 5"); never a status bar icon. Pure."""
     sels = [s.strip() for s in (text or "").split("||") if s.strip()]
-    for sel in sels:
-        hits = find_nodes(nodes, sel, exact=True)
-        if hits:
-            return hits
-    for sel in sels:
-        hits = [n for n in find_nodes(nodes, sel, exact=False) if loosely_named(sel, n)]
-        if hits:
-            return hits
+    for exact in (True, False):
+        for sel in sels:
+            hits = find_nodes(nodes, sel, exact=exact)
+            if hits:
+                return hits
     return []
 
 
@@ -2175,7 +2206,7 @@ def cmd_dump(args):
     if getattr(args, "fresh", False):
         # The UI helper reuses a read for 2s and only burner's own actions
         # clear it, so a screen changed some other way can read stale.
-        u2_invalidate()
+        u2_invalidate(acted=False)
     root = ui_dump()
     if getattr(args, "save", None):
         # The raw screen, for tests/fixtures/: replay it offline with
@@ -2559,13 +2590,17 @@ def plan_tap(nodes, w, h, text=None, xy=None, fuzzy=False, index=None,
         # title); rows that merely contain them are named, not tapped
         for sel in selectors:
             loose = find_nodes(nodes, sel, exact=False)
-            hits = [n for n in loose if loosely_named(sel, n)]
+            # rows the words name, else a field they name (a tap only
+            # focuses it): a search box holding more than the words made
+            # `tap "Echo Dot"` ambiguous with the product's row (review, Oct 7)
+            hits = ([n for n in loose if not _is_text_field(n) and fuzzy_ok(sel, n["text"] or n["desc"] or "")]
+                    or [n for n in loose if field_named(sel, n)])
             if hits:
                 used, fuzzy_used = sel, True
                 break
-            for w in (_row_words(n) for n in loose):
-                if w and w not in near:  # one control drawn twice is named once
-                    near.append(w)
+            for words in (_row_words(n) for n in loose):
+                if words and words not in near:  # one control drawn twice is named once
+                    near.append(words)
     if not hits:
         return {"action": "nomatch", "near": near[:3]}
     controls = dedupe_same_control(hits)
@@ -2789,8 +2824,8 @@ def cmd_tap(args):
             shown = ", ".join('"{}"'.format(w if len(w) <= LABEL_MAX else w[:LABEL_MAX - 1] + "\u2026")
                               for w in plan["near"])
             return _tap_fail(args, 'no row reads "{0}"; rows with those words: {1}. If one of these is '
-                                   'the row you mean, tap it by its full words; `burner scroll down --to {2}` '
-                                   'looks further down'.format(args.text, shown, _shell_words(args.text)))
+                                   'the row you mean, tap it by its full words; else `burner scroll down` '
+                                   'and tap again'.format(args.text, shown))
         return _tap_fail(args, 'no match for "{0}" on the screen; `burner scroll down --to {1}` '
                                'looks further down'.format(args.text, _shell_words(args.text)))
     if plan["action"] == "ambiguous":
@@ -3949,6 +3984,8 @@ def shot_hint(lines, now):
     m = re.match(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\s+\d+ms exit 0 burner (?:--\S+ )*(\w+)", last)
     if not m or m.group(2) not in PRINTING_VERBS:
         return ""
+    if re.search(r"\s(-q|--quiet|--json)(\s|$)", last):
+        return ""  # it printed no rows (review of Oct 7)
     try:
         t = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
     except ValueError:
@@ -4931,8 +4968,12 @@ def cmd_scroll(args):
     root = ui_dump()  # also refreshes the screen size
     pkg = dump_package(root)
     for i in range(times + 1):
-        if rows_named(walk(root), args.to):
-            print("found: {}".format(args.to))
+        hits = rows_holding(walk(root), args.to)
+        if hits:
+            words = _row_words(hits[0])
+            # the row that holds the words, when it reads more than them
+            print("found: {}{}".format(args.to, "" if plain_words(words).lower() == plain_words(args.to).lower()
+                                       else ' (in "{}")'.format(words[:LABEL_MAX])))
             if not quiet:
                 print_screen(root)
             return 0
