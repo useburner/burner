@@ -5102,7 +5102,7 @@ class _ScriptedPage(_FakePage):
 
     def _name(self, expression):
         for name in ("TARGET_FILL_JS", "FIND_JS", "TARGET_JS", "FILL_JS", "FILLED_JS", "READ_JS", "PLACE_JS",
-                     "SELECT_JS", "SETTLE_JS", "SCROLL_TO_JS", "SCROLL_JS"):
+                     "SELECT_JS", "SETTLE_JS", "SCROLL_TO_JS", "SCROLL_JS", "TEXT_JS"):
             if ("(" + getattr(self.cdp, name)) in expression:
                 return name
         return expression[:40]
@@ -6643,6 +6643,69 @@ class WebPathTests(OfflineTestCase):
             pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to=None, quiet=True))
         self.assertIn("scrolled down x1\n  something over the page holds it (a pop-up or a menu); "
                       "close that to tap the rows under it", out.getvalue())
+
+    def test_text_prints_the_words_uncut(self):
+        # Reddit, Oct 7: rows cut the JSON answer at 160 characters, and the
+        # assistant went around burner (Chrome's DevTools port over adb)
+        cdp = _cdp()
+        body = '{"kind": "Listing", "data": {"children": [' + ", ".join('{"title": "post %d"}' % i for i in range(400)) + "]}}"
+        page = _ScriptedPage(cdp, {"TEXT_JS": {"title": "", "url": "https://www.reddit.com/r/androiddev/top.json",
+                                               "total": len(body), "text": body[:20000]}})
+        self.assertEqual(cdp.page_text(page)["total"], len(body))
+        self.assertEqual(page.calls, [("eval", "TEXT_JS")])
+        sent = []
+
+        def u2(cmd, arg="", timeout=30):
+            sent.append((cmd, json.loads(arg)))
+            p = json.loads(arg)
+            return json.dumps({"title": "", "url": "https://www.reddit.com/r/androiddev/top.json",
+                               "total": len(body), "text": body[p["from"]:p["from"] + p["max"]]})
+        self.allow("u2sock", side_effect=u2)
+        with self.cap() as (out, err):
+            rc = pc.cmd_text(self.parse(["text"]))
+        self.assertEqual(rc, 0)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(lines[0], "page: (no title) (https://www.reddit.com/r/androiddev/top.json), {} characters"
+                         .format(len(body)))
+        self.assertIn('{"title": "post 399"}', out.getvalue())  # the whole answer, uncut
+        self.assertEqual(sent, [("text", {"from": 0, "max": pc.TEXT_MAX})])
+        # a long one, a part at a time
+        with self.cap() as (out, err):
+            pc.cmd_text(self.parse(["text", "--max", "100"]))
+        self.assertIn("(cut at 100 of {}: `burner text --from 100` for the rest)".format(len(body)), out.getvalue())
+        with self.cap() as (out, err):
+            pc.cmd_text(self.parse(["text", "--from", "100", "--max", "50"]))
+        self.assertIn(", from 100\n" + body[100:150] + "\n", out.getvalue())
+        # not a page: every row's words, uncut, the status bar and the keyboard aside
+        long_words = ("A long message " + "word " * 60).strip()
+        xml = ('<hierarchy rotation="0"><node text="" class="android.widget.FrameLayout" package="com.example" '
+               'bounds="[0,0][1080,2400]"><node text="12:01" package="com.android.systemui" class="android.widget.TextView" '
+               'bounds="[0,0][90,40]"/><node text="%s" package="com.example" class="android.widget.TextView" '
+               'bounds="[0,300][1080,900]"/><node text="Send" package="com.example" class="android.widget.Button" '
+               'bounds="[800,1000][1000,1100]" clickable="true"/><node text="q" package="com.google.android.inputmethod.latin" '
+               'class="android.widget.TextView" bounds="[0,1800][100,1900]"/></node></hierarchy>') % long_words
+        self.allow("u2sock", return_value=None)
+        self.allow("ui_dump", return_value=ET.fromstring(xml))
+        self.allow("screen_dims", return_value=(1080, 2400))
+        with self.cap() as (out, err):
+            rc = pc.cmd_text(self.parse(["text"]))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.getvalue().splitlines()[1:], [long_words, "Send"])
+        self.assertTrue(out.getvalue().startswith("screen: com.example, "))
+        # the helper: the page's words as JSON; elsewhere "not a page"
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = self._fake_cdp(mod, calls)
+        fake.page_text = lambda page, start=0, count=20000: {"title": "t", "url": "u", "total": 5,
+                                                            "text": "hello"[start:start + count]}
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        self.assertEqual(json.loads(dm.cmd_text(json.dumps({"from": 1, "max": 3})))["text"], "ell")
+        dm._last_xml = SAMPLE_XML
+        with self.assertRaises(RuntimeError):
+            dm.cmd_text("")
 
     def test_scroll_to_on_a_page_asks_the_page(self):
         # allrecipes.com, Oct 7: ten scrolls (469px each) never reached

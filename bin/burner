@@ -5909,6 +5909,14 @@ def build_parser():
                        help="read the notifications on the phone (changes nothing)")
     p.set_defaults(fn=cmd_notifications)
 
+    p = sub.add_parser("text", help="the words on screen, uncut: in Chrome the whole page, "
+                                    "top to bottom (changes nothing)")
+    p.add_argument("--from", dest="start", type=int, default=0,
+                   help="start at this character (for the rest of a long page)")
+    p.add_argument("--max", type=int, default=TEXT_MAX,
+                   help="characters at most (default {})".format(TEXT_MAX))
+    p.set_defaults(fn=cmd_text)
+
     p = sub.add_parser("apps", help="list apps installed on the phone")
     p.add_argument("match", nargs="?",
                    help="only apps whose package name contains this (e.g. amazon)")
@@ -7602,6 +7610,69 @@ def log_command(ms, rc):
             f.write(log_line(sys.argv[1:], ms, rc) + "\n")
     except Exception:
         pass
+
+
+TEXT_MAX = 20000  # characters `burner text` prints at a time (--max)
+
+
+def screen_text(nodes, h):
+    """Every row's words on a read, uncut and in order (`burner text`
+    off a page): the status bar, the navigation bar and the keyboard
+    aside, a row read twice once. Pure."""
+    out, seen = [], set()
+    for n in nodes:
+        pkg = n.get("package") or ""
+        r = _bounds_rect(n.get("bounds"))
+        if pkg == SYSTEM_UI_PKG and (r is None or _in_system_bars(r, h)):
+            continue
+        if is_ime_package(pkg):
+            continue
+        words = (n.get("text") or n.get("desc") or "").strip()
+        if not words or (words, r) in seen or (out and out[-1] == words):
+            continue
+        seen.add((words, r))
+        out.append(words)
+    return out
+
+
+def cmd_text(args):
+    """The words on the screen, uncut, for reading: in Chrome the page's
+    whole text, top to bottom (the page itself, as a reader sees it),
+    elsewhere every row's words. Rows cut a long text at LABEL_MAX, and an
+    assistant went around burner to read a JSON answer in full (Oct 7).
+    Changes nothing on the phone."""
+    start, count = max(0, args.start), max(1, args.max)
+    out = u2sock("text", json.dumps({"from": start, "max": count}), timeout=30)
+    page = None
+    if out is not None and out != U2_NOT_FOUND:
+        try:
+            page = json.loads(out)
+        except ValueError:
+            page = None
+    if isinstance(page, dict) and isinstance(page.get("text"), str):
+        total, text = int(page.get("total") or 0), page["text"]
+        print("page: {} ({}), {} characters{}".format(
+            page.get("title") or "(no title)", page.get("url") or "", total,
+            ", from {}".format(start) if start else ""))
+        if text:
+            print(text)
+        end = start + len(text)
+        if end < total:
+            print("(cut at {} of {}: `burner text --from {}` for the rest)".format(end, total, end))
+        return 0
+    root = ui_dump()
+    _w, h = screen_dims()
+    rows = screen_text(walk(root), h)
+    text = "\n".join(rows)
+    print("screen: {}, {} characters{}".format(dump_package(root) or "?", len(text),
+                                               ", from {}".format(start) if start else ""))
+    part = text[start:start + count]
+    if part:
+        print(part)
+    if start + len(part) < len(text):
+        print("(cut at {} of {}: `burner text --from {}` for the rest)".format(
+            start + len(part), len(text), start + len(part)))
+    return 0
 
 
 def cmd_log(args):

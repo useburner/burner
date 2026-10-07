@@ -1035,6 +1035,19 @@ SCROLL_TO_JS = r"""
 })"""
 
 
+# The page's words as a reader sees them (innerText: what is drawn, in
+# reading order, its line breaks kept), `count` characters from `start`,
+# with the whole length: `burner text`. Rows cut a long text at 160
+# characters, and an assistant went around burner to read a JSON answer
+# in full (Oct 7).
+TEXT_JS = r"""
+(function(start, count){
+  const raw = (document.body || document.documentElement).innerText || '';
+  const text = raw.replace(/[ \t\u00a0]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  return {title: document.title, url: location.href, total: text.length, text: text.slice(start, start + count)};
+})"""
+
+
 def _js(fn, *args):
     return "(%s)(%s)" % (fn, ", ".join(json.dumps(a) for a in args))
 
@@ -1671,6 +1684,12 @@ def type_text(page, text, idle_ms=800):
                       % (sel.get("type"), text, sel.get("value")))
     return {"screen": _read_or_again(page, res[2]), "ready": "complete",
             "direct": bool(sel.get("direct")), "only": bool(sel.get("only"))}
+
+
+def page_text(page, start=0, count=20000):
+    """The page's words, `count` characters from `start` (see TEXT_JS):
+    {"title", "url", "total", "text"}."""
+    return page.eval(_js(TEXT_JS, int(start), int(count)), timeout=10.0) or {}
 
 
 def scroll_to(page, label, direction="down"):

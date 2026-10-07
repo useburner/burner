@@ -1,4 +1,4 @@
-> Install: curl -fsSL https://useburner.si/install.sh | bash (full guide below). Skill rev 724c90f2: if `burner version` shows a different rev, run `burner update`.
+> Install: curl -fsSL https://useburner.si/install.sh | bash (full guide below). Skill rev cca1b3df: if `burner version` shows a different rev, run `burner update`.
 
 # burner
 
@@ -189,6 +189,7 @@ Look at the screen
   burner shot [--out PATH]          screenshot (--out . to send it in chat)
   burner status                     is it up? battery, charging, screen, storage, apps
   burner state                      open app + the main text on screen
+  burner text [--from N]            the words uncut: in Chrome the whole page, top to bottom
   burner dump [--all] [--fresh]     every item on screen: text, type, position
   burner snap [--all]               numbered list (@e1…) for exact taps
 

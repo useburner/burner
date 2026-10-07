@@ -27,7 +27,9 @@ Every step you take costs a round trip, so the fewer steps, the faster.
    `(off)` on switches. Don't follow an action with `dump`, `state`, a
    screenshot or a sleep: you already have the result.
 2. **Screenshots only to see pictures** (a photo, a map, a chart):
-   `burner shot --out .`, then send the file. For words, the rows are enough.
+   `burner shot --out .`, then send the file. For words, the rows are enough;
+   a row cut short with … or a long page reads whole with `burner text` (in
+   Chrome, the whole page, top to bottom: `burner text | grep -i preheat`).
 3. **Never sleep, and don't wait for what is already there.** Every action
    prints the screen it ends on: when the words you need are on it, act on
    them. `burner wait "Text" --timeout 30` is for a page still loading, when
@@ -91,6 +93,7 @@ Every step you take costs a round trip, so the fewer steps, the faster.
 | "Check my notifications" / "anything new?" | `burner notifications` prints them and changes nothing. |
 | "Check my Amazon order" | `burner amazon-status`. |
 | "Check my messages" | `burner apps messages`, `burner start <package>`, read the rows; open a conversation only to read it. |
+| "Read this article" / a recipe / a long page / a JSON answer | `burner open "https://…" com.android.chrome`, then `burner text`: the page's whole text, top to bottom (`burner text \| grep -i bake` for the part you need, `--from N` for more of a very long one). |
 | "Scroll down" / "scroll to the top" | `burner scroll down`, `burner scroll top`: inside the open app, never HOME or an edge swipe. |
 | "Do this every time" / "save that" | Turn the steps that worked into a recipe with `burner save <name> 'step' ...` (labels, not coordinates; `$VARIABLE` for text that changes), test it once with `burner recipe <name>`. |
 | "Update my burner" | `burner update` (it stays on this version), then re-read `~/burner/SKILL-fast.md`. |
@@ -126,6 +129,7 @@ screen it ends on unless you add `--quiet`.
 Look
   burner shot [--out PATH]          screenshot (--out . to send it in chat)
   burner state                      the app in front and the rows on screen (no action)
+  burner text [--from N]            the words uncut: in Chrome the whole page, top to bottom
   burner dump [--all] [--fresh]     every item on screen: text, type, position
   burner snap                       numbered rows (@e1…) for exact taps
   burner status                     is it up? battery, charging, screen, storage, apps

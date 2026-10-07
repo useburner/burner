@@ -2092,6 +2092,23 @@ class U2Daemon:
             return self._dump(fresh=True, page_first=True, hint=link).encode()
         return self._dump(fresh=(arg.strip() == "fresh")).encode()
 
+    def cmd_text(self, arg):
+        """arg: JSON {"from": n, "max": n}. The page's words in Chrome (see
+        cdp.page_text), as JSON; "not a page" elsewhere (the CLI prints
+        the screen's rows uncut then)."""
+        p = json.loads(arg) if arg.strip() else {}
+        page = self._page()
+        if page is None:
+            raise RuntimeError("not a page")
+        with self._lock:
+            try:
+                with _t("web text"):
+                    r = _cdp().page_text(page, int(p.get("from", 0)), int(p.get("max", 20000)))
+            except Exception as e:
+                self._web = None
+                raise RuntimeError("the page's text couldn't be read (%s)" % err_text(e, 100))
+        return json.dumps(r).encode()
+
     def cmd_tabs(self, _):
         """Chrome's tabs as DevTools lists them: JSON [{"id", "url",
         "title"}], for `burner tabs`."""
