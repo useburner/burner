@@ -2113,10 +2113,13 @@ def act_and_read(action, prev_root=None, idle_ms=IDLE_ACT_MS, rereads=2):
     # its second look): said, so the screen isn't read again to be sure
     unchanged, marked = root.get("unchanged"), root
     named = root.get("tapped")  # the row a tap's words only named, in its own words
+    entered = root.get("entered")  # the Enter after a typing went with it
     root, note = settled_read(prev_root, idle_ms=idle_ms, rereads=rereads,
                               first_root=root)
     if named and root is not None:
         root.set("tapped", named)
+    if entered and root is not None:
+        root.set("entered", entered)
     # said only with the read the helper marked: a re-read here can find
     # the new screen (a slow one), review Oct 7
     if unchanged and not note and root is marked:
@@ -3535,8 +3538,13 @@ def cmd_type(args):
     enter = getattr(args, "enter", False)
 
     def typed(status, root, note):
-        # the typing's screen; with --enter, the key's instead
+        # the typing's screen; with --enter, the key's instead: pressed in
+        # the typing's own trip when a field had the focus (the helper says
+        # so), else now
         if enter and status == "ok":
+            if root is not None and root.get("entered"):
+                print("pressed ENTER")
+                return print_act(status, root, note, "key press")
             return _enter_after_typing(args, into_field=True)
         return print_act(status, root, note, "typing")
     if use_unicode:
@@ -3565,7 +3573,8 @@ def cmd_type(args):
     # last text field). Elsewhere: focus the field first, then type.
     page_fields = ""
     if args.field and not args.slow and not quiet:
-        status, root, note = act_and_read({"set_text": args.text, "field": args.field})
+        status, root, note = act_and_read(dict({"set_text": args.text, "field": args.field},
+                                               **({"enter": True} if enter else {})))
         if status == "unsent" and "; its fields: " in _u2_status:
             # the page's own fields, said if nothing else has the label
             page_fields = _u2_status.split("; its fields: ", 1)[1]
@@ -3600,8 +3609,9 @@ def cmd_type(args):
     # first). set_text replaces the content, so --clear is implicit.
     no_focus = False
     if not args.slow and not quiet:
-        # One round trip: the text into the focused field, the wait, the read.
-        status, root, note = act_and_read({"set_text": args.text})
+        # One round trip: the text into the focused field, the wait, the read
+        # (and the Enter, with --enter and a field with the focus).
+        status, root, note = act_and_read(dict({"set_text": args.text}, **({"enter": True} if enter else {})))
         if status == "ok":
             print("typed {} chars".format(len(args.text)))
             return typed(status, root, note)

@@ -4606,6 +4606,79 @@ class HiddenControlTests(OfflineTestCase):
                          (127, 126, 85))
 
 
+class TypeEnterTests(OfflineTestCase):
+    def _daemon(self, mod, last, results):
+        EmptyScreenTests.no_sleep(self, mod)
+        mod.log = lambda *a: None
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([], screen_on=True)
+        dm._last_xml, dm._last_xml_t = last, mod._time.monotonic()
+        dm._page = lambda *a, **k: None
+        sent = []
+        dm._batch = lambda calls, timeout=45.0: sent.append(calls) or results(calls)
+        return dm, sent
+
+    def test_a_search_typed_into_the_focused_field_is_submitted_in_the_same_trip(self):
+        # YouTube's search, Oct 7: `type NASA --enter` after `tap Search`
+        # was the typing's trip (its wait and read, ~1.3s), then the key's
+        mod = _u2mux()
+        self.assertEqual([m for m, _ in mod.act_calls({"set_text": "nasa", "enter_now": True, "idle": 1200})],
+                         ["wakeUp", "setText", "pressKeyCode", "dumpWindowHierarchy", "waitForIdle",
+                          "dumpWindowHierarchy"])
+        results = lambda calls: [None, True, None, None, None, SAMPLE_XML]
+        dm, sent = self._daemon(mod, SAMPLE_XML, results)  # its search box has the focus
+        xml = dm.cmd_act(json.dumps({"set_text": "nasa", "enter": True, "idle": 1200})).decode()
+        self.assertEqual(sent[0][2], ("pressKeyCode", [66]))
+        self.assertIn('<hierarchy entered="1"', xml)
+        # no field with the focus on the newest read: the typing alone (the
+        # CLI presses Enter after it, with its own look for a field)
+        unfocused = SAMPLE_XML.replace('focused="true"', 'focused="false"')
+        dm, sent = self._daemon(mod, unfocused, lambda calls: [None, True, None, None, unfocused])
+        xml = dm.cmd_act(json.dumps({"set_text": "nasa", "enter": True, "idle": 1200})).decode()
+        self.assertNotIn("pressKeyCode", [m for m, _ in sent[0]])
+        self.assertNotIn("entered", xml)
+        # the text didn't go in: said with the key that went anyway, in words
+        # the CLI doesn't take for "type another way"
+        dm, sent = self._daemon(mod, SAMPLE_XML, lambda calls: [None, RuntimeError(
+            "androidx.test.uiautomator.UiObjectNotFoundException"), None, None, None, SAMPLE_XML])
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"set_text": "nasa", "enter": True, "idle": 1200}))
+        self.assertEqual(str(cm.exception), "act failed after sending: no text field took the text, and Enter "
+                                            "went to the screen as it was")
+
+    def test_the_cli_prints_the_key_s_screen_once(self):
+        self.allow("u2_invalidate")
+        self.allow("nav_record")
+        entered = SAMPLE_XML.replace("<hierarchy ", '<hierarchy entered="1" ', 1)
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append(json.loads(arg) if cmd == "act" else cmd)
+            return entered
+        self.allow("u2sock", side_effect=u2)
+        with self.cap() as (out, err):
+            rc = pc.cmd_type(self.parse(["type", "nasa", "--enter"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual([c for c in calls if isinstance(c, dict)], [{"set_text": "nasa", "enter": True,
+                                                                      "idle": pc.IDLE_ACT_MS}])
+        lines = out.getvalue().splitlines()
+        self.assertEqual(lines[:2], ["typed 4 chars", "pressed ENTER"])
+        self.assertEqual(sum(1 for l in lines if l.startswith("screen: ")), 1)
+        # the typing failed after the key went: said, nothing typed again
+        calls.clear()
+
+        def u2_failed(cmd, arg="", timeout=30):
+            calls.append(json.loads(arg) if cmd == "act" else cmd)
+            pc._u2_status = ("err act failed after sending: no text field took the text, and Enter went to "
+                             "the screen as it was")
+            return None
+        self.allow("u2sock", side_effect=u2_failed)
+        with self.cap() as (out, err):
+            self.assertEqual(pc.cmd_type(self.parse(["type", "nasa", "--enter"])), 1)
+        self.assertEqual(len([c for c in calls if isinstance(c, dict)]), 1)
+        self.assertIn("no text field took the text, and Enter went to the screen as it was", err.getvalue())
+
+
 class HelperStalenessTests(OfflineTestCase):
     def test_a_command_waits_for_a_helper_that_is_starting(self):
         attempts = []

@@ -1612,6 +1612,10 @@ def act_calls(spec):
             calls.append(("waitForIdle", [int(spec.get("idle", 2000))]))
         sel = spec.get("field_selector") or focused_field_selector()
         calls.append(("setText", [sel, str(spec["set_text"])]))
+        if spec.get("enter_now"):
+            # `type --enter` into the field with the focus: the key in the
+            # same trip (see U2Daemon.cmd_act)
+            calls.append(("pressKeyCode", [66]))
     if calls:
         if not sleeps_the_screen(spec):
             calls.insert(0, ("wakeUp", []))
@@ -3268,7 +3272,23 @@ class U2Daemon:
             lone = self._lone_field()
             if lone is not None:
                 spec["field_selector"] = field_selector(lone.get("rid", ""))
+            elif spec.get("enter") and self._focused_field():
+                # a search typed and submitted: with a field focused on the
+                # newest read, the text and the Enter go to it in one trip
+                # (the typing's own wait and read cost about 1.3s, YouTube's
+                # search, Oct 7)
+                spec["enter_now"] = True
         return self._act_batch(spec)
+
+    def _focused_field(self):
+        """Whether the newest read (BY_WORDS_S old at most) has an enabled
+        text field with the focus."""
+        if not self._last_xml or _time.monotonic() - self._last_xml_t >= BY_WORDS_S:
+            return False
+        try:
+            return any(n["field"] and n["enabled"] and n["focused"] for n in iter_nodes(self._last_xml))
+        except Exception:
+            return False
 
     def _lone_field(self):
         """The one enabled text field on the newest read (BY_WORDS_S old
@@ -3441,6 +3461,8 @@ class U2Daemon:
         the field doesn't have the focus after all (the phone found no
         such field, and nothing was typed)."""
         spec["field_selector"] = focused_field_selector(node.get("rid", ""))
+        if spec.get("enter"):
+            spec["enter_now"] = True  # the field has the focus: the key goes with the text
         try:
             return self._act_batch(spec)
         except RuntimeError as e:
@@ -3505,6 +3527,19 @@ class U2Daemon:
                         self._remember(after)
                     raise RuntimeError("act failed after sending: %r had hidden itself, and a touch where "
                                        "it was (on %r) didn't bring it back" % (spec.get("words"), spec["reveal_on"]))
+            if spec.get("enter_now"):
+                # the text and the Enter went out together: a text that
+                # didn't go in is said with the key that went anyway, in
+                # words the CLI doesn't take for "type another way"
+                typed_at = next(i for i in acted if calls[i][0] == "setText")
+                if isinstance(results[typed_at], Exception) or results[typed_at] is False:
+                    log("the typing before an Enter failed: %s" % (
+                        "setText said no" if results[typed_at] is False else err_text(results[typed_at], 120)))
+                    raise RuntimeError("act failed after sending: no text field took the text, and Enter "
+                                       "went to the screen as it was")
+                if isinstance(results[typed_at + 1], Exception):
+                    raise RuntimeError("act failed after sending: the text went in; the Enter after it "
+                                       "failed (%s)" % err_text(results[typed_at + 1], 80))
             if acted and isinstance(results[acted[0]], Exception):
                 err = results[acted[0]]
                 if "tap_selector" in spec and ("UiObjectNotFound" in str(err) or "-32002" in str(err)):
@@ -3641,6 +3676,8 @@ class U2Daemon:
                 xml = marked_named(xml, spec["named"])
             if spec.get("reveal_on"):
                 xml = marked_revealed(xml, spec["reveal_on"])
+            if spec.get("enter_now"):
+                xml = re.sub(r"<hierarchy\b", '<hierarchy entered="1"', xml, count=1)
         return xml.encode()
 
     def _relook(self, xml):
