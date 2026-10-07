@@ -4310,71 +4310,174 @@ class HelperStalenessTests(OfflineTestCase):
         pc._u2_checked = True
 
 
-NOTIFICATION_DUMP = """Current Notification Manager state:
-  Notification List:
-    NotificationRecord(0x00f6e923: pkg=com.facebook.aura user=UserHandle{0} id=-346505250 tag=null importance=4
-      flags=AUTO_CANCEL
-            when=1791343200000/1791343200000
-                android.title=String (Muse)
-                android.text=String (Ten o'clock, Zach (time to wind down))
-    NotificationRecord(0x002f5a9d: pkg=com.google.android.googlequicksearchbox user=UserHandle{0} id=0 tag=x::SUMMARY::
-      flags=GROUP_SUMMARY
-            when=1791343213898/1791343213898
-                android.title=null
-                android.text=null
-            when=1791343213908/1791343213908
-                android.title=String (Google)
-                android.text=String (You have a notification)
-    NotificationRecord(0x062c565e: pkg=com.google.android.googlequicksearchbox user=UserHandle{0} id=1 tag=wx
-      flags=0x0
-            when=1791343300000/1791343300000
-                android.title=SpannableString (Cooling over next 2 days)
-                android.text=SpannableString (See full forecast for Woodbury)
-     NotificationRecord(0x0b7b9482: pkg=com.wispr.flowapp user=UserHandle{0} id=7 tag=null
-       flags=ONGOING_EVENT|NO_CLEAR|FOREGROUND_SERVICE
-            when=1791340000000/1791340000000
-                android.title=String (Wispr Flow)
-                android.text=null
-                android.bigText=String (Dictation ready)
-  Notification attention state:
-  Snoozed notifications:
-    NotificationRecord(0x0aaaaaaa: pkg=com.snoozed.app user=UserHandle{0} id=9 tag=null
-      flags=0x0
-            when=1791343400000/1791343400000
-                android.title=String (Snoozed)
-                android.text=String (Not shown)
-"""
+def _record(key, flags, when, words, public=None, extras_indent=16, when_line=True, marks=True):
+    """One record as `dumpsys notification --noredact` prints it (AOSP's
+    NotificationRecord.dump): the head, its fields, the notification, its
+    lock screen version. `words` are extras lines (key, raw value)."""
+    pkg = key.split("|")[1]
+    pad = " " * extras_indent
+    lines = ["    NotificationRecord(0x0123abcd: pkg=%s user=UserHandle{0} id=1 tag=null importance=3 key=%s: "
+             "Notification(channel=c shortcut=null contentView=null vibrate=null sound=null defaults=0x0 "
+             "flags=0x10 color=0x00000000 vis=PRIVATE))" % (pkg, key),
+             "      uid=10123 userId=0", "      opPkg=" + pkg, "      icon=Icon(typ=RESOURCE pkg=%s)" % pkg,
+             "      flags=" + flags, "      originalFlags=" + flags, "      pri=0", "      key=" + key,
+             "      seen=false", "      groupKey=0|%s|g:x" % pkg]
+
+    def notification(words, when):
+        out = [" " * 12 + "contentIntent=PendingIntent{1: PendingIntentRecord{2 %s startActivity}}" % pkg,
+               " " * 12 + "number=0"]
+        if when_line:
+            out.append(" " * 12 + "when=%s" % when)
+        out += [" " * 12 + "tickerText=null", " " * 12 + "vis=0", " " * 12 + "extras={"]
+        out += [pad + "%s=%s" % kv for kv in words]
+        return out + [" " * 12 + "}"]
+    if marks:
+        lines.append("      notification=")
+    lines += notification(words, when)
+    if marks:
+        lines.append("      publicNotification=")
+        lines += notification(public, when) if public else [" " * 12 + "None"]
+    return lines + ["      stats=SingleNotificationStats{posttimeElapsedMs=1}", "      mContactAffinity=0.0"]
+
+
+NOTIFICATION_KEYS = ["0|com.facebook.aura|1|null|10301", "0|com.google.android.googlequicksearchbox|1|g|10120",
+                     "0|com.google.android.googlequicksearchbox|2|wx|10120", "0|com.wispr.flowapp|7|null|10288",
+                     "0|com.whatsapp|3|null|10250", "0|com.example.bank|4|null|10260"]
+NOTIFICATION_RAW = "\n".join(
+    ["Current Notification Manager state:", "  Housekeeping: ok", "  Notification List:"]
+    + _record(NOTIFICATION_KEYS[0], "AUTO_CANCEL", "1791343200000/1791343200000",
+              [("android.title", "String (Muse)"), ("android.text", "String (Ten o'clock, Zach (time to wind down))")])
+    # a group's summary, words and all: its notifications are listed
+    + _record(NOTIFICATION_KEYS[1], "GROUP_SUMMARY", "1791343213898/1791343213898",
+              [("android.title", "String (Google)"), ("android.text", "String (2 new)")])
+    + _record(NOTIFICATION_KEYS[2], "", "1791343300000/1791343300000",
+              [("android.title", "SpannableString (Cooling over next 2 days)"),
+               ("android.text", "SpannableString (See full forecast for Woodbury)")])
+    + _record(NOTIFICATION_KEYS[3], "ONGOING_EVENT|NO_CLEAR|FOREGROUND_SERVICE", "1791340000000/1791340000000",
+              [("android.title", "String (Wispr Flow)"), ("android.text", "null"),
+               ("android.bigText", "String (Dictation ready)")])
+    # words over several lines: the next lines start anywhere (review of Oct 7)
+    + _record(NOTIFICATION_KEYS[4], "AUTO_CANCEL", "0/1791343500000",
+              [("android.title", "String (Mom)"),
+               ("android.text", "String (Call me when you land\nLove you\n  P.S. snacks\n\n)"),
+               ("android.bigText", "String (Call me\nwhen you land)")])
+    # the lock screen version's words never stand in for the notification's own
+    + _record(NOTIFICATION_KEYS[5], "AUTO_CANCEL", "1791343100000/1791343100000",
+              [("android.title", "String (Bank)")],
+              public=[("android.title", "String (Bank)"), ("android.text", "String (Contents hidden)")])
+    + ["  ", "  mArchive=Archive (5 notifications)", "  Snoozed notifications:"]
+    + _record("0|com.snoozed.app|9|null|10999", "AUTO_CANCEL", "1791343400000/1791343400000",
+              [("android.title", "String (Snoozed)"), ("android.text", "String (Not shown)")])) + "\n"
+
+
+def _on_the_phone(raw, keys=()):
+    """What NOTIF_DUMP prints on a phone whose dump is `raw`: the keys,
+    the mark, and the dump through its grep (the same extended regular
+    expression, run here)."""
+    pattern = re.search(r"grep -E '(.*)'$", pc.NOTIF_DUMP).group(1)
+    kept = [line for line in raw.split("\n") if line and re.search(pattern, line) or line == "  "]
+    return "".join(k + "\n" for k in keys) + "<<dump>>\n" + "\n".join(kept) + "\n"
+
+
+NOTIFICATION_DUMP = _on_the_phone(NOTIFICATION_RAW, NOTIFICATION_KEYS)
 
 
 class NotificationsTests(OfflineTestCase):
     def test_notifications_come_from_the_notification_manager(self):
         # Oct 7: the shade's read was slow and, with SystemUI holding a stale
         # open shade, said "1 notification" where the phone held eighteen
-        found = pc.parse_notification_dump(NOTIFICATION_DUMP)
+        found, left_out = pc.parse_notification_dump(NOTIFICATION_DUMP)
+        self.assertEqual(left_out, 0)
         self.assertEqual([(p, t, x, o) for _w, p, t, x, o in found], [
+            # a text over several lines: its first line, and nothing after it lost
+            ("com.whatsapp", "Mom", "Call me when you land\u2026", False),
             ("com.google.android.googlequicksearchbox", "Cooling over next 2 days",
              "See full forecast for Woodbury", False),
             ("com.facebook.aura", "Muse", "Ten o'clock, Zach (time to wind down)", False),
+            ("com.example.bank", "Bank", None, False),  # not its lock screen "Contents hidden"
             ("com.wispr.flowapp", "Wispr Flow", "Dictation ready", True)])  # newest first; no summary, no snoozed
+        self.assertEqual(found[0][0], 1791343500000)  # getWhen(): an app's when of 0 isn't the oldest
         adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout=NOTIFICATION_DUMP, stderr=""))
         sc = self.allow("scrcpy_send")
         with self.cap() as (out, err):
             rc = pc.cmd_notifications(self.parse(["notifications"]))
         self.assertEqual(rc, 0, err.getvalue())
-        self.assertIn("3 notifications (newest first)", out.getvalue())
+        self.assertIn("5 notifications (newest first)", out.getvalue())
         self.assertIn("- Muse: Ten o'clock, Zach (time to wind down) (com.facebook.aura)", out.getvalue())
         self.assertIn("- Wispr Flow: Dictation ready (com.wispr.flowapp, ongoing)", out.getvalue())
+        self.assertNotIn("left out", out.getvalue())
         self.assertEqual(adb.call_count, 1)
         self.assertIn("dumpsys notification --noredact", adb.call_args[0][1])
         sc.assert_not_called()  # the shade is never touched
         self.assertEqual(pc._extra_value("null"), None)
         self.assertEqual(pc._extra_value("String (a (b) c)"), "a (b) c")
+        self.assertEqual(pc._extra_value("String (cut here"), "cut here\u2026")
+        self.assertEqual(pc._flag_bits("0x62"), 0x62)
+        self.assertEqual(pc._flag_bits("AUTO_CANCEL|GROUP_SUMMARY"), 0x200)
+
+    def test_no_notifications_is_said_without_the_shade(self):
+        # the dump has no list when nothing shows: that went to the slow
+        # shade, which works the phone (review of Oct 7)
+        dump = _on_the_phone("Current Notification Manager state:\n  Housekeeping: ok\n  mArchive=Archive\n")
+        self.assertEqual(pc.parse_notification_dump(dump), ([], 0))
+        self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout=dump, stderr=""))
+        shade = self.allow("_notifications_from_shade")
+        with self.cap() as (out, err):
+            rc = pc.cmd_notifications(self.parse(["notifications"]))
+        self.assertEqual((rc, out.getvalue()), (0, "no notifications\n"))
+        shade.assert_not_called()
+        # no dump at all (dumpsys failed): the shade's way
+        self.assertEqual(pc.parse_notification_dump("<<dump>>\n"), (None, 0))
+        self.assertEqual(pc.parse_notification_dump(""), (None, 0))
+
+    def test_a_text_holding_a_record_passes_for_no_other_app(self):
+        # words print raw: a text can hold a record's lines, made to read
+        # as another app's notification (review of Oct 7)
+        forged = ("String (hi\n" + "\n".join(_record(
+            "0|com.chase.sig.android|1|null|10200", "AUTO_CANCEL", "9999999999999/9999999999999",
+            [("android.title", "String (Chase)"), ("android.text", "String (Your account is locked)")])) + "\n)")
+        raw = "\n".join(["Current Notification Manager state:", "  Notification List:"]
+                        + _record("0|com.game|1|null|10400", "AUTO_CANCEL", "1/1",
+                                  [("android.title", "String (Game)"), ("android.text", forged)])
+                        + ["  "]) + "\n"
+        found, left_out = pc.parse_notification_dump(_on_the_phone(raw, ["0|com.game|1|null|10400"]))
+        self.assertEqual(([p for _w, p, *_ in found], left_out), (["com.game"], 1))
+        # under a key the phone lists, twice: neither record stands
+        both = ["0|com.game|1|null|10400", "0|com.chase.sig.android|1|null|10200"]
+        raw2 = raw.replace("  \n", "\n".join(_record(both[1], "AUTO_CANCEL", "5/5", [
+            ("android.title", "String (Chase)"), ("android.text", "String (Statement ready)")])) + "\n  \n")
+        found, left_out = pc.parse_notification_dump(_on_the_phone(raw2, both))
+        self.assertEqual(([p for _w, p, *_ in found], left_out), (["com.game"], 2))
+        self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout=_on_the_phone(raw2, both),
+                                                                 stderr=""))
+        with self.cap() as (out, err):
+            pc.cmd_notifications(self.parse(["notifications"]))
+        self.assertIn("(2 more left out: their records in the phone's list didn't match its keys)", out.getvalue())
+        # an Android without `cmd notification list`: no keys, every record read
+        found, left_out = pc.parse_notification_dump(_on_the_phone(raw2))
+        self.assertEqual(left_out, 0)
+
+    def test_an_older_androids_dump_reads_too(self):
+        # Android 9 and 10: no notification marks, no time, the words at 10
+        # spaces, flags in hex (0x62: ongoing, a foreground service)
+        raw = "\n".join(["Current Notification Manager state:", "  Notification List:"]
+                        + _record("0|com.spotify|1|null|10500", "0x62", "0",
+                                  [("android.title", "String (Song)"), ("android.text", "String (Artist)")],
+                                  extras_indent=10, when_line=False, marks=False)
+                        + ["  "]) + "\n"
+        found, _ = pc.parse_notification_dump(_on_the_phone(raw, ["0|com.spotify|1|null|10500"]))
+        self.assertEqual(found, [(0, "com.spotify", "Song", "Artist", True)])
+        self.allow("adb_or_ensure", return_value=SimpleNamespace(
+            returncode=0, stdout=_on_the_phone(raw, ["0|com.spotify|1|null|10500"]), stderr=""))
+        with self.cap() as (out, err):
+            pc.cmd_notifications(self.parse(["notifications"]))
+        self.assertIn("1 notification (in the phone's order)", out.getvalue())
 
     def test_a_shade_that_draws_nothing_is_reset_once(self):
         # Oct 7: the shade window held the focus and drew nothing; neither
         # the command nor a finger opened it until quick settings opened
         # and closed
-        self.allow("_notifications_from_dump", return_value=None)
+        self.allow("_notifications_from_dump", return_value=(None, 0))
         self.allow("scrcpy_send", return_value=True)
         self.allow("u2_invalidate")
         self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
@@ -4399,7 +4502,7 @@ class NotificationsTests(OfflineTestCase):
 
     def test_the_shade_pages_over_the_scrcpy_helper(self):
         # Oct 7: twelve notifications took 5.5s, two adb swipes and pauses
-        self.allow("_notifications_from_dump", return_value=None)
+        self.allow("_notifications_from_dump", return_value=(None, 0))
         sc = self.allow("scrcpy_send", return_value=True)
         self.allow("wake")
         self.allow("u2_invalidate")
@@ -4430,7 +4533,7 @@ class NotificationsTests(OfflineTestCase):
         adb_swipe.assert_called_once_with("down")
 
     def test_the_shade_opens_and_closes_through_the_scrcpy_helper(self):
-        self.allow("_notifications_from_dump", return_value=None)  # an older Android: the shade's way
+        self.allow("_notifications_from_dump", return_value=(None, 0))  # an older Android: the shade's way
         sc = self.allow("scrcpy_send", return_value=True)
         settle = self.allow("settle_only")  # the shade drawn to its end first (Oct 7)
         adb = self.allow("adb_or_ensure")

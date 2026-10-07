@@ -5122,77 +5122,135 @@ def _shade(what):
         return False
 
 
-# What `dumpsys notification --noredact` is cut to on the phone: section
-# heads, record heads, flags, times and the words (the whole dump is
-# thousands of lines of channels and preferences).
-NOTIF_DUMP = ("dumpsys notification --noredact | grep -E "
-              "'^ ?[A-Za-z]|^  [A-Za-z]|NotificationRecord\\(|^ *flags=|^ *when=|^ *android\\.(title|text|bigText)='")
+# What `burner notifications` reads on the phone, in one adb call: the
+# keys of the notifications showing (`cmd notification list`; nothing on
+# an Android without it), then `dumpsys notification --noredact` cut to
+# the lines it needs, each held to the shape AOSP prints it in
+# (NotificationRecord.dump): the dump's first line; the list's head and
+# its end (a line of two spaces); record heads (4 spaces); flags and the
+# notification/publicNotification marks (6); times (12); the words (16,
+# or 10 on Android 9 and 10). A notification's words print raw, so a
+# text that runs over several lines puts its next line anywhere: one at
+# column 0 ended the list, and every notification after it was lost
+# (review of Oct 7); a line held to these shapes isn't taken for one.
+NOTIF_DUMP = ("cmd notification list 2>/dev/null; echo '<<dump>>'; "
+              "dumpsys notification --noredact | grep -E "
+              "'^Current Notification Manager state|^  Notification List:$|^  $"
+              "|^    NotificationRecord\\(|^      flags=|^      notification=$|^      publicNotification=$"
+              "|^            when=|^( {10}| {16})android\\.(title|text|bigText)='")
+
+# A notification's flags, as bits (Notification.FLAG_*)
+_FLAG_BITS = {"ONGOING_EVENT": 0x2, "FOREGROUND_SERVICE": 0x40, "GROUP_SUMMARY": 0x200}
+_ONGOING_BITS = 0x2 | 0x40
+
+
+def _flag_bits(flags):
+    """A record's flags as dumpsys prints them, by name from Android 15
+    on ("AUTO_CANCEL|GROUP_SUMMARY"), in hex before ("0x210"), as bits
+    (those in _FLAG_BITS). Pure."""
+    flags = (flags or "").strip()
+    if re.match(r"^0x[0-9a-fA-F]+$", flags):
+        return int(flags, 16)
+    names = re.split(r"[|\s]+", flags)
+    return sum(b for name, b in _FLAG_BITS.items() if name in names)
 
 
 def _extra_value(raw):
     """A notification extra as dumpsys prints it ("String (Muse)",
-    "SpannableString (...)", "null"): its words, or None. Pure."""
+    "SpannableString (...)", "null"): its words, or None. A value whose
+    line ends before its ")" goes on over more lines, which the phone's
+    grep leaves out: its first line, marked "…". Pure."""
     raw = raw.strip()
     if raw in ("", "null"):
         return None
-    m = re.match(r"^[A-Za-z][\w.$]* \((.*)\)$", raw)
-    return (m.group(1) if m else raw).strip() or None
+    m = re.match(r"^[A-Za-z][\w.$]* \((.*)$", raw)
+    if not m:
+        return raw
+    words = m.group(1)
+    words = words[:-1] if words.endswith(")") else words.rstrip() + "\u2026"
+    return words.strip() or None
 
 
 def parse_notification_dump(text):
-    """The notifications of `dumpsys notification --noredact`, from its
-    "Notification List" section only (not the snoozed ones, nor the
-    archive): [(when_ms, pkg, title, text, ongoing)], the newest first.
-    The first title and text of a record are its own (a second pair is its
-    lock screen version); a record with neither (a group's summary) is left
-    out. Pure."""
-    out, rec, in_list = [], None, False
-
-    def flush(r):
-        if r and (r["title"] or r["text"]):
-            ongoing = any(f in r["flags"] for f in ("ONGOING_EVENT", "FOREGROUND_SERVICE"))
-            out.append((r["when"], r["pkg"], r["title"], r["text"] or r["bigText"], ongoing))
-    for line in (text or "").splitlines():
-        if re.match(r"^ {0,2}\S", line):  # a section's head
-            flush(rec)
-            rec, in_list = None, line.strip().startswith("Notification List")
-            continue
+    """What NOTIF_DUMP printed, as (found, left_out). found: [(when_ms,
+    pkg, title, text, ongoing)], the newest first, from the dump's
+    "Notification List" alone (not the queued or snoozed ones, nor the
+    archive); a group's summary is left out (its notifications are
+    listed), and so is a record with no words; the words are the
+    notification's own, never its lock screen version's. found is None
+    when the text holds no dump (dumpsys failed: the shade, then), [] when
+    the phone shows no notification (the dump has no list then). With the
+    keys of the notifications showing (the lines before "<<dump>>"), a
+    record counts only under a key listed, and listed once: words print
+    raw, and a text holding a record's lines would read as another app's
+    notification (review of Oct 7); left_out counts the records dropped
+    so. Pure."""
+    head, sep, dump = (text or "").partition("<<dump>>")
+    if not sep:
+        head, dump = "", head
+    if "Current Notification Manager state" not in dump:
+        return None, 0
+    keys = {k.strip() for k in head.splitlines() if re.match(r"^-?\d+\|\S", k.strip())}
+    recs, rec, in_list = [], None, False
+    for line in dump.splitlines():
+        line = line.rstrip("\r")
         if not in_list:
+            in_list = line == "  Notification List:"
             continue
-        s = line.strip()
-        m = re.match(r"NotificationRecord\(0x[0-9a-fA-F]+: pkg=(\S+)", s)
-        if m:
-            flush(rec)
-            rec = {"pkg": m.group(1), "title": None, "text": None, "bigText": None,
-                   "when": 0, "flags": "", "seen": set()}
+        if line == "  ":
+            break  # the list's end
+        if line.startswith("    NotificationRecord("):
+            m = re.search(r" pkg=(\S+)", line)
+            rec = {"head": line, "pkg": m.group(1) if m else "?", "flags": None, "when": 0,
+                   "public": False, "title": None, "text": None, "bigText": None, "seen": set()}
+            recs.append(rec)
             continue
         if rec is None:
             continue
-        if s.startswith("flags=") and not rec["flags"]:
-            rec["flags"] = s[len("flags="):]
-        elif s.startswith("when=") and not rec["when"]:
-            m = re.match(r"when=(\d+)", s)
-            rec["when"] = int(m.group(1)) if m else 0
+        if line.startswith("      flags="):
+            if rec["flags"] is None:
+                rec["flags"] = line[len("      flags="):]
+        elif line == "      publicNotification=":
+            rec["public"] = True  # the lock screen version follows
+        elif rec["public"] or line == "      notification=":
+            continue
+        elif line.startswith("            when="):
+            m = re.match(r"^when=(\d+)(?:/(\d+))?", line.strip())
+            if m and not rec["when"]:
+                rec["when"] = int(m.group(2) or m.group(1))  # getWhen(), from Android 15 on
         else:
-            m = re.match(r"android\.(title|text|bigText)=(.*)$", s)
+            m = re.match(r"^(?: {10}| {16})android\.(title|text|bigText)=(.*)$", line)
             if m and m.group(1) not in rec["seen"]:
                 rec["seen"].add(m.group(1))
                 rec[m.group(1)] = _extra_value(m.group(2))
-    flush(rec)
-    out.sort(key=lambda r: -r[0])
-    return out
+    count = {}
+    if keys:
+        for r in recs:
+            r["key"] = next((k for k in keys if " key=" + k + ": " in r["head"]), None)
+            count[r["key"]] = count.get(r["key"], 0) + 1
+    found, left_out = [], 0
+    for r in recs:
+        if keys and (r["key"] is None or count[r["key"]] > 1):
+            left_out += 1
+            continue
+        bits = _flag_bits(r["flags"])
+        words = r["text"] or r["bigText"]
+        if bits & _FLAG_BITS["GROUP_SUMMARY"] or not (r["title"] or words):
+            continue
+        found.append((r["when"], r["pkg"], r["title"], words, bool(bits & _ONGOING_BITS)))
+    found.sort(key=lambda r: -r[0])
+    return found, left_out
 
 
 def _notifications_from_dump():
-    """parse_notification_dump on the phone's dump, or None when it can't
-    be had or holds nothing (an older Android: the shade, then)."""
+    """parse_notification_dump on the phone's dump: (found, left_out),
+    found None when the dump can't be had (the shade, then)."""
     try:
         r = adb_or_ensure("shell", NOTIF_DUMP, timeout=20)
     except Exception as e:
         _trace("notification dump failed: {}".format(e))
-        return None
-    found = parse_notification_dump(getattr(r, "stdout", "") or "")
-    return found or None
+        return None, 0
+    return parse_notification_dump(getattr(r, "stdout", "") or "")
 
 
 def cmd_notifications(args):
@@ -5202,15 +5260,23 @@ def cmd_notifications(args):
     down, read (scrolling for more) and closed. The shade's read was slow
     and, with SystemUI holding a stale open shade, said "1 notification"
     where the phone held eighteen (Oct 7)."""
-    found = _notifications_from_dump()
-    if found:
-        print("{} notification{} (newest first)".format(len(found), "" if len(found) == 1 else "s"))
-        for _when, pkg, title, text, ongoing in found:
-            words = ": ".join(w for w in (title, text) if w)
-            words = words if len(words) <= 200 else words[:199] + "\u2026"
-            print("- {} ({}{})".format(words, pkg, ", ongoing" if ongoing else ""))
-        return 0
-    return _notifications_from_shade()
+    found, left_out = _notifications_from_dump()
+    if found is None:
+        return _notifications_from_shade()
+    if not found:
+        print("no notifications")
+    else:
+        print("{} notification{} ({})".format(
+            len(found), "" if len(found) == 1 else "s",
+            "newest first" if any(w for w, *_ in found) else "in the phone's order"))
+    for _when, pkg, title, text, ongoing in found:
+        words = ": ".join(w for w in (title, text) if w)
+        words = words if len(words) <= 200 else words[:199] + "\u2026"
+        print("- {} ({}{})".format(words, pkg, ", ongoing" if ongoing else ""))
+    if left_out:
+        print("({} more left out: {} record{} in the phone's list didn't match its keys)".format(
+            left_out, "its" if left_out == 1 else "their", "" if left_out == 1 else "s"))
+    return 0
 
 
 def _notifications_from_shade():
