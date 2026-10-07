@@ -7865,14 +7865,20 @@ def find_places(text, words, start=0, budget=TEXT_FIND_MAX):
     """The places at or after `start` in `text` with the words (any case,
     any run of spaces between them, a curly quote for a straight one),
     each with the line before it and the three after, `budget` characters
-    in all, 12 places at most (TEXT_JS's rule, for the screen's rows):
-    ([(where, its lines)], where the next place left out is, or -1). Pure."""
+    in all, 12 places at most; whole words first, inside longer words only
+    when they aren't anywhere as whole words (TEXT_JS's rule, for the
+    screen's rows): ([(where, its lines)], where the next place left out
+    is, or -1, whether the words are only inside longer ones). Pure."""
     parts = [re.escape(w).replace("'", "['\u2018\u2019\u02bc]").replace('"', '["\u201c\u201d]')
              for w in (words or "").split()]
     places, used, more = [], 0, -1
     if not parts:
-        return places, more
-    pat = re.compile(r"\s+".join(parts), re.I)
+        return places, more, False
+    body = r"\s+".join(parts)
+    pat = re.compile(r"(?<!\w)" + body + r"(?!\w)", re.I)
+    loose = not pat.search(text, start)
+    if loose:
+        pat = re.compile(body, re.I)
     pos = start
     while True:
         m = pat.search(text, pos)
@@ -7901,15 +7907,17 @@ def find_places(text, words, start=0, budget=TEXT_FIND_MAX):
         places.append((at, "\n".join(l for l in text[frm:to].split("\n") if l.strip())))
         used += to - frm
         pos = max(end, to)
-    return places, more
+    return places, more, loose
 
 
-def print_places(where, total, find, places, more, start):
+def print_places(where, total, find, places, more, start, loose=False):
     """`text --find`'s answer: the places, or why there are none (exit 1).
     Returns the exit code."""
-    print('{}, {} characters; "{}" in {} place{}{}'.format(
+    print('{}, {} characters; "{}" in {} place{}{}{}'.format(
         where, total, find, len(places), "" if len(places) == 1 else "s",
-        " after {}".format(start) if start else "") + (":" if places else ""))
+        " after {}".format(start) if start else "",
+        " (inside longer words: not anywhere as words of their own)" if loose and places else "")
+        + (":" if places else ""))
     if not places:
         print('no "{}" {}'.format(find, "in the page's text" if where.startswith("page:") else "on the screen"),
               file=sys.stderr)
@@ -7982,7 +7990,7 @@ def cmd_text(args):
                                                    _readable(page.get("url") or "")),
                             int(page.get("total") or 0), find,
                             [(p.get("at", 0), p.get("text") or "") for p in page["places"]],
-                            int(page.get("more", -1)), start)
+                            int(page.get("more", -1)), start, bool(page.get("loose")))
     if isinstance(page, dict) and isinstance(page.get("text"), str):
         # places as the page counts them (an emoji is two), from the page:
         # counting here said "cut" on a page with emoji (review, Oct 7)
@@ -8012,8 +8020,8 @@ def cmd_text(args):
     rows = screen_text(walk(root), h)
     text = _readable("\n".join(rows))
     if find:
-        places, more = find_places(text, find, start, count)
-        return print_places("screen: {}".format(pkg or "?"), len(text), find, places, more, start)
+        places, more, loose = find_places(text, find, start, count)
+        return print_places("screen: {}".format(pkg or "?"), len(text), find, places, more, start, loose)
     print("screen: {}, {} characters{}".format(pkg or "?", len(text),
                                                ", from {}".format(start) if start else ""))
     part = text[start:start + count]

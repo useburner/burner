@@ -1363,9 +1363,15 @@ TEXT_JS = r"""
     const q1 = '[\'' + String.fromCharCode(0x2018, 0x2019, 0x2bc) + ']', q2 = '["' + String.fromCharCode(0x201c, 0x201d) + ']';
     const pat = find.trim().split(/\s+/).map(w => esc(w).replace(/'/g, q1).replace(/"/g, q2)).join('\\s+');
     const places = [];
-    let more = -1;
+    let more = -1, loose = false;
     if (pat) {
-      const re = new RegExp(pat, 'gi');
+      // whole words first ("ETH" is not in "Ethereum": coinmarketcap's rows
+      // read "2 ETH $2,581.91" at phone width, Oct 7); inside longer words
+      // only when they aren't anywhere as whole words
+      const W = '[\\p{L}\\p{N}_]';
+      let re = new RegExp('(?<!' + W + ')' + pat + '(?!' + W + ')', 'giu');
+      re.lastIndex = a;
+      if (!re.test(text)) { re = new RegExp(pat, 'giu'); loose = true; }
       re.lastIndex = a;
       let used = 0, m;
       while ((m = re.exec(text))) {
@@ -1395,7 +1401,8 @@ TEXT_JS = r"""
         re.lastIndex = Math.max(re.lastIndex, to);
       }
     }
-    return {title: document.title, url: location.href, total: text.length, start: a, places: places, more: more};
+    return {title: document.title, url: location.href, total: text.length, start: a, places: places, more: more,
+            loose: loose};
   }
   let b = Math.min(text.length, a + Math.max(1, count));
   if (inside(a)) a--;
@@ -2123,7 +2130,8 @@ def page_text(page, start=0, count=20000, find=""):
     places at or after `start` with those words instead, each with the
     lines around it, `count` characters in all: {"title", "url", "total",
     "start", "places": [{"at", "text"}], "more": where the next place
-    left out is, or -1}."""
+    left out is, or -1, "loose": the words were found only inside longer
+    words}."""
     return page.eval(_js(TEXT_JS, int(start), int(count), find or ""), timeout=10.0) or {}
 
 

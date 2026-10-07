@@ -7355,15 +7355,22 @@ class WebPathTests(OfflineTestCase):
         self.assertIn('no "Dogecorn" in the page\'s text', err.getvalue())
         # the screen's rows (a native app): the same rule
         text = "Wi-Fi\nConnected\nBluetooth\nOn\nBattery\n48%\nScreen\nDark"
-        places, more = pc.find_places(text, "battery")
-        self.assertEqual((places, more), ([(text.index("Battery"), "On\nBattery\n48%\nScreen\nDark")], -1))
+        places, more, loose = pc.find_places(text, "battery")
+        self.assertEqual((places, more, loose), ([(text.index("Battery"), "On\nBattery\n48%\nScreen\nDark")], -1, False))
+        # whole words first: "ETH" is not in "Ethereum" (coinmarketcap's rows read "2 ETH $2,581.91")
+        cmc = "Ethereum ETFs\nSolana ETFs\nx\ny\nz\n2\nETH\n$2,581.91\n4.91%"
+        places, more, loose = pc.find_places(cmc, "eth")
+        self.assertEqual(([p[0] for p in places], loose), ([cmc.index("\nETH") + 1], False))
+        # inside longer words only when they are nowhere as words of their own
+        places, more, loose = pc.find_places("Baking time\n25 min", "bak")
+        self.assertEqual((len(places), loose), (1, True))
         # two places, the second inside the first one's lines: one place
         self.assertEqual(len(pc.find_places("a\nBattery\nb\nBattery saver\nc\nd\ne", "battery")[0]), 1)
         # a curly quote for a straight one, any run of spaces
         self.assertEqual(pc.find_places("Don" + chr(0x2019) + "t   allow", "don't allow")[0][0][0], 0)
-        self.assertEqual(pc.find_places(text, "battery", start=len(text)), ([], -1))
+        self.assertEqual(pc.find_places(text, "battery", start=len(text))[:2], ([], -1))
         many = "\n".join("row %d Battery" % i for i in range(100))
-        places, more = pc.find_places(many, "battery", budget=100)
+        places, more, _ = pc.find_places(many, "battery", budget=100)
         self.assertEqual((len(places) < 12, more > 0), (True, True))
         self.assertEqual(pc.find_places(many, "battery", budget=10 ** 6)[1], many.index("row 48 ") + 7)  # 12 at most (one each 4 rows)
 
