@@ -3382,7 +3382,7 @@ class LaunchReadBudgetTests(OfflineTestCase):
             rc = pc.cmd_open(self.parse(["open", "https://example.com"]))
         self.assertEqual(rc, 0)
         self.assertEqual((calls[1][0], calls[1][1].split()[0]), ("dump", "page"))  # the page asked first (an older helper's reply: not a page)
-        self.assertEqual(calls[2], ("act", '{"idle": 1000}'))
+        self.assertEqual(calls[2], ("act", '{"wake": true, "idle": 1000}'))  # the screen woken first
         self.assertEqual(dump.call_count, 1)  # one re-read of a thin screen
         self.assertIn("(may still be loading)", out.getvalue())
 
@@ -3639,7 +3639,7 @@ class OneRoundTripTests(OfflineTestCase):
             rc = pc.cmd_open(self.parse(["open", "https://example.com"]))
         self.assertEqual(rc, 0)
         self.assertEqual(calls, [("act", {"open": "https://example.com", "idle": 1000}),
-                                 ("act", {"idle": 1000})])
+                                 ("act", {"wake": True, "idle": 1000})])
         self.assertIn("screen: com.example", out.getvalue())
 
     def test_helper_batch_results_and_act_calls(self):
@@ -4057,15 +4057,18 @@ class StartAndSettingsTests(OfflineTestCase):
         adb = self.allow("adb_or_ensure")
         self.allow("u2_invalidate")
         self.allow("nav_record")
-        calls = []
+        calls, specs = [], []
         self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30:
-                   calls.append(cmd) or SAMPLE_XML)
+                   calls.append(cmd) or specs.append(json.loads(arg)) or SAMPLE_XML)
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_start(self.parse(["start", "com.example"]))
         self.assertEqual(rc, 0)
         sc.assert_called_once_with("startapp com.example")  # no "+": a force-stop would kill a download
         adb.assert_not_called()
         self.assertEqual(calls, ["act"])
+        # the read wakes the screen first, in the same trip (an app started
+        # with the screen off read as the bars alone, Oct 7)
+        self.assertEqual(specs, [{"wake": True, "idle": pc.IDLE_LAUNCH_MS}])
         self.assertIn("launched com.example", out.getvalue())
         self.assertIn("screen: com.example", out.getvalue())
 
@@ -6072,9 +6075,13 @@ class EmptyScreenTests(OfflineTestCase):
             self.assertTrue(mod.sleeps_the_screen({"key": key}))
         self.assertFalse(mod.sleeps_the_screen({"key": 4}))
         self.assertFalse(mod.sleeps_the_screen({"tap": [1, 2]}))
-        # a bare read wakes nothing
+        # a bare read wakes nothing (it may follow a POWER sent another
+        # way); the read after a launch wakes the screen first
         self.assertEqual([m for m, _ in mod.act_calls({})],
                          ["waitForIdle", "dumpWindowHierarchy"])
+        self.assertEqual([m for m, _ in mod.act_calls({"wake": True, "idle": 1500})],
+                         ["wakeUp", "waitForIdle", "dumpWindowHierarchy"])
+        self.assertEqual(mod.act_calls({"wake": True, "tap": [1, 2]})[:2], [("wakeUp", []), ("click", [1, 2])])
         # every read asks for a depth: a null one reads as 0 on the phone
         # (two bare window nodes, Oct 4)
         for spec in ({}, {"tap": [1, 2]}):

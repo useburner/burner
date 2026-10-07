@@ -1326,7 +1326,8 @@ def act_calls(spec):
     screen is dropped (a phone off its charger turns its screen off after
     10s), and wakeUp is a no-op with the screen on and sleeps 500ms only
     when it woke the phone. Not before POWER or SLEEP, whose job is the
-    opposite. Pure."""
+    opposite. A read with no action wakes nothing (it may follow a POWER
+    sent another way), unless it is the read after a launch (`wake`). Pure."""
     calls = []
     if "tap_selector" in spec:
         # how many controls carry the words now (the check after the tap),
@@ -1356,6 +1357,12 @@ def act_calls(spec):
             # answers it (the click waits for the first event it causes),
             # so no read stands in for the pause there
             calls.append(("dumpWindowHierarchy", [False, DUMP_DEPTH]))
+    elif spec.get("wake"):
+        # the read after a launch: an app started with the screen off read
+        # as the system UI's bars alone, and the look at the screen, the
+        # wake and the read again came after (about 2s of the Calculator's
+        # 3.7s start, Oct 7)
+        calls.append(("wakeUp", []))
     calls.append(("waitForIdle", [int(spec.get("idle", 2000))]))
     # the read that is returned; a chained (quiet) step takes it too, on
     # the phone's time alone, as the newest read known: its next step

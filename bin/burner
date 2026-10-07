@@ -3693,7 +3693,9 @@ def launch_read(quiet, expect=None):
     t0 = time.monotonic()
     attempt, installed = 0, None
     while True:
-        status, root, note = act_and_read({}, idle_ms=IDLE_LAUNCH_MS, rereads=1)
+        # the screen woken first, in the same trip: an app started with the
+        # screen off read as the system UI's bars alone (the Calculator, Oct 7)
+        status, root, note = act_and_read({"wake": True}, idle_ms=IDLE_LAUNCH_MS, rereads=1)
         if status == "unsent":
             root, note = read_after_root(idle_ms=IDLE_LAUNCH_MS, rereads=1)
             if root is None:
