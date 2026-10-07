@@ -1402,7 +1402,14 @@ class AmbiguousTapTests(OfflineTestCase):
                                  ("Echo Dot", "Echo Dot (5th Gen) | Smart speaker with Alexa | Charcoal", True),
                                  ("lofi hip hop radio", "lofi hip hop radio \U0001f4da beats to relax/study to - Lofi Girl", True),
                                  ("Wi-Fi", "Wi\u2011Fi, connected", True),
-                                 ("Turn on", "Turn on now", True)):
+                                 ("Turn on", "Turn on now", True),
+                                 # the review of Oct 7
+                                 ("Turn off", "Don\u2019t turn off", False),
+                                 ("turn off notifications", "Don't turn off notifications", False),
+                                 ("Add", "Add-ons", False),
+                                 ("Next", "Next >", True),
+                                 ("Continue", "Continue \u2192", True),
+                                 ("Starred", "\u2605 Starred", True)):
             self.assertEqual(pc.fuzzy_ok(query, label), ok, (query, label))
             self.assertEqual(_u2mux().fuzzy_ok(query, label), ok, (query, label))
         voice = ('<hierarchy rotation="0"><node text="" class="android.widget.FrameLayout" bounds="[0,0][1080,2400]" '
@@ -1423,6 +1430,32 @@ class AmbiguousTapTests(OfflineTestCase):
         self.assertEqual([n["desc"] for n in pc.rows_named(nodes, "Nope || Search with your voice")],
                          ["Search with your voice"])
         self.assertEqual([n["text"] for n in pc.rows_named(nodes, "lofi hip hop radio")], ["lofi hip hop radio"])
+        # a text field is taken loosely: a tap only focuses it (`type --field
+        # Email` on "Email or phone" failed once taps matched strictly,
+        # review of Oct 7)
+        mod = _u2mux()
+        email = voice.replace('text="lofi hip hop radio"', 'text="Email or phone"')
+        plan = pc.plan_tap(pc.walk(ET.fromstring(email)), 1080, 2400, text="Email")
+        self.assertEqual((plan["action"], plan["node"]["text"]), ("tap", "Email or phone"))
+        self.assertEqual(mod.find_node(email, "Email", names=True)["text"], "Email or phone")
+        self.assertEqual(mod.field_node(email, "Email")["text"], "Email or phone")
+        self.assertIsNone(mod.field_node(email, "mail"))  # whole words
+        two = email.replace('</node></hierarchy>', '<node text="Email again" class="android.widget.EditText" '
+                            'bounds="[150,400][850,520]" clickable="true" enabled="true"/></node></hierarchy>')
+        self.assertIsNone(mod.field_node(two, "Email"))  # two fields hold it
+        # rows named once each, in full; the advice quoted for the shell
+        twice = voice.replace('</node></hierarchy>', '<node text="Search with your voice" '
+                              'class="android.widget.TextView" bounds="[890,160][990,260]" clickable="false" '
+                              'enabled="true"/></node></hierarchy>')
+        self.assertEqual(pc.plan_tap(pc.walk(ET.fromstring(twice)), 1080, 2400, text="Search")["near"],
+                         ["Search with your voice"])
+        long_row = "Search " + "word " * 40
+        longer = voice.replace("Search with your voice", long_row.strip())
+        rc, out, err, tc = self._tap(["tap", "Search"], xml=longer)
+        self.assertIn(long_row.strip()[:pc.LABEL_MAX - 1] + "\u2026", err)
+        self.assertEqual(pc._shell_words("Search"), '"Search"')
+        self.assertEqual(pc._shell_words('Say "hi"'), "'Say \"hi\"'")
+        self.assertEqual(pc._shell_words("$4.99"), "'$4.99'")
         tc.assert_not_called()
         # --fuzzy asks for the loose match: taken
         rc, out, err, tc = self._tap(["tap", "--fuzzy", "Search"], xml=voice)
@@ -3685,7 +3718,8 @@ class OneRoundTripTests(OfflineTestCase):
                           err.getvalue())
             self.assertIn("nothing was pressed", err.getvalue())
             self.assertIn("`--force` sends the key anyway", err.getvalue())
-            self.assertEqual([c for c, _ in calls], ["dump"], key)  # the helper's newest read; no key sent
+            # the helper's newest read, then the screen reader's now; no key sent
+            self.assertEqual(calls, [("dump", "cached"), ("dump", "native")], key)
         sc.assert_not_called()
         adb.assert_not_called()
         # a text field with the focus: the key goes, in one round trip
@@ -3725,12 +3759,14 @@ class OneRoundTripTests(OfflineTestCase):
             rc = pc.cmd_press(self.parse(["press", "enter"]))
         self.assertEqual((rc, [c for c, _ in calls]), (1, ["dump", "dump"]))
         native[0] = page  # an older helper answers with the page again: can't tell, the key goes
+        self.allow("ui_dump", return_value=ET.fromstring(page))
         with self.cap() as (out, err):
             self.assertEqual(pc.cmd_press(self.parse(["press", "enter"])), 0)
+        self.assertEqual(err.getvalue(), "")
         # the screen can't be read: the key goes, and a line says why
         self.allow("_cached_root", return_value=None)
         self.allow("ui_dump", side_effect=RuntimeError("the phone is unreachable"))
-        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30: SAMPLE_XML)
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30: None if cmd == "dump" else SAMPLE_XML)
         with self.cap() as (out, err):
             self.assertEqual(pc.cmd_press(self.parse(["press", "enter"])), 0)
         self.assertIn("couldn't be read to look for a text field (the phone is unreachable); the key goes",

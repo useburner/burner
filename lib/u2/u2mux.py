@@ -1445,8 +1445,11 @@ def lone_focused_field(xml, label):
     except Exception:
         return None
     alts = [plain_words(p).lower() for p in label.split("||") if p.strip()]
+    # a keyboard's key reading the label ("Search") is no row of the screen
+    # that still carries it (review of Oct 7)
     if any(a in (plain_words(n["text"]).lower(), plain_words(n["desc"]).lower())
-           for n in nodes for a in alts):
+           for n in nodes for a in alts
+           if n["pkg"] != SYSTEM_UI and not any(k in n["pkg"] for k in U2Daemon.IME_HINTS)):
         return None
     fields = [n for n in nodes if n["field"]]
     return fields[0] if len(fields) == 1 and fields[0]["focused"] else None
@@ -1481,11 +1484,29 @@ def hint_field(xml, label):
     return field
 
 
+def loose_field(xml, label):
+    """The one text field whose words hold `label`'s as whole words (an
+    empty field reads its hint: "Email or phone" for `Email`), whole on
+    the screen; None when none or several do. A field only takes the
+    focus when tapped, so a loose match is safe here where a button's
+    isn't (`type --field Email` failed on "Email or phone" once taps
+    matched strictly, review of Oct 7). Pure."""
+    try:
+        nodes = list(iter_nodes(xml or ""))
+    except Exception:
+        return None
+    alts = [plain_words(p).lower() for p in label.split("||") if p.strip()]
+    pats = [re.compile(r"(?<![\w-])" + re.escape(a) + r"(?![\w-])") for a in alts]
+    hits = [n for n in nodes if n["field"] and not cut_off(n) and any(
+        p.search(plain_words(s).lower()) for p in pats for s in (n["text"], n["desc"]) if s)]
+    return hits[0] if len(hits) == 1 else None
+
+
 def field_node(xml, label):
     """The text field with this label on a read (see label_node: once,
     whole, nothing over it), or the one whose hint reads it (see
-    hint_field); None otherwise (no such row, several, or a row that is
-    neither). Pure."""
+    hint_field), or the one field whose words hold it (see loose_field);
+    None otherwise. Pure."""
     if not xml:
         return None
     try:
@@ -1494,7 +1515,7 @@ def field_node(xml, label):
         node = None
     if node is not None and node.get("field"):
         return node
-    return hint_field(xml, label)
+    return hint_field(xml, label) or loose_field(xml, label)
 SLEEP_KEYS = (26, 223, 276)  # POWER, SLEEP, SOFT_SLEEP
 
 
@@ -2967,22 +2988,34 @@ def bar_icon(node, h):
 # "Search", pressed "Search with your voice", and Android asked to record
 # audio (Oct 7); "Delete" inside "Delete account" would be worse.
 NOTE_MARKS = ",:;([|-\u2013\u2014\u00b7\u2022/"  # what starts a note after a row's name
+# A row that says the opposite of a tap's words ("Don't turn off" for `Turn
+# off`, review of Oct 7) is never named by them.
+NEGATIONS = ("don't", "dont", "not", "never", "no", "stop", "cancel", "undo", "without")
 
 
 def fuzzy_ok(query, label):
     """Whether `label`, a row's words that contain `query` without being
     it, may stand for it in a tap: the words are whole words of the row
-    and a phrase of three words or more, more than half of the row's
-    words, or the row's head with a note after it ("Inbox, 3 unread",
-    "Echo Dot (5th Gen) | Smart speaker"). Pure."""
+    (a hyphen joins a word: "Add" is not "Add-ons"), not right after a
+    negation ("Don't turn off"), and a phrase of three words or more,
+    more than half of the row's words, or the row's head with a note
+    after it ("Inbox, 3 unread", "Echo Dot (5th Gen) | Smart speaker",
+    "Next >"); a symbol before the head is no word ("\u2605 Starred"). Pure."""
     q, row = plain_words(query).lower(), plain_words(label).lower()
-    if not q or not re.search(r"(?<!\w)" + re.escape(q) + r"(?!\w)", row):
+    m = re.search(r"(?<![\w-])" + re.escape(q) + r"(?![\w-])", row) if q else None
+    if not m:
+        return False
+    before = row[:m.start()].split()
+    if before and before[-1] in NEGATIONS:
         return False
     words, row_words = len(q.split()), len(row.split())
     if words >= 3 or 2 * words > row_words:
         return True
-    rest = row[len(q):].lstrip() if row.startswith(q) else ""
-    return rest[:1] != "" and rest[0] in NOTE_MARKS
+    head = re.sub(r"^[^\w]+", "", row)
+    if not head.startswith(q):
+        return False
+    rest = head[len(q):].strip()
+    return rest == "" or rest[0] in NOTE_MARKS or not any(ch.isalnum() for ch in rest)
 
 
 def find_node(xml, needle, fuzzy=True, names=False):
@@ -3002,8 +3035,8 @@ def find_node(xml, needle, fuzzy=True, names=False):
                 return n
             if (fuzzy and first_sub is None and any(nl in l for l in labels)
                     and not bar_icon(n, h)
-                    and (not names or any(fuzzy_ok(nl, l) for l in labels if nl in l))):
-                first_sub = n
+                    and (not names or n["field"] or any(fuzzy_ok(nl, l) for l in labels if nl in l))):
+                first_sub = n  # a field only takes the focus: loosely, as before (review of Oct 7)
         if first_sub is not None:
             return first_sub
     return None

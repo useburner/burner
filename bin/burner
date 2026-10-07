@@ -1090,22 +1090,47 @@ def _screen_height(nodes):
 # "Search", pressed "Search with your voice", and Android asked to record
 # audio (Oct 7); "Delete" inside "Delete account" would be worse.
 NOTE_MARKS = ",:;([|-\u2013\u2014\u00b7\u2022/"  # what starts a note after a row's name
+# A row that says the opposite of a tap's words ("Don't turn off" for `Turn
+# off`, review of Oct 7) is never named by them.
+NEGATIONS = ("don't", "dont", "not", "never", "no", "stop", "cancel", "undo", "without")
 
 
 def fuzzy_ok(query, label):
     """Whether `label`, a row's words that contain `query` without being
     it, may stand for it in a tap: the words are whole words of the row
-    and a phrase of three words or more, more than half of the row's
-    words, or the row's head with a note after it ("Inbox, 3 unread",
-    "Echo Dot (5th Gen) | Smart speaker"). Pure."""
+    (a hyphen joins a word: "Add" is not "Add-ons"), not right after a
+    negation ("Don't turn off"), and a phrase of three words or more,
+    more than half of the row's words, or the row's head with a note
+    after it ("Inbox, 3 unread", "Echo Dot (5th Gen) | Smart speaker",
+    "Next >"); a symbol before the head is no word ("\u2605 Starred"). Pure."""
     q, row = plain_words(query).lower(), plain_words(label).lower()
-    if not q or not re.search(r"(?<!\w)" + re.escape(q) + r"(?!\w)", row):
+    m = re.search(r"(?<![\w-])" + re.escape(q) + r"(?![\w-])", row) if q else None
+    if not m:
+        return False
+    before = row[:m.start()].split()
+    if before and before[-1] in NEGATIONS:
         return False
     words, row_words = len(q.split()), len(row.split())
     if words >= 3 or 2 * words > row_words:
         return True
-    rest = row[len(q):].lstrip() if row.startswith(q) else ""
-    return rest[:1] != "" and rest[0] in NOTE_MARKS
+    head = re.sub(r"^[^\w]+", "", row)
+    if not head.startswith(q):
+        return False
+    rest = head[len(q):].strip()
+    return rest == "" or rest[0] in NOTE_MARKS or not any(ch.isalnum() for ch in rest)
+
+
+def _is_text_field(n):
+    """Whether a walk() node is a text field. Pure."""
+    return "EditText" in (n.get("class") or "")
+
+
+def loosely_named(sel, n):
+    """Whether the words `sel`, held by row `n` without being its words,
+    stand for it: a row they name (see fuzzy_ok), or a text field, which
+    a tap only focuses (`type --field Email` on "Email or phone" failed
+    once taps matched strictly, review of Oct 7). Pure."""
+    return _is_text_field(n) or fuzzy_ok(sel, n["text"] or n["desc"] or "")
 
 
 def rows_named(nodes, text):
@@ -1120,8 +1145,7 @@ def rows_named(nodes, text):
         if hits:
             return hits
     for sel in sels:
-        hits = [n for n in find_nodes(nodes, sel, exact=False)
-                if fuzzy_ok(sel, n["text"] or n["desc"] or "")]
+        hits = [n for n in find_nodes(nodes, sel, exact=False) if loosely_named(sel, n)]
         if hits:
             return hits
     return []
@@ -2245,6 +2269,14 @@ def _tap_fail(args, msg, evidence=True):
     return 1
 
 
+def _shell_words(s):
+    """`s` as one shell word, in double quotes when they keep it whole
+    (as the advice has always read), else in single quotes. Pure."""
+    if not any(ch in s for ch in '"$`\\!'):
+        return '"{}"'.format(s)
+    return shlex.quote(s)
+
+
 def _tap_ok(args, label, xy, via=None):
     """Report a successful tap. xy is (x, y) or None for on-device daemon taps."""
     if as_json(args):
@@ -2505,11 +2537,13 @@ def plan_tap(nodes, w, h, text=None, xy=None, fuzzy=False, index=None,
         # title); rows that merely contain them are named, not tapped
         for sel in selectors:
             loose = find_nodes(nodes, sel, exact=False)
-            hits = [n for n in loose if fuzzy_ok(sel, n["text"] or n["desc"] or "")]
+            hits = [n for n in loose if loosely_named(sel, n)]
             if hits:
                 used, fuzzy_used = sel, True
                 break
-            near += [w for w in (_row_words(n) for n in loose) if w and w not in near]
+            for w in (_row_words(n) for n in loose):
+                if w and w not in near:  # one control drawn twice is named once
+                    near.append(w)
     if not hits:
         return {"action": "nomatch", "near": near[:3]}
     controls = dedupe_same_control(hits)
@@ -2728,12 +2762,15 @@ def cmd_tap(args):
         # Oct 6); rows with the words in a longer label are named, since
         # one of them may be meant (see fuzzy_ok)
         if plan.get("near"):
+            # each in full, as the screen prints it: cut mid-word, the
+            # words tapped failed again (review of Oct 7)
+            shown = ", ".join('"{}"'.format(w if len(w) <= LABEL_MAX else w[:LABEL_MAX - 1] + "\u2026")
+                              for w in plan["near"])
             return _tap_fail(args, 'no row reads "{0}"; rows with those words: {1}. If one of these is '
-                                   'the row you mean, tap it by its full words; `burner scroll down --to "{0}"` '
-                                   'looks further down'.format(
-                                       args.text, ", ".join('"{}"'.format(w[:60]) for w in plan["near"])))
-        return _tap_fail(args, 'no match for "{0}" on the screen; `burner scroll down --to "{0}"` '
-                               'looks further down'.format(args.text))
+                                   'the row you mean, tap it by its full words; `burner scroll down --to {2}` '
+                                   'looks further down'.format(args.text, shown, _shell_words(args.text)))
+        return _tap_fail(args, 'no match for "{0}" on the screen; `burner scroll down --to {1}` '
+                               'looks further down'.format(args.text, _shell_words(args.text)))
     if plan["action"] == "ambiguous":
         return _tap_ambiguous(args, plan["used"], plan["hits"], plan["fuzzy"])
     if plan["action"] == "nobounds":
@@ -3444,7 +3481,8 @@ def enter_target(nodes):
     for n in nodes:
         if is_ime_package(n.get("package")):
             return True
-        if n.get("focused") and (n.get("class") or "").endswith("EditText"):
+        cls = n.get("class") or ""
+        if n.get("focused") and ("EditText" in cls or "AutoComplete" in cls):
             return True
     return False
 
@@ -3464,23 +3502,23 @@ def _native_root():
 
 
 def _enter_has_a_field():
-    """enter_target on the helper's newest read, else on a read now. A
-    page's read in Chrome holds neither the keyboard nor Chrome's own
-    address bar: when it shows no focused field, the screen reader's read
-    decides (Enter after typing into the address bar was refused, review
-    of Oct 7), and with none to be had the key goes. When the screen
-    can't be read at all the key goes too, and a line says the check
-    couldn't be made."""
+    """enter_target on the helper's newest read when it shows a field;
+    else the screen reader's read now decides, so nothing is refused on
+    a read that may be older than the field's focus or a page's (which
+    holds neither the keyboard nor Chrome's address bar: Enter after
+    typing into the address bar was refused, review of Oct 7). With an
+    older helper (no such read), a read the usual way, and a page's read
+    lets the key go. When the screen can't be read at all the key goes
+    too, and a line says the check couldn't be made."""
     try:
         root = _cached_root()
-        if root is None:
-            root = ui_dump()
-        if enter_target(walk(root)):
+        if root is not None and enter_target(walk(root)):
             return True
-        if root.get("page"):
-            native = _native_root()
-            return native is None or enter_target(walk(native))
-        return False
+        native = _native_root()
+        if native is not None:
+            return enter_target(walk(native))
+        root = ui_dump()
+        return enter_target(walk(root)) or bool(root.get("page"))
     except Exception as e:
         print("burner: the screen couldn't be read to look for a text field ({}); the key goes"
               .format(" ".join(str(e).split())[:80]), file=sys.stderr)
