@@ -6402,9 +6402,18 @@ class WebPathTests(OfflineTestCase):
         dm._act_batch = lambda spec: sent.append(spec) or bar.encode()
         dm._last_xml, dm._last_xml_t = bar, mod._time.monotonic()
         dm._dump = lambda fresh=False, **kw: bar
+        reads = []
+        dm._dump = lambda fresh=False, **kw: reads.append(fresh) or bar
         dm.cmd_act(json.dumps({"set_text": "espn", "field": "Search or ask Play", "idle": 1200}))
         self.assertEqual((sent[0]["tap_first"], sent[0]["field_selector"], sent[0]["opens_box"]),
                          ([525, 505], mod.focused_field_selector(), "Search or ask Play"))
+        self.assertEqual(reads, [True])  # in its place on both reads: no second look
+        # moved since the assistant's read: the second look first
+        sent.clear()
+        reads.clear()
+        dm._last_xml, dm._last_xml_t = bar.replace("[150,470][900,540]", "[150,670][900,740]"), mod._time.monotonic()
+        dm.cmd_act(json.dumps({"set_text": "espn", "field": "Search or ask Play", "idle": 1200}))
+        self.assertEqual((reads, sent[0]["tap_first"]), ([True, True], [525, 505]))
         # a secret's label, a row that takes no tap, a field with the focus: the CLI's way
         self.assertIsNone(dm._bar_named(bar.replace("Search or ask Play", "Password"), "Password"))
         self.assertIsNone(dm._bar_named(bar.replace('clickable="true"><node', 'clickable="false"><node'),

@@ -2954,6 +2954,7 @@ class U2Daemon:
         spec = dict(spec)
         label = spec.pop("field")
         young = self._last_xml and _time.monotonic() - self._last_xml_t < BY_WORDS_S
+        last = self._last_xml if young else ""  # the assistant's read
         before = field_node(self._last_xml, label) if young else None
         if before is not None and before["focused"] and before.get("rid"):
             # its resource id pins it: a field that lost the focus since is
@@ -2971,6 +2972,13 @@ class U2Daemon:
         now = field_node(xml, label)
         if now is not None and now["focused"]:
             return self._type_at_once(spec, now)
+        if now is None and last:
+            # a bar that opens its box, in the same place on the assistant's
+            # read and this one: still, so tapped and typed now (the second
+            # look below cost about 1s, Oct 7)
+            bar, was = self._bar_named(xml, label), self._bar_named(last, label)
+            if bar is not None and was is not None and bar["center"] == was["center"]:
+                return self._tap_bar_and_type(spec, bar, label)
         if now is None or before is None or now["center"] != before["center"]:
             # one more look a moment later: a box a tap opens can come after
             # the reads (Settings' search: the tap's read showed the page
@@ -3015,15 +3023,18 @@ class U2Daemon:
             return self._type_at_once(spec, lone)
         bar = self._bar_named(xml, label) if now is None else None
         if bar is not None:
-            # a bar that opens its box when tapped (the Play Store's "Search
-            # or ask Play"): tapped, and the text into the field with the
-            # focus then, in one batch (the CLI's tap, read and typing took
-            # 5.9s, Oct 7)
-            spec["tap_first"] = list(bar["center"])
-            spec["field_selector"] = focused_field_selector()
-            spec["opens_box"] = label
-            return self._act_batch(spec)
+            return self._tap_bar_and_type(spec, bar, label)
         raise RuntimeError(self.NO_FIELD_TAP)
+
+    def _tap_bar_and_type(self, spec, bar, label):
+        """A bar that opens its box when tapped (the Play Store's "Search
+        or ask Play"): tapped, and the text into the field with the focus
+        then, in one batch (the CLI's tap, read and typing took 5.9s,
+        Oct 7). See _bar_named."""
+        spec["tap_first"] = list(bar["center"])
+        spec["field_selector"] = focused_field_selector()
+        spec["opens_box"] = label
+        return self._act_batch(spec)
 
     @staticmethod
     def _bar_named(xml, label):
