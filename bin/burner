@@ -5149,10 +5149,13 @@ def cmd_settings(args):
             print("settings app needs a package, e.g. burner settings app com.tinder",
                   file=sys.stderr)
             return 1
-        script = "am start -a android.settings.APPLICATION_DETAILS_SETTINGS -d {}".format(
+        script = "am start --activity-clear-top -a android.settings.APPLICATION_DETAILS_SETTINGS -d {}".format(
             _sh_quote("package:" + args.package))
     elif page in SETTINGS_PAGES:
-        script = "am start -a {}".format(_sh_quote(SETTINGS_PAGES[page]))
+        # --activity-clear-top: the page asked for, not the one Settings was
+        # left on (`settings home` showed the Storage page from before: the
+        # launch only brought the old task forward, Oct 7)
+        script = "am start --activity-clear-top -a {}".format(_sh_quote(SETTINGS_PAGES[page]))
     else:
         print("no settings page called {!r}. Pages: {}, app <package>".format(
             page, ", ".join(sorted(SETTINGS_PAGES))), file=sys.stderr)

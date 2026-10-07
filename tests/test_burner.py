@@ -4393,7 +4393,8 @@ class StartAndSettingsTests(OfflineTestCase):
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_settings(self.parse(["settings", "bluetooth"]))
         self.assertEqual(rc, 0)
-        self.assertIn("am start -a 'android.settings.BLUETOOTH_SETTINGS'", adb.call_args[0][1])
+        # the page asked for, not the one Settings was left on (Oct 7)
+        self.assertIn("am start --activity-clear-top -a 'android.settings.BLUETOOTH_SETTINGS'", adb.call_args[0][1])
         self.assertIn("opened settings: bluetooth", out.getvalue())
         self.assertIn("screen: com.example", out.getvalue())
 
