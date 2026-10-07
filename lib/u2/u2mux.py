@@ -2450,6 +2450,11 @@ class U2Daemon:
                 except Exception as e:
                     self._web = None
                     raise RuntimeError("act failed after sending: %s" % err_text(e, 120))
+                # how far, by what, and whether the page is held (a pop-up
+                # over it): the ten scrolls for nothing on allrecipes.com
+                # left no word why (Oct 7)
+                log("web scroll: moved %s px (%s)%s" % (r.get("moved"), r.get("scroller") or "nothing",
+                                                         ", the page held" if r.get("held") else ""))
                 xml = self._after_page(r["screen"])
                 self._remember(xml)
             return xml.encode()

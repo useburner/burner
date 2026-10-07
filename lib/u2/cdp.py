@@ -972,8 +972,14 @@ SCROLL_JS = r"""
     else (isWin ? window : el).scrollBy(0, dy);
     return at() - before;
   };
+  // taller than the screen, but its html or body won't scroll for a
+  // finger: a pop-up or a menu holds the page (a script's scroll still
+  // moves it, as here: said, not refused)
+  const de = document.documentElement, body = document.body;
+  const held = Math.max(de.scrollHeight, body ? body.scrollHeight : 0) > innerHeight + 2
+    && [de, body].some(e => e && getComputedStyle(e).overflowY === 'hidden');
   let moved = go(window, true);
-  if (moved !== 0) return {moved: moved, scroller: 'page'};
+  if (moved !== 0) return {moved: moved, scroller: 'page', held: held};
   let best = null, bestH = 0;
   for (const el of document.querySelectorAll('div,main,section,article,ul,body')) {
     if (el.scrollHeight <= el.clientHeight + 1 || el.clientHeight < innerHeight / 3) continue;
@@ -981,9 +987,9 @@ SCROLL_JS = r"""
     if (oy !== 'auto' && oy !== 'scroll') continue;
     if (el.clientHeight > bestH) { best = el; bestH = el.clientHeight; }
   }
-  if (!best) return {moved: 0, scroller: null};
+  if (!best) return {moved: 0, scroller: null, held: held};
   moved = go(best, false);
-  return {moved: moved, scroller: best.tagName.toLowerCase()};
+  return {moved: moved, scroller: best.tagName.toLowerCase(), held: held};
 })"""
 
 
@@ -1127,8 +1133,12 @@ def page_xml(screen, top, screen_h=0, pkg="com.android.chrome"):
                            "[0,%d][%d,%d]" % (top + H, W, int(screen_h)),
                            "com.android.systemui"))
     # page="1": a page's read, not the screen reader's (it holds neither
-    # the keyboard nor Chrome's own views, such as its address bar's focus)
-    return ('<?xml version="1.0" encoding="UTF-8"?>\n<hierarchy rotation="0" page="1">\n'
+    # the keyboard nor Chrome's own views, such as its address bar's focus);
+    # after a scroll, how far the page moved and whether something holds it
+    extra = ""
+    if "moved" in screen:
+        extra = ' moved="%d"' % int(screen.get("moved") or 0) + (' held="1"' if screen.get("held") else "")
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n<hierarchy rotation="0" page="1"%s>\n' % extra
             + "\n".join(parts) + "\n</hierarchy>")
 
 
@@ -1627,10 +1637,17 @@ def scroll(page, direction="down", times=1, fraction=0.6, idle_ms=500):
     cmds = [_evaluate(_js(SCROLL_JS, step, where))] * (1 if where else max(1, int(times)))
     cmds.append(_evaluate(_later(_js(READ_JS, 600), 150)))
     res = page.call_many(cmds, timeout=10.0, raise_errors=False)
-    moved = 0
+    moved, last, held = 0, {}, False
     for r in res[:-1]:
         try:
-            moved += (_value(r) or {}).get("moved") or 0
+            last = _value(r) or {}
         except RuntimeError:
-            pass
-    return {"moved": moved, "screen": _read_or_again(page, res[-1]), "ready": "complete"}
+            continue
+        moved += last.get("moved") or 0
+        held = held or bool(last.get("held"))
+    # the read says how far the page moved, and whether something over it
+    # holds it (see page_xml): a scroll that moved nothing said "scrolled"
+    # ten times on allrecipes.com (Oct 7)
+    screen = dict(_read_or_again(page, res[-1]) or {}, moved=moved, held=held)
+    return {"moved": moved, "scroller": last.get("scroller"), "held": held,
+            "screen": screen, "ready": "complete"}

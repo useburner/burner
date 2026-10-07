@@ -6415,7 +6415,8 @@ class WebPathTests(OfflineTestCase):
         cdp = _cdp()
         page = _ScriptedPage(cdp, {"SCROLL_JS": {"moved": 1200, "scroller": "page"}, "READ_JS": WEB_SCREEN})
         r = cdp.scroll(page, "down", times=2)
-        self.assertEqual((r["moved"], r["screen"]), (2400, WEB_SCREEN))
+        # the read, with how far the page moved (see page_stuck)
+        self.assertEqual((r["moved"], r["screen"]), (2400, dict(WEB_SCREEN, moved=2400, held=False)))
         self.assertEqual(page.calls, [("many", ["SCROLL_JS", "SCROLL_JS", "READ_JS"])])
 
     def test_type_takes_the_one_field_in_view_when_nothing_has_the_focus(self):
@@ -6533,6 +6534,50 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(calls[1][1]["scroll"], "down")
         self.assertIn("scrolled down x1", out.getvalue())
         self.assertIn("Box Score (click) (796,491)", out.getvalue())
+        # the page moved nothing: said, with why (allrecipes.com, Oct 7:
+        # "scrolled down" again and again over a page an ad held)
+        page = _cdp().page_xml(dict(WEB_SCREEN, moved=0, held=True), 283, 2400)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to=None, quiet=False))
+        self.assertIn("the page didn't move down: something over it holds it (a pop-up or a menu); "
+                      "close that first", out.getvalue())
+        self.assertNotIn("scrolled down", out.getvalue())
+        # a search on such a page stops at the first scroll, not the tenth
+        calls.clear()
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to="Preheat", quiet=True))
+        self.assertEqual(rc, 1)
+        self.assertEqual([c[0] for c in calls].count("act"), 1)
+        self.assertIn("not found: Preheat (the page didn't move down at scroll 1: something over it holds it",
+                      err.getvalue())
+        # moved, but the rows stayed as they were: the same stop
+        page = _cdp().page_xml(dict(WEB_SCREEN, moved=900), 283, 2400)
+        self.allow("ui_dump", return_value=ET.fromstring(page))
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to="Preheat", quiet=True))
+        self.assertEqual(rc, 1)
+        self.assertIn("its rows stayed as they were", err.getvalue())
+        self.assertEqual(pc.page_stuck(ET.fromstring(_cdp().page_xml(dict(WEB_SCREEN, moved=0), 283, 2400))),
+                         "it is at its end, or a box over it takes the scroll")
+        self.assertEqual(pc.page_stuck(ET.fromstring(_cdp().page_xml(WEB_SCREEN, 283, 2400))), "")
+        # moved, but held by a pop-up (a finger couldn't have): said
+        page = _cdp().page_xml(dict(WEB_SCREEN, moved=900, held=True), 283, 2400)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to=None, quiet=True))
+        self.assertIn("scrolled down x1\n  something over the page holds it (a pop-up or a menu); "
+                      "close that to tap the rows under it", out.getvalue())
+
+    def test_a_page_scroll_says_how_far_the_page_moved(self):
+        cdp = _cdp()
+        page = _ScriptedPage(cdp, {"SCROLL_JS": {"moved": 0, "scroller": None, "held": True}, "READ_JS": WEB_SCREEN})
+        r = cdp.scroll(page, "down")
+        self.assertEqual((r["moved"], r["held"], r["screen"]["moved"], r["screen"]["held"]), (0, True, 0, True))
+        self.assertIn('page="1" moved="0" held="1"', cdp.page_xml(r["screen"], 283, 2400))
+        page = _ScriptedPage(cdp, {"SCROLL_JS": {"moved": 600, "scroller": "page"}, "READ_JS": WEB_SCREEN})
+        r = cdp.scroll(page, "down", times=2)
+        self.assertEqual((r["moved"], r["held"]), (1200, False))
+        self.assertIn('page="1" moved="1200">', cdp.page_xml(r["screen"], 283, 2400))
+        self.assertNotIn("moved=", cdp.page_xml(WEB_SCREEN, 283, 2400))  # a read with no scroll
 
 
 class RepeatedRowsTests(OfflineTestCase):

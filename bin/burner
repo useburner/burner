@@ -4813,8 +4813,17 @@ def _web_scroll(direction, times=1, quiet=False):
         return print_act(status, root, note, "scroll")
     if direction in ("top", "bottom"):
         print("at the {}".format(direction))
+    elif page_stuck(root):
+        # the page's own word: it moved nothing (allrecipes.com, Oct 7:
+        # "scrolled down" again and again over a page an ad held)
+        print("the page didn't move {}: {}".format(direction, page_stuck(root)))
     else:
         print("scrolled {} x{}".format(direction, times))
+        if root is not None and root.get("held") == "1":
+            # a finger couldn't scroll this page, and what lies over it
+            # covers the rows (the page's own scroll moves it all the same)
+            print("  something over the page holds it (a pop-up or a menu); "
+                  "close that to tap the rows under it")
         if times == 1:
             hint = scroll_hint(direction)  # the same hint as a native scroll's
             if hint:
@@ -4822,6 +4831,17 @@ def _web_scroll(direction, times=1, quiet=False):
     if not quiet:
         print_screen(root, note=note)
     return 0
+
+
+def page_stuck(root):
+    """Why a page's scroll moved nothing, from its read (see cdp.page_xml:
+    moved="0", held="1"), or "" when it moved or the read doesn't say.
+    Pure."""
+    if root is None or root.get("moved") != "0":
+        return ""
+    if root.get("held") == "1":
+        return "something over it holds it (a pop-up or a menu); close that first"
+    return "it is at its end, or a box over it takes the scroll"
 
 
 def _scroll_step(direction, pkg):
@@ -5043,6 +5063,15 @@ def cmd_scroll(args):
                   file=sys.stderr)
             return 1
         after = visible_lines(walk(root))
+        if pkg in WEB_APPS and (page_stuck(root) or after == before):
+            # the page moved nothing, or its rows stayed as they were: more
+            # scrolls do the same (ten for nothing on allrecipes.com, Oct 7)
+            print("not found: {} (the page didn't move {} at scroll {}: {})".format(
+                args.to, args.direction, i + 1,
+                page_stuck(root) or "its rows stayed as they were"), file=sys.stderr)
+            if not quiet:
+                print_screen(root)
+            return 1
         if after == before and pkg not in WEB_APPS:
             # nothing moved: the list's end, or a swipe that was dropped
             # (right after `burner update` ten swipes moved nothing and the
