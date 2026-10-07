@@ -4844,6 +4844,19 @@ def page_stuck(root):
     return "it is at its end, or a box over it takes the scroll"
 
 
+def _page_scroll_to(text, direction):
+    """`scroll --to` on a page: the page finds the words and brings them
+    into view (the helper's scroll_to, see cdp.SCROLL_TO_JS): ("1" in view
+    now, "other" only on the other side, or "0" not on the page; the read),
+    or (None, None) when the helper can't ask the page."""
+    if direction not in ("down", "up"):
+        return None, None
+    status, root, _note = act_and_read({"scroll_to": text, "direction": direction}, idle_ms=IDLE_SCROLL_MS)
+    if status != "ok" or root is None:
+        return None, None
+    return root.get("found"), root
+
+
 def _scroll_step(direction, pkg):
     """One scroll and the screen after it: by the page itself in Chrome,
     else a swipe and a settled read. None when the screen can't be read."""
@@ -5040,6 +5053,27 @@ def cmd_scroll(args):
     before = visible_lines(walk(root))
     for i in range(times + 1):
         sel, hits = holding_which(walk(root), args.to)
+        if not hits and i == 0 and pkg in WEB_APPS:
+            # a page holds its words below the screen too: it finds them and
+            # brings them into view in one trip (allrecipes.com: ten scrolls
+            # never reached "Preheat", 7.5s, Oct 7); words it doesn't hold
+            # yet (a list that loads as it scrolls) go to the scrolls below
+            found, page_root = _page_scroll_to(args.to, args.direction)
+            if found == "other":
+                print("not found {}: {} (the page has it {}: `burner scroll {} --to {}`)".format(
+                    "below" if args.direction == "down" else "above", args.to,
+                    "above" if args.direction == "down" else "below",
+                    "up" if args.direction == "down" else "down", _shell_words(args.to)), file=sys.stderr)
+                return 1
+            if page_root is not None:
+                root = page_root
+                sel, hits = holding_which(walk(root), args.to)
+                if found == "1" and not hits:
+                    # the page has the words in view, though no row reads them whole
+                    print("found: {}".format(args.to))
+                    if not quiet:
+                        print_screen(root)
+                    return 0
         if hits:
             words = _row_words(hits[0])
             # the alternative found, and the row that holds it when that

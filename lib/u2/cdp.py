@@ -993,6 +993,47 @@ SCROLL_JS = r"""
 })"""
 
 
+# `scroll --to` on a page: the element holding these words (any "a || b"
+# alternative, case and spaces aside; its text, or its aria-label, alt or
+# title) brought to the middle of the screen: one on the screen already
+# stays; else the nearest below it (down) or above it (up). {found, moved,
+# used, text}; {found: false, other: true} when the words are only on the
+# other side; {found: false} when the page doesn't hold them (yet).
+SCROLL_TO_JS = r"""
+(function(label, direction){
+  const squash = s => (s || '').replace(/[\u2018\u2019]/g, "'").replace(/\s+/g, ' ').trim().toLowerCase();
+  const vh = innerHeight, up = direction === 'up';
+  const shown = el => el.checkVisibility ? el.checkVisibility({visibilityProperty: true, opacityProperty: true}) : true;
+  let other = false;
+  for (const want of label.split('||').map(squash).filter(Boolean)) {
+    const hits = new Set();
+    const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    for (let t = tw.nextNode(); t; t = tw.nextNode()) {
+      const p = t.parentElement;
+      if (!p || p.closest('script,style,noscript,template')) continue;
+      // the words in one text node, or across the inline parts of its
+      // element ("Pre<b>heat</b> oven")
+      if (squash(t.nodeValue).includes(want)) hits.add(p);
+      else if (p.textContent.length < 1000 && squash(p.textContent).includes(want)) hits.add(p);
+    }
+    for (const el of document.body.querySelectorAll('[aria-label],[alt],[title]'))
+      if (squash(el.getAttribute('aria-label') || el.getAttribute('alt') || el.getAttribute('title')).includes(want)) hits.add(el);
+    const placed = [];
+    for (const el of hits) { if (!shown(el)) continue; const r = el.getBoundingClientRect(); if (r.width > 0 && r.height > 0) placed.push([el, r]); }
+    if (!placed.length) continue;
+    const here = placed.find(([el, r]) => r.bottom > 0 && r.top < vh);
+    if (here) return {found: true, moved: 0, used: want, text: squash(here[0].textContent).slice(0, 80)};
+    const ahead = placed.filter(([el, r]) => up ? r.bottom <= 0 : r.top >= vh)
+      .sort((a, b) => up ? b[1].bottom - a[1].bottom : a[1].top - b[1].top);
+    if (!ahead.length) { other = true; continue; }
+    const before = scrollY;
+    ahead[0][0].scrollIntoView({block: 'center', inline: 'nearest'});
+    return {found: true, moved: scrollY - before, used: want, text: squash(ahead[0][0].textContent).slice(0, 80)};
+  }
+  return other ? {found: false, other: true} : {found: false};
+})"""
+
+
 def _js(fn, *args):
     return "(%s)(%s)" % (fn, ", ".join(json.dumps(a) for a in args))
 
@@ -1138,6 +1179,8 @@ def page_xml(screen, top, screen_h=0, pkg="com.android.chrome"):
     extra = ""
     if "moved" in screen:
         extra = ' moved="%d"' % int(screen.get("moved") or 0) + (' held="1"' if screen.get("held") else "")
+    if "found" in screen:
+        extra += ' found="%s"' % screen["found"]  # what a `scroll --to` asked the page
     return ('<?xml version="1.0" encoding="UTF-8"?>\n<hierarchy rotation="0" page="1"%s>\n' % extra
             + "\n".join(parts) + "\n</hierarchy>")
 
@@ -1625,6 +1668,22 @@ def type_text(page, text, idle_ms=800):
                       % (sel.get("type"), text, sel.get("value")))
     return {"screen": _read_or_again(page, res[2]), "ready": "complete",
             "direct": bool(sel.get("direct")), "only": bool(sel.get("only"))}
+
+
+def scroll_to(page, label, direction="down"):
+    """The element with these words brought into view by the page itself
+    (see SCROLL_TO_JS) and the read a moment later, in one round trip:
+    {"found": "1" (in view now), "other" (only on the other side) or "0"
+    (not on the page), "screen"}; the read carries `found` for page_xml."""
+    res = page.call_many([_evaluate(_js(SCROLL_TO_JS, label, direction)),
+                          _evaluate(_later(_js(READ_JS, 600), 150))], timeout=10.0, raise_errors=False)
+    try:
+        hit = _value(res[0]) or {}
+    except RuntimeError:
+        hit = {}
+    found = "1" if hit.get("found") else ("other" if hit.get("other") else "0")
+    screen = dict(_read_or_again(page, res[1]) or {}, found=found)
+    return {"found": found, "used": hit.get("used") or "", "moved": hit.get("moved") or 0, "screen": screen}
 
 
 def scroll(page, direction="down", times=1, fraction=0.6, idle_ms=500):

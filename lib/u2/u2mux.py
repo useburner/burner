@@ -2397,7 +2397,7 @@ class U2Daemon:
         returned and cached. Never replayed after an error: the action may
         have happened. "act failed after sending: ..." means just that."""
         spec = json.loads(arg) if arg.strip() else {}
-        if "open" in spec or "scroll" in spec:
+        if "open" in spec or "scroll" in spec or "scroll_to" in spec:
             self._last_tap = None  # another action: see _type_into_field
         if "open" in spec:
             # A link opened in the page in Chrome (cdp.navigate): its
@@ -2430,6 +2430,26 @@ class U2Daemon:
                 except Exception as e:
                     self._web = None
                     raise RuntimeError("act failed after sending: %s" % err_text(e, 120))
+                xml = self._after_page(r["screen"])
+                self._remember(xml)
+            return xml.encode()
+        if "scroll_to" in spec:
+            # `scroll --to` on a page in Chrome: the page finds the words,
+            # below the screen too, and brings them into view (cdp.scroll_to)
+            page = self._page()
+            if page is None:
+                raise RuntimeError("act not sent: not a page")
+            with self._lock:
+                self.invalidate()
+                try:
+                    with _t("web scroll to"):
+                        r = _cdp().scroll_to(page, str(spec["scroll_to"]), spec.get("direction", "down"))
+                except Exception as e:
+                    self._web = None
+                    raise RuntimeError("act failed after sending: %s" % err_text(e, 120))
+                log("web scroll to %r: %s%s" % (spec["scroll_to"], {"1": "in view", "other": "only on the other side",
+                                                                      "0": "not on the page"}.get(r["found"], r["found"]),
+                                                 ", moved %s px" % r["moved"] if r["moved"] else ""))
                 xml = self._after_page(r["screen"])
                 self._remember(xml)
             return xml.encode()

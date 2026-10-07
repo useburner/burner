@@ -5027,7 +5027,7 @@ class _ScriptedPage(_FakePage):
 
     def _name(self, expression):
         for name in ("TARGET_FILL_JS", "FIND_JS", "TARGET_JS", "FILL_JS", "FILLED_JS", "READ_JS", "PLACE_JS",
-                     "SELECT_JS", "SETTLE_JS", "SCROLL_JS"):
+                     "SELECT_JS", "SETTLE_JS", "SCROLL_TO_JS", "SCROLL_JS"):
             if ("(" + getattr(self.cdp, name)) in expression:
                 return name
         return expression[:40]
@@ -6547,7 +6547,9 @@ class WebPathTests(OfflineTestCase):
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
             rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to="Preheat", quiet=True))
         self.assertEqual(rc, 1)
-        self.assertEqual([c[0] for c in calls].count("act"), 1)
+        # the page asked for the words first (not on it here), then one scroll
+        self.assertEqual([c[1].get("scroll_to") or c[1].get("scroll") for c in calls if c[0] == "act"],
+                         ["Preheat", "down"])
         self.assertIn("not found: Preheat (the page didn't move down at scroll 1: something over it holds it",
                       err.getvalue())
         # moved, but the rows stayed as they were: the same stop
@@ -6566,6 +6568,60 @@ class WebPathTests(OfflineTestCase):
             pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to=None, quiet=True))
         self.assertIn("scrolled down x1\n  something over the page holds it (a pop-up or a menu); "
                       "close that to tap the rows under it", out.getvalue())
+
+    def test_scroll_to_on_a_page_asks_the_page(self):
+        # allrecipes.com, Oct 7: ten scrolls (469px each) never reached
+        # "Preheat" (7.5s); the page holds its words below the screen too
+        cdp = _cdp()
+        directions = dict(WEB_SCREEN, rows=WEB_SCREEN["rows"] + [
+            {"text": "Preheat oven to 350 degrees F", "desc": "", "kind": "text", "l": 0, "t": 400, "w": 500, "h": 40}])
+        page = _ScriptedPage(cdp, {"SCROLL_TO_JS": {"found": True, "moved": 5191, "used": "preheat"},
+                                   "READ_JS": directions})
+        r = cdp.scroll_to(page, "Preheat", "down")
+        self.assertEqual((r["found"], r["moved"], r["screen"]["found"]), ("1", 5191, "1"))
+        self.assertEqual(page.calls, [("many", ["SCROLL_TO_JS", "READ_JS"])])
+        self.assertIn('page="1" found="1">', cdp.page_xml(r["screen"], 283, 2400))
+        page = _ScriptedPage(cdp, {"SCROLL_TO_JS": {"found": False, "other": True}, "READ_JS": WEB_SCREEN})
+        self.assertEqual(cdp.scroll_to(page, "Preheat", "down")["found"], "other")
+        # the CLI: one trip, the row found, no scroll
+        self.allow("wake")
+        self.allow("u2_invalidate")
+        calls = []
+        replies = {"1": cdp.page_xml(dict(directions, found="1"), 283, 2400),
+                   "other": cdp.page_xml(dict(WEB_SCREEN, found="other"), 283, 2400)}
+        answer = ["1"]
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append(json.loads(arg) if arg.startswith("{") else arg)
+            return replies[answer[0]]
+        self.allow("u2sock", side_effect=u2)
+        self.allow("ui_dump", return_value=ET.fromstring(cdp.page_xml(WEB_SCREEN, 283, 2400)))
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to="Preheat", quiet=True))
+        self.assertEqual((rc, out.getvalue()), (0, 'found: Preheat (in "Preheat oven to 350 degrees F")\n'))
+        self.assertEqual([c.get("scroll_to") for c in calls], ["Preheat"])
+        # only above: said, with the way there, and no scroll
+        answer[0], calls[:] = "other", []
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_scroll(SimpleNamespace(direction="down", times=1, to="Preheat", quiet=True))
+        self.assertEqual(rc, 1)
+        self.assertIn("not found below: Preheat (the page has it above: `burner scroll up --to \"Preheat\"`)",
+                      err.getvalue())
+        self.assertEqual(len(calls), 1)
+        # the helper: the page's answer, logged, as a screen read
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        seen = []
+        fake = self._fake_cdp(mod, seen)
+        fake.scroll_to = lambda page, label, direction="down": seen.append(("scroll_to", label, direction)) or {
+            "found": "1", "used": "preheat", "moved": 5191, "screen": dict(directions, found="1")}
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        xml = dm.cmd_act(json.dumps({"scroll_to": "Preheat", "direction": "down", "idle": 500})).decode()
+        self.assertIn('found="1"', xml)
+        self.assertIn("Preheat oven to 350 degrees F", xml)
+        self.assertEqual(seen[-1], ("scroll_to", "Preheat", "down"))
 
     def test_a_page_scroll_says_how_far_the_page_moved(self):
         cdp = _cdp()
