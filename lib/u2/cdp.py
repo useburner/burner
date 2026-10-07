@@ -796,6 +796,7 @@ FIND_JS = r"""
     else if (el.matches(ACTIVE)) { const t = squash(el.innerText); if (t && t.length <= 80) n.push(t); }
     return n.filter(Boolean).map(s => s.toLowerCase()); };
   window.__burnerTarget = null;
+  window.__burnerGuard = null;
   const alts = label.split('||').map(squash).filter(Boolean);
   let used = '';
   const find = test => { for (const alt of alts) { const want = alt.toLowerCase(); const h = [];
@@ -874,6 +875,8 @@ FIND_JS = r"""
   }
   if (!inView(r) || r.top < 0 || r.bottom > vh) { el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'}); r = box(el); moved = true; }
   window.__burnerTarget = el;
+  // the touch that follows is judged where it lands (see GUARD_JS)
+  window.__burnerGuard = {until: performance.now() + 3000, verdict: null};
   // a text field with the focus keeps the keyboard up, which pushes the
   // visual viewport: leave it first (as a person tapping elsewhere does),
   // and the caller takes the place afresh (PLACE_JS)
@@ -906,13 +909,101 @@ FIND_JS = r"""
   if (!moved) return answer();
   // scrolled into view: the page's answer to the scroll (a sticky header,
   // a list filling in) comes a frame or two later; the place is taken
-  // after it, in this same trip (a trip of its own for it, Oct 7)
+  // after it, in this same trip (a trip of its own for it, Oct 7). An image
+  // above it in view with no size yet (a lazy one the scroll brought in)
+  // moves it down when it loads: waited for, 400ms at most (the touch
+  // landed on the image, review of Oct 7); a later move is the guard's
   return new Promise(done => {
-    let frames = 0, sent = false;
+    let sent = false;
     const finish = () => { if (sent) return; sent = true; r = box(el); done(Object.assign(answer(), {settled: true})); };
-    const tick = () => { if (++frames >= 2) finish(); else requestAnimationFrame(tick); };
-    requestAnimationFrame(tick);
-    setTimeout(finish, 120);
+    // two frames, or 120ms on a page whose frames don't come
+    const frames = then => { let n = 0, gone = false; const go = () => { if (!gone) { gone = true; then(); } };
+      const tick = () => { if (++n >= 2) go(); else requestAnimationFrame(tick); };
+      requestAnimationFrame(tick); setTimeout(go, 120); };
+    const sizeless = () => { const top = box(el).top; return Array.from(document.images).filter(im => {
+      if (im.complete) return false; const b = im.getBoundingClientRect(); return b.height < 2 && b.top >= -2 && b.top <= top; }); };
+    frames(() => {
+      const wait = sizeless();
+      if (!wait.length) return finish();
+      let left = wait.length;
+      const one = () => { if (--left === 0) frames(finish); };
+      for (const im of wait) { im.addEventListener('load', one, {once: true}); im.addEventListener('error', one, {once: true}); }
+      setTimeout(() => frames(finish), 400);
+    });
+  });
+})"""
+
+# The guard on a touch aimed at window.__burnerTarget (FIND_JS, PLACE_JS):
+# judged where it lands by the first event of its gesture that reaches the
+# page: the target gone, moved from under the point (an image above it
+# loading late: the touch took the image, review of Oct 7), or under
+# something else there. A miss is held back whole: the page sees none of
+# its events, so nothing opens; its verdict is kept for VERDICT_JS. Armed
+# by FIND_JS and PLACE_JS (window.__burnerGuard) for one gesture, a few
+# seconds at most; installed once a document, in the trip of a find or a
+# place. A script's own click is no finger, and passes. A touch on a frame
+# (an ad's) never reaches the page: no verdict, and nothing held.
+GUARD_JS = r"""
+(function(){
+  if (window.__burnerGuardOn) return true;
+  window.__burnerGuardOn = true;
+  const ACTIVE = 'a[href],button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=switch],[role=option],[onclick]';
+  const FIRST = ['pointerdown', 'touchstart', 'mousedown', 'click'];
+  const judge = (e, T) => {
+    if (!T || !T.isConnected) return 'gone';
+    const p = (e.touches && e.touches[0]) || (e.changedTouches && e.changedTouches[0]) || e;
+    const b = T.getBoundingClientRect();
+    if (!(p.clientX >= b.left - 1 && p.clientX <= b.right + 1 && p.clientY >= b.top - 1 && p.clientY <= b.bottom + 1)) return 'moved';
+    const path = e.composedPath ? e.composedPath() : [e.target];
+    const ctl = T.closest(ACTIVE) || T;
+    if (path.indexOf(T) >= 0 || path.indexOf(ctl) >= 0) return 'ok';
+    // an element around it, in no other control (a gap between a link's
+    // lines): the point the find took for the target's own
+    const t = path[0];
+    return t && t.contains && t.contains(T) && !(t.closest && t.closest(ACTIVE)) ? 'ok' : 'covered';
+  };
+  const on = e => {
+    const g = window.__burnerGuard;
+    if (!g || !e.isTrusted) return;
+    const now = performance.now();
+    if (!g.verdict) {
+      if (now > g.until || FIRST.indexOf(e.type) < 0) return;
+      g.verdict = judge(e, window.__burnerTarget);
+      g.stop = now + 700;
+      if (g.verdict !== 'ok') {
+        const t = e.composedPath ? e.composedPath()[0] : e.target;
+        g.hit = t && t.tagName ? (t.tagName.toLowerCase() + ' ' + (t.innerText || t.getAttribute('alt') || '')).replace(/\s+/g, ' ').trim().slice(0, 40) : '';
+      }
+    }
+    if (g.verdict !== 'ok' && now <= g.stop) {
+      // a touch event's listener is passive (no scroll waits on it): what
+      // it starts is held at the click
+      if (e.type.slice(0, 5) !== 'touch' && e.cancelable) e.preventDefault();
+      e.stopImmediatePropagation();
+      if (e.type === 'click') g.stop = 0;
+    }
+  };
+  for (const type of ['pointerdown', 'pointerup', 'pointercancel', 'mousedown', 'mouseup', 'click', 'contextmenu'])
+    window.addEventListener(type, on, {capture: true});
+  for (const type of ['touchstart', 'touchend', 'touchcancel'])
+    window.addEventListener(type, on, {capture: true, passive: true});
+  return true;
+})"""
+
+# What the guard made of the touch just sent: waited for on the page, `ms`
+# at most. {verdict: null}: no event of it reached the page (a frame's
+# content took it); null: nothing was armed.
+VERDICT_JS = r"""
+(function(ms){
+  return new Promise(done => {
+    const t0 = performance.now();
+    const look = () => {
+      const g = window.__burnerGuard;
+      if (!g) return done(null);
+      if (g.verdict || performance.now() - t0 >= ms) return done({verdict: g.verdict || null, hit: g.hit || ''});
+      setTimeout(look, 10);
+    };
+    look();
   });
 })"""
 
@@ -959,7 +1050,7 @@ TARGET_JS = r"""
 PLACE_JS = r"""
 (function(){
   const el = window.__burnerTarget;
-  if (!el) return null;
+  if (!el || !el.isConnected) return null;
   const vv = window.visualViewport, vh = vv ? vv.height : innerHeight;
   let r = el.getBoundingClientRect();
   const top = r.top - (vv ? vv.offsetTop : 0), bottom = r.bottom - (vv ? vv.offsetTop : 0);
@@ -974,6 +1065,8 @@ PLACE_JS = r"""
     const oc = over.closest(ACTIVE), b = oc && oc.getBoundingClientRect();
     if (b && b.left <= r.left + 2 && b.top <= r.top + 2 && b.right >= r.right - 2 && b.bottom >= r.bottom - 2) { covered = false; window.__burnerTarget = oc; }
   }
+  // the touch that follows is judged where it lands (see GUARD_JS)
+  window.__burnerGuard = {until: performance.now() + 3000, verdict: null};
   return {x: cx - (vv ? vv.offsetLeft : 0), y: cy - (vv ? vv.offsetTop : 0), covered: covered};
 })"""
 
@@ -1277,6 +1370,10 @@ def _value(res):
 
 
 READ_LATER_MS = 250  # the read in a touch's round trip: this long after it
+GUARD_TRIES = 3      # touches held back (see GUARD_JS) before nothing is tapped
+VERDICT_WAIT_MS = 400  # a touch's verdict is waited for this long, on the page
+MISSES = ("moved", "covered", "gone")
+CLICK_TARGET = "window.__burnerGuard = null; window.__burnerTarget && window.__burnerTarget.click(); 'clicked'"
 LINK_LOAD_S = 1.0    # a touched link to another page: its load is given this long to start
 
 
@@ -1509,7 +1606,7 @@ def touch(page, x, y, then=()):
     # own click stands in
     res = page.call_many(cmds, timeout=5.0, raise_errors=False)
     if any(isinstance(r, Exception) for r in res[:2]):
-        page.eval("window.__burnerTarget && window.__burnerTarget.click(); 'clicked'")
+        page.eval(CLICK_TARGET)
         return "click", []
     return "touch", res[2:]
 
@@ -1578,6 +1675,28 @@ def _found(hit, label, top):
             "inview": bool(hit.get("inview")), "count": hit.get("count", 1)}
 
 
+class Held(RuntimeError):
+    """Every touch on the target was held back (see GUARD_JS): nothing was
+    tapped. `verdict`: the last one ("gone": the page replaced it)."""
+
+    def __init__(self, message, verdict):
+        RuntimeError.__init__(self, message)
+        self.verdict = verdict
+
+
+def _find_to_touch(page, label, index):
+    """FIND_JS's answer, with the guard installed in its trip."""
+    res = page.call_many([_evaluate(_js(FIND_JS, label, index)), _evaluate(_js(GUARD_JS))])
+    return _value(res[0])
+
+
+def _place(page):
+    """PLACE_JS's answer ({} for a target gone), with the guard installed
+    in its trip (PLACE_JS arms it)."""
+    res = page.call_many([_evaluate(_js(PLACE_JS)), _evaluate(_js(GUARD_JS))])
+    return _value(res[0]) or {}
+
+
 def tap(page, label, index=None, idle_ms=1200):
     """Find the element by its words, touch it, read: {"found": True,
     "count": 1, "screen": ...}. {"found": False} when the words aren't
@@ -1588,10 +1707,10 @@ def tap(page, label, index=None, idle_ms=1200):
     and read afresh. Raises NotSent when the page can't be asked, before
     any touch."""
     try:
-        hit = page.eval(_js(FIND_JS, label, index))
+        hit = _find_to_touch(page, label, index)
         if not hit or not hit.get("found"):
             time.sleep(0.7)  # a page still drawing shows the words a moment later
-            hit = page.eval(_js(FIND_JS, label, index))
+            hit = _find_to_touch(page, label, index)
     except Exception as e:
         raise NotSent(str(e)[:120])
     if not hit or not hit.get("found"):
@@ -1605,7 +1724,18 @@ def tap(page, label, index=None, idle_ms=1200):
         return {"found": True, "count": 1, "label": hit.get("label"),
                 "how": "chose" if hit.get("chose") else "focus", "screen": read(page)}
     page.window_opened = None
-    how, after = touch_hit(page, hit, then=[_evaluate(_later(_js(READ_JS, 600), READ_LATER_MS))])
+    try:
+        how, after = touch_hit(page, hit, then=[_evaluate(_later(_js(READ_JS, 600), READ_LATER_MS))])
+    except Held as e:
+        if e.verdict != "gone":
+            raise
+        # the page replaced the target (a list drawn again): found again by
+        # its words, once; nothing was touched
+        again = _find_to_touch(page, label, index) or {}
+        if not again.get("found") or again.get("count", 1) != 1 or again.get("chose") or again.get("focused"):
+            raise
+        hit = again
+        how, after = touch_hit(page, hit, then=[_evaluate(_later(_js(READ_JS, 600), READ_LATER_MS))])
     screen, ready = None, "complete"
     if after and not page.loading:
         try:
@@ -1636,7 +1766,7 @@ def tap(page, label, index=None, idle_ms=1200):
             # without it left nothing to go on (airbnb.com, Oct 5)
             "at": [hit.get("x"), hit.get("y")], "tag": hit.get("tag") or "",
             "over": hit.get("over") or "", "moved": bool(hit.get("moved")),
-            "covered": bool(hit.get("covered"))}
+            "covered": bool(hit.get("covered")), "held": hit.get("held", 0)}
 
 
 def leaves_for(hit, screen):
@@ -1681,7 +1811,11 @@ def touch_hit(page, hit, then=()):
     covers it is closed first, its place taken afresh after a scroll
     into view, a keyboard going or a popup closing, and a cover that
     stays is bypassed with the element's own click. `then` rides in the
-    touch's round trip (see touch). Returns (how, results of `then`)."""
+    touch's round trip (see touch). A touch the page held back because
+    it missed the target (see GUARD_JS) is aimed again at the target's
+    place now, GUARD_TRIES touches at most (hit["held"]: how many were
+    held). Returns (how, results of `then`); raises Held when every
+    touch was held back, or the target is gone (nothing was tapped)."""
     if hit.get("covered"):
         # something lies over the target (a date field's calendar):
         # Escape closes a widget's popup, as it would for a person
@@ -1697,16 +1831,37 @@ def touch_hit(page, hit, then=()):
         # nothing, Oct 7)
         if hit.get("blurred") or hit.get("covered"):
             time.sleep(0.35)
-        place = page.eval(_js(PLACE_JS)) or {}
+        place = _place(page)
         if place.get("x") is not None:
             hit["x"], hit["y"] = place["x"], place["y"]
         hit["covered"] = bool(place.get("covered"))
     page.loading = False
-    if hit.get("covered"):
-        # still covered: the element's own click, past whatever lies over it
-        page.eval("window.__burnerTarget && window.__burnerTarget.click(); 'clicked'")
-        return "click", []
-    return touch(page, hit["x"], hit["y"], then)
+    held = []
+    while True:
+        if hit.get("covered"):
+            # still covered: the element's own click, past whatever lies over it
+            page.eval(CLICK_TARGET)
+            return "click", []
+        how, after = touch(page, hit["x"], hit["y"], [_evaluate(_js(VERDICT_JS, VERDICT_WAIT_MS))] + list(then))
+        if how != "touch" or not after:
+            return how, after
+        try:
+            verdict = _value(after[0]) or {}
+        except RuntimeError:
+            verdict = {}  # the document went away: the touch went in (a load)
+        hit["held"] = len(held)
+        if verdict.get("verdict") not in MISSES:
+            return how, after[1:]
+        # held back: the page saw none of it; aimed again where the target is
+        held.append(verdict["verdict"] + (", %s under the point" % verdict["hit"] if verdict.get("hit") else ""))
+        hit["held"] = len(held)
+        place = _place(page) if verdict["verdict"] != "gone" else {}
+        if place.get("x") is None or len(held) >= GUARD_TRIES:
+            raise Held("nothing was tapped: the page moved %r from under the touch %d time%s (%s)" % (
+                hit.get("used") or hit.get("label") or "the target", len(held), "" if len(held) == 1 else "s",
+                "; ".join(held)),
+                "gone" if place.get("x") is None else verdict["verdict"])
+        hit["x"], hit["y"], hit["covered"] = place["x"], place["y"], bool(place.get("covered"))
 
 
 def navigate(page, url, idle_ms=1000):
@@ -1835,7 +1990,7 @@ def fill(page, label, text, index=None):
     anything changed, NotDone when the field didn't take the text."""
     try:
         res = page.call_many([_evaluate(_js(FIND_JS, label, index, False, True)),
-                              _evaluate(_js(FILL_JS, text))], raise_errors=False)
+                              _evaluate(_js(FILL_JS, text)), _evaluate(_js(GUARD_JS))], raise_errors=False)
     except NothingSent as e:
         raise NotSent(str(e)[:120])
     # from here on a failure came after the fill went out (it clicks a

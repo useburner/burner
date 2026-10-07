@@ -2810,6 +2810,10 @@ class U2Daemon:
                                        int(spec.get("idle", 2000)))
                 except _cdp().NotSent as e:
                     raise RuntimeError("act not sent: the page couldn't be asked (%s)" % e)
+                except _cdp().Held as e:
+                    # every touch missed the target and was held back: the
+                    # page is as it was, and its session good
+                    raise RuntimeError("act failed after sending: %s" % e)
                 except Exception as e:
                     self._web = None
                     raise RuntimeError("act failed after sending: %s" % err_text(e, 120))
@@ -2817,11 +2821,13 @@ class U2Daemon:
                     # where the touch went: a tap that opened nothing
                     # left nothing to go on without it (airbnb.com, Oct 5)
                     at = r["at"]
-                    log("web tap: %s on <%s> at %.0f,%.0f%s%s%s" % (
+                    log("web tap: %s on <%s> at %.0f,%.0f%s%s%s%s" % (
                         r.get("how", "?"), r.get("tag") or "?", at[0] or 0, at[1] or 0,
                         " laid over the words" if r.get("over") else "",
                         ", scrolled into view" if r.get("moved") else "",
-                        ", under a cover" if r.get("covered") else ""))
+                        ", under a cover" if r.get("covered") else "",
+                        ", after %d touch%s held back (the page moved it)" % (
+                            r["held"], "" if r["held"] == 1 else "es") if r.get("held") else ""))
                 if not r.get("found"):
                     # Chrome's own prompts (a permission ask, "Save
                     # password?") are not on the page; the screen reader
@@ -2851,7 +2857,7 @@ class U2Daemon:
                                         spec.get("index"))
                 except _cdp().NotSent as e:
                     raise RuntimeError("act not sent: %s" % e)
-                except _cdp().NotDone as e:
+                except (_cdp().NotDone, _cdp().Held) as e:
                     raise RuntimeError("act failed after sending: %s" % e)
                 except Exception as e:
                     self._web = None

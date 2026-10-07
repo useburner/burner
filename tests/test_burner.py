@@ -5209,7 +5209,7 @@ class _ScriptedPage(_FakePage):
 
     def _name(self, expression):
         for name in ("TARGET_FILL_JS", "FIND_JS", "TARGET_JS", "FILL_JS", "FILLED_JS", "READ_JS", "PLACE_JS",
-                     "SELECT_JS", "SETTLE_JS", "SCROLL_TO_JS", "SCROLL_JS", "TEXT_JS"):
+                     "SELECT_JS", "SETTLE_JS", "SCROLL_TO_JS", "SCROLL_JS", "TEXT_JS", "GUARD_JS", "VERDICT_JS"):
             if ("(" + getattr(self.cdp, name)) in expression:
                 return name
         return expression[:40]
@@ -5719,7 +5719,7 @@ class WebPathTests(OfflineTestCase):
             return {"moved": 1200, "screen": WEB_SCREEN}
         fake = types.SimpleNamespace(
             is_chrome=real.is_chrome, page_xml=real.page_xml, NotSent=real.NotSent, NotDone=real.NotDone,
-            CHROME_PACKAGES=real.CHROME_PACKAGES, LOAD_PROBE_S=real.LOAD_PROBE_S,
+            Held=real.Held, CHROME_PACKAGES=real.CHROME_PACKAGES, LOAD_PROBE_S=real.LOAD_PROBE_S,
             front_page=lambda dev, current=None, **kw: _FakePage(), visible=lambda page, timeout=1.5: True,
             QUICK_PROBE_S=0.7,
             read=lambda page, cap=160: calls.append(("read",)) or WEB_SCREEN,
@@ -6810,8 +6810,8 @@ class WebPathTests(OfflineTestCase):
             r = cdp.fill(page, "Search", "Pixel 7")
         self.assertEqual((r["found"], r["how"], r["value"]), (True, "tap+focus", "Pixel 7"))
         self.assertEqual(page.calls, [
-            ("many", ["FIND_JS", "FILL_JS"]),  # the fill rides with the find: a field takes it there
-            ("many", ["Input.dispatchTouchEvent", "Input.dispatchTouchEvent"]),  # not a field: touched
+            ("many", ["FIND_JS", "FILL_JS", "GUARD_JS"]),  # the fill rides with the find: a field takes it there
+            ("many", ["Input.dispatchTouchEvent", "Input.dispatchTouchEvent", "VERDICT_JS"]),  # not a field: touched
             ("eval", "TARGET_FILL_JS"),  # the field that opened, waited for and filled in one script
             ("many", ["Input.insertText", "FILLED_JS", "READ_JS"])])
         # the touch led to a page with the box (no focus): the field with the label, on the second look
@@ -6849,17 +6849,17 @@ class WebPathTests(OfflineTestCase):
             r = cdp.fill(page, "Email", "a@b.c")
         self.assertEqual((r["how"], r["value"], r["screen"]), ("fill", "a@b.c", WEB_SCREEN))
         # two round trips: find + fill, then the text, the check and the read
-        self.assertEqual(page.calls, [("many", ["FIND_JS", "FILL_JS"]),
+        self.assertEqual(page.calls, [("many", ["FIND_JS", "FILL_JS", "GUARD_JS"]),
                                       ("many", ["Input.insertText", "FILLED_JS", "READ_JS"])])
 
     def test_a_read_that_fails_after_an_untouched_answer_is_not_sent(self):
         cdp = _cdp()
         page = _ScriptedPage(cdp, {"FIND_JS": {"found": False}})
-        page.eval = mock.Mock(side_effect=[{"found": False}, {"found": False}, OSError("stream closed")])
+        page.eval = mock.Mock(side_effect=[OSError("stream closed")])  # the read after the two finds
         with mock.patch.object(cdp.time, "sleep"), self.assertRaises(cdp.NotSent):
             cdp.tap(page, "Nope")
         page = _ScriptedPage(cdp, {"FIND_JS": {"found": True, "count": 2, "labels": ["a", "b"]}})
-        page.eval = mock.Mock(side_effect=[{"found": True, "count": 2, "labels": ["a", "b"]}, OSError("stream closed")])
+        page.eval = mock.Mock(side_effect=[OSError("stream closed")])
         with self.assertRaises(cdp.NotSent):
             cdp.tap(page, "Twice")
 
@@ -6962,8 +6962,10 @@ class WebPathTests(OfflineTestCase):
         page = _ScriptedPage(cdp, {"FIND_JS": found, "READ_JS": WEB_SCREEN})
         r = cdp.tap(page, "Box Score")
         self.assertEqual((r["how"], r["ready"], r["screen"]), ("touch", "complete", WEB_SCREEN))
-        self.assertEqual(page.calls, [("eval", "FIND_JS"),
-                                      ("many", ["Input.dispatchTouchEvent", "Input.dispatchTouchEvent", "READ_JS"])])
+        # the guard installed in the find's trip, its verdict in the touch's
+        self.assertEqual(page.calls, [("many", ["FIND_JS", "GUARD_JS"]),
+                                      ("many", ["Input.dispatchTouchEvent", "Input.dispatchTouchEvent",
+                                                "VERDICT_JS", "READ_JS"])])
         # the touch started a load: the read that rode along is not the
         # new page; it is waited out and read afresh
         page = _ScriptedPage(cdp, {"FIND_JS": found, "READ_JS": WEB_SCREEN, "navigates": True})
@@ -7002,6 +7004,27 @@ class WebPathTests(OfflineTestCase):
             cdp.type_text(page, "Pixel 7")
         self.assertEqual(str(cm.exception), "no field has the focus on the page "
                          "(2 text fields in view; tap one, or type --field with its label)")
+
+    def test_helper_says_nothing_was_tapped_when_every_touch_was_held(self):
+        # the review of Oct 7: a target the page keeps moving is never
+        # tapped where it was; the tap says nothing was tapped, and the
+        # page's session stays
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = self._fake_cdp(mod, calls)
+        msg = "nothing was tapped: the page moved 'More' from under the touch 3 times (moved, div under the point)"
+
+        def tap(page, label, index=None, idle_ms=1200):
+            raise fake.Held(msg, "moved")
+        fake.tap = tap
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"tap_label": "More"}))
+        self.assertEqual(str(cm.exception), "act failed after sending: " + msg)
+        self.assertIsNotNone(dm._web)
 
     def test_helper_keeps_the_page_when_a_fill_did_not_take(self):
         mod = _u2mux()
@@ -7420,7 +7443,61 @@ class WebPathTests(OfflineTestCase):
             cdp.touch_hit(page, {"x": 30, "y": 400, "moved": True, "settled": True})
             self.assertEqual((touched[-1], page.calls), ((30, 400), []))  # no trip for the place
             cdp.touch_hit(page, {"x": 30, "y": 400, "moved": True})  # an older find: placed afresh
-            self.assertEqual((touched[-1], page.calls), ((1, 2), [("eval", "PLACE_JS")]))
+            self.assertEqual((touched[-1], page.calls), ((1, 2), [("many", ["PLACE_JS", "GUARD_JS"])]))
+
+    def test_a_touch_that_misses_its_target_is_held_and_aimed_again(self):
+        # review of Oct 7: an image above "More" took its size after the
+        # link's place was taken, and the touch opened the image; the page
+        # judges each touch where it lands (GUARD_JS) and holds a miss back
+        cdp = _cdp()
+        page = _ScriptedPage(cdp, {"PLACE_JS": [{"x": 5, "y": 600}, {"x": 5, "y": 700}, {"x": 5, "y": 800}]})
+        verdicts, touched = [], []
+
+        def touch(pg, x, y, then=()):
+            touched.append((x, y))
+            return "touch", [{"result": {"value": verdicts.pop(0)}}, "read"]
+        hit = {"x": 30, "y": 400, "moved": True, "settled": True, "used": "More"}
+        with mock.patch.object(cdp, "touch", touch):
+            verdicts[:] = [{"verdict": "moved", "hit": "img"}, {"verdict": "ok"}]
+            self.assertEqual(cdp.touch_hit(page, hit, then=["READ"]), ("touch", ["read"]))
+            self.assertEqual((touched, hit["held"]), ([(30, 400), (5, 600)], 1))
+            self.assertEqual(page.calls, [("many", ["PLACE_JS", "GUARD_JS"])])  # placed again, armed again
+            # held every time: nothing was tapped, and it says so
+            verdicts[:] = [{"verdict": "moved", "hit": "div"}] * 3
+            with self.assertRaises(cdp.Held) as cm:
+                cdp.touch_hit(page, dict(hit, held=0), then=["READ"])
+            self.assertTrue(str(cm.exception).startswith(
+                "nothing was tapped: the page moved 'More' from under the touch 3 times (moved, div under the point;"))
+            self.assertEqual(cm.exception.verdict, "moved")
+            # the target gone (the page drew it again): nothing to aim at here
+            verdicts[:] = [{"verdict": "gone"}]
+            with self.assertRaises(cdp.Held) as cm:
+                cdp.touch_hit(page, dict(hit), then=["READ"])
+            self.assertEqual(cm.exception.verdict, "gone")
+            # no verdict (nothing armed, or a frame took the touch): as before
+            for v in (None, {"verdict": None}):
+                verdicts[:] = [v]
+                self.assertEqual(cdp.touch_hit(page, dict(hit), then=["READ"]), ("touch", ["read"]))
+        # a verdict that can't be read (the touch started a load): it went in
+        with mock.patch.object(cdp, "touch", lambda pg, x, y, then=(): ("touch", [RuntimeError("context destroyed"), "read"])):
+            self.assertEqual(cdp.touch_hit(page, dict(hit), then=["READ"]), ("touch", ["read"]))
+        # in a tap: a target the page replaced is found again by its words, once
+        found = {"found": True, "count": 1, "label": "more", "used": "More", "x": 300, "y": 400, "url": "u"}
+        page = _ScriptedPage(cdp, {"FIND_JS": found, "READ_JS": WEB_SCREEN})
+        tries = []
+
+        def touch_hit(pg, hit, then=()):
+            tries.append(hit)
+            if len(tries) == 1:
+                raise cdp.Held("nothing was tapped: gone", "gone")
+            return "touch", [{"result": {"value": WEB_SCREEN}}]
+        with mock.patch.object(cdp, "touch_hit", touch_hit):
+            self.assertEqual(cdp.tap(page, "More")["screen"], WEB_SCREEN)
+        self.assertEqual((len(tries), page.calls.count(("many", ["FIND_JS", "GUARD_JS"]))), (2, 2))
+        # held for moving: said as it is (the helper reports nothing was tapped)
+        with mock.patch.object(cdp, "touch_hit", mock.Mock(side_effect=cdp.Held("nothing was tapped: x", "moved"))):
+            with self.assertRaises(cdp.Held):
+                cdp.tap(page, "More")
 
     def test_a_tap_that_opens_a_new_tab_follows_it(self):
         # weather.gov, Oct 7: 'Get Detailed info' opened a new tab; the tap
