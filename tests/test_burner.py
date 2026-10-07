@@ -4487,6 +4487,14 @@ class HiddenControlTests(OfflineTestCase):
             '<node text="" class="android.widget.ImageView" package="com.google.android.youtube" '
             'content-desc="Play video" clickable="true" enabled="true" bounds="[459,474][619,634]"/>')
         self.assertIsNone(mod.hid_itself(PLAYER_SHOWN_XML, took, node))
+        # a progress bar beside the player counts the seconds on its own:
+        # the same row (YouTube, Oct 7: the reveal didn't happen for it)
+        def bar(xml, at):
+            return xml.replace('<node text="What It Takes"', '<node text="" class="android.widget.SeekBar" '
+                               'package="com.google.android.youtube" content-desc="0 minutes %d seconds of 13 '
+                               'minutes 30 seconds" clickable="true" enabled="true" bounds="[0,850][1080,870]"/>'
+                               '<node text="What It Takes"' % at)
+        self.assertEqual(mod.hid_itself(bar(PLAYER_SHOWN_XML, 3), bar(PLAYER_HIDDEN_XML, 7), node), "Video player")
         # something outside the player changed too: not the controls hiding
         self.assertIsNone(mod.hid_itself(PLAYER_SHOWN_XML, PLAYER_HIDDEN_XML.replace("What It Takes", "Next up"), node))
         # a screen the app moved to: its own words, none of the player's

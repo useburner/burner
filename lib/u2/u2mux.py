@@ -1441,6 +1441,7 @@ def loose_label_node(nodes, alts):
 
 NEW_WORDS_MAX = 2  # rows with words new on a read where controls hid themselves (a
                    # player's thin progress bar); a screen the app moved to has more
+_DIGITS = re.compile(r"\d+")
 
 
 def hid_itself(before, now, node):
@@ -1465,7 +1466,10 @@ def hid_itself(before, now, node):
         return None
 
     def key(n):
-        return n["cls"], n["text"], n["desc"], n["rect"]
+        # a value that counts on its own is the same row while its digits
+        # change (YouTube's progress bar under the hidden controls, "0
+        # minutes 7 seconds of 13 minutes 30 seconds", Oct 7)
+        return n["cls"], _DIGITS.sub("#", n["text"]), _DIGITS.sub("#", n["desc"]), n["rect"]
 
     def chain(nodes, i):
         """i and the indices of what holds nodes[i], nearest first."""
