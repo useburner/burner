@@ -309,7 +309,8 @@ class Page:
                     raise
                 self.ws.close()
                 self.handshake_again = True
-                self.ws = WebSocket(open_stream(dev), "/devtools/page/" + target)
+                # within the probe's bound (an adb open may take OPEN_S)
+                self.ws = WebSocket(open_stream(dev, timeout=min(OPEN_S, bound)), "/devtools/page/" + target)
                 self.ws.handshake(bound)
                 res = self.call_many(first, timeout=bound, raise_errors=False)
             for r in res[:2]:
@@ -1246,7 +1247,9 @@ def placeholders(screen):
     n = 0
     for r in (screen or {}).get("rows") or []:
         text, desc = (r.get("text") or "").strip(), (r.get("desc") or "").strip()
-        if _BUSY_WORDS.match(text) or (not text and _BUSY_LABEL.match(desc)):
+        # a label counts on a row that isn't a control (a photo's alt text
+        # "Loading dock ..." in a link is content, review of Oct 7)
+        if _BUSY_WORDS.match(text) or (not text and not r.get("click") and _BUSY_LABEL.match(desc)):
             n += 1
     return n
 

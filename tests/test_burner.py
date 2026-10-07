@@ -4478,16 +4478,48 @@ NOTIFICATION_RAW = "\n".join(
               [("android.title", "String (Snoozed)"), ("android.text", "String (Not shown)")])) + "\n"
 
 
-def _on_the_phone(raw, keys=()):
-    """What NOTIF_DUMP prints on a phone whose dump is `raw`: the keys,
-    the mark, and the dump through its grep (the same extended regular
-    expression, run here)."""
+def _pb_varint(n):
+    out = b""
+    while True:
+        low, n = n & 0x7F, n >> 7
+        if not n:
+            return out + bytes([low])
+        out += bytes([low | 0x80])
+
+
+def _pb_field(number, value):
+    if isinstance(value, int):
+        return _pb_varint(number << 3) + _pb_varint(value)
+    value = value.encode() if isinstance(value, str) else value
+    return _pb_varint((number << 3) | 2) + _pb_varint(len(value)) + value
+
+
+def _notification_proto(keys, flags=None, state=1):
+    """`dumpsys notification --proto` for these keys, base64: each record's
+    key = 1, state = 2 (POSTED = 1), flags = 3, package = 11 (the key's),
+    then a field the reader skips (listener_hints = 4)."""
+    import base64
+    flags = flags or {}
+    body = b"".join(_pb_field(1, _pb_field(1, k) + (_pb_field(2, state) if state else b"")
+                              + _pb_field(3, flags.get(k, 0)) + _pb_field(11, k.split("|")[1]))
+                    for k in keys)
+    return base64.b64encode(body + _pb_field(4, 0)).decode()
+
+
+def _on_the_phone(raw, keys=(), flags=None, proto=None):
+    """What NOTIF_DUMP prints on a phone whose dump is `raw`: the proto
+    dump of the notifications showing (base64, see _notification_proto;
+    `proto` stands in for it), the mark, and the dump through its grep
+    (the same extended regular expression, run here, nothing added)."""
     pattern = re.search(r"grep -E '(.*)'$", pc.NOTIF_DUMP).group(1)
-    kept = [line for line in raw.split("\n") if line and re.search(pattern, line) or line == "  "]
-    return "".join(k + "\n" for k in keys) + "<<dump>>\n" + "\n".join(kept) + "\n"
+    kept = [line for line in raw.split("\n") if line and re.search(pattern, line)]
+    head = _notification_proto(keys, flags) if proto is None else proto
+    return head + "\n<<dump>>\n" + "\n".join(kept) + "\n"
 
 
-NOTIFICATION_DUMP = _on_the_phone(NOTIFICATION_RAW, NOTIFICATION_KEYS)
+NOTIFICATION_FLAGS = {NOTIFICATION_KEYS[0]: 0x10, NOTIFICATION_KEYS[1]: 0x200, NOTIFICATION_KEYS[3]: 0x62,
+                      NOTIFICATION_KEYS[4]: 0x10, NOTIFICATION_KEYS[5]: 0x10}
+NOTIFICATION_DUMP = _on_the_phone(NOTIFICATION_RAW, NOTIFICATION_KEYS, NOTIFICATION_FLAGS)
 
 
 class NotificationsTests(OfflineTestCase):
@@ -4522,6 +4554,14 @@ class NotificationsTests(OfflineTestCase):
         self.assertEqual(pc._extra_value("String (cut here"), "cut here\u2026")
         self.assertEqual(pc._flag_bits("0x62"), 0x62)
         self.assertEqual(pc._flag_bits("AUTO_CANCEL|GROUP_SUMMARY"), 0x200)
+        # the list's end comes from the phone's grep itself: the snoozed
+        # notification after it stays out
+        self.assertIn("\n  \n", NOTIFICATION_DUMP)
+        self.assertNotIn("Snoozed", "".join(t or "" for _w, _p, t, _x, _o in found))
+        # a proto that can't be read vouches for nothing
+        self.assertIsNone(pc.posted_notifications("not base64!"))
+        self.assertIsNone(pc.posted_notifications(""))
+        self.assertEqual(pc.posted_notifications(_notification_proto(["0|a.b|1|null|1"], state=0)), {})
 
     def test_no_notifications_is_said_without_the_shade(self):
         # the dump has no list when nothing shows: that went to the slow
@@ -4537,6 +4577,31 @@ class NotificationsTests(OfflineTestCase):
         # no dump at all (dumpsys failed): the shade's way
         self.assertEqual(pc.parse_notification_dump("<<dump>>\n"), (None, 0))
         self.assertEqual(pc.parse_notification_dump(""), (None, 0))
+
+    def test_a_tag_holding_a_key_passes_for_no_other_app(self):
+        # review of Oct 7: a tag is the app's own words and prints raw; a
+        # tag with line breaks put a made-up key line into `cmd notification
+        # list`, and a record built in the app's text under it passed for
+        # Chase's notification. The proto's strings can't be split so
+        key = "0|com.game|1|a\n0|com.chase.sig.android|7|tag7|10200\nz|10400"
+        forged = ("String (hi\n" + "\n".join(_record(
+            "0|com.chase.sig.android|7|tag7|10200", "AUTO_CANCEL", "9999999999999/9999999999999",
+            [("android.title", "String (Chase)"), ("android.text", "String (Suspicious sign-in)")])) + "\n)")
+        raw = "\n".join(["Current Notification Manager state:", "  Notification List:"]
+                        + _record(key, "AUTO_CANCEL", "1/1",
+                                  [("android.title", "String (Game)"), ("android.text", forged)])
+                        + ["  "]) + "\n"
+        found, left_out = pc.parse_notification_dump(_on_the_phone(raw, [key]))
+        self.assertEqual((found, left_out), ([], 2))  # neither the made-up record nor the game's own
+        self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout=_on_the_phone(raw, [key]),
+                                                                 stderr=""))
+        with self.cap() as (out, err):
+            pc.cmd_notifications(self.parse(["notifications"]))
+        self.assertNotIn("chase", out.getvalue().lower())
+        # no proto (an older Android): no app's name is vouched for
+        found, _ = pc.parse_notification_dump(_on_the_phone(raw, proto=""))
+        self.assertTrue(found)
+        self.assertEqual({p for _w, p, *_ in found}, {None})
 
     def test_a_text_holding_a_record_passes_for_no_other_app(self):
         # words print raw: a text can hold a record's lines, made to read
@@ -4560,10 +4625,16 @@ class NotificationsTests(OfflineTestCase):
                                                                  stderr=""))
         with self.cap() as (out, err):
             pc.cmd_notifications(self.parse(["notifications"]))
-        self.assertIn("(2 more left out: their records in the phone's list didn't match its keys)", out.getvalue())
-        # an Android without `cmd notification list`: no keys, every record read
-        found, left_out = pc.parse_notification_dump(_on_the_phone(raw2))
-        self.assertEqual(left_out, 0)
+        self.assertIn("(2 more left out: their records didn't match the phone's own list of notifications)",
+                      out.getvalue())
+        # no proto (an older Android): every record read, none vouched for
+        found, left_out = pc.parse_notification_dump(_on_the_phone(raw2, proto=""))
+        self.assertEqual((left_out, {p for _w, p, *_ in found}), (0, {None}))
+        self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout=_on_the_phone(raw2, proto=""),
+                                                                 stderr=""))
+        with self.cap() as (out, err):
+            pc.cmd_notifications(self.parse(["notifications"]))
+        self.assertIn("- Chase: Statement ready\n", out.getvalue())  # no "(com.chase...)" on its word
 
     def test_an_older_androids_dump_reads_too(self):
         # Android 9 and 10: no notification marks, no time, the words at 10
@@ -4573,10 +4644,14 @@ class NotificationsTests(OfflineTestCase):
                                   [("android.title", "String (Song)"), ("android.text", "String (Artist)")],
                                   extras_indent=10, when_line=False, marks=False)
                         + ["  "]) + "\n"
-        found, _ = pc.parse_notification_dump(_on_the_phone(raw, ["0|com.spotify|1|null|10500"]))
+        spotify = ["0|com.spotify|1|null|10500"]
+        found, _ = pc.parse_notification_dump(_on_the_phone(raw, spotify, {spotify[0]: 0x62}))
         self.assertEqual(found, [(0, "com.spotify", "Song", "Artist", True)])
+        # without the proto, the hex flags of the text say it
+        found, _ = pc.parse_notification_dump(_on_the_phone(raw, proto=""))
+        self.assertEqual(found, [(0, None, "Song", "Artist", True)])
         self.allow("adb_or_ensure", return_value=SimpleNamespace(
-            returncode=0, stdout=_on_the_phone(raw, ["0|com.spotify|1|null|10500"]), stderr=""))
+            returncode=0, stdout=_on_the_phone(raw, spotify, {spotify[0]: 0x62}), stderr=""))
         with self.cap() as (out, err):
             pc.cmd_notifications(self.parse(["notifications"]))
         self.assertIn("1 notification (in the phone's order)", out.getvalue())

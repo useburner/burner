@@ -5251,9 +5251,10 @@ def _shade(what):
 
 
 # What `burner notifications` reads on the phone, in one adb call: the
-# keys of the notifications showing (`cmd notification list`; nothing on
-# an Android without it), then `dumpsys notification --noredact` cut to
-# the lines it needs, each held to the shape AOSP prints it in
+# notifications showing as `dumpsys notification --proto` lists them (in
+# base64: each one's key, package and flags, as length-prefixed strings
+# that no notification's words can split), then `dumpsys notification
+# --noredact` cut to the lines it needs, each held to the shape AOSP prints it in
 # (NotificationRecord.dump): the dump's first line; the list's head and
 # its end (a line of two spaces); record heads (4 spaces); flags and the
 # notification/publicNotification marks (6); times (12); the words (16,
@@ -5261,7 +5262,7 @@ def _shade(what):
 # text that runs over several lines puts its next line anywhere: one at
 # column 0 ended the list, and every notification after it was lost
 # (review of Oct 7); a line held to these shapes isn't taken for one.
-NOTIF_DUMP = ("cmd notification list 2>/dev/null; echo '<<dump>>'; "
+NOTIF_DUMP = ("dumpsys notification --proto | base64 | tr -d '\\n'; echo; echo '<<dump>>'; "
               "dumpsys notification --noredact | grep -E "
               "'^Current Notification Manager state|^  Notification List:$|^  $"
               "|^    NotificationRecord\\(|^      flags=|^      notification=$|^      publicNotification=$"
@@ -5281,6 +5282,69 @@ def _flag_bits(flags):
         return int(flags, 16)
     names = re.split(r"[|\s]+", flags)
     return sum(b for name, b in _FLAG_BITS.items() if name in names)
+
+
+def _proto_fields(data):
+    """A protobuf message's top-level fields, [(number, wire type, value)]:
+    a varint as an int, a length-prefixed field as bytes, fixed ones as
+    bytes. Raises ValueError on a malformed message. Pure."""
+    def varint(i):
+        n = shift = 0
+        while True:
+            if i >= len(data):
+                raise ValueError("a varint runs past the end")
+            c = data[i]
+            i += 1
+            n |= (c & 0x7F) << shift
+            if c < 0x80:
+                return n, i
+            shift += 7
+    out, i = [], 0
+    while i < len(data):
+        tag, i = varint(i)
+        number, wire = tag >> 3, tag & 7
+        if wire == 0:
+            value, i = varint(i)
+        elif wire == 2:
+            size, i = varint(i)
+            if i + size > len(data):
+                raise ValueError("a field runs past the end")
+            value, i = data[i:i + size], i + size
+        elif wire in (1, 5):
+            size = 8 if wire == 1 else 4
+            value, i = data[i:i + size], i + size
+        else:
+            raise ValueError("wire type {}".format(wire))
+        out.append((number, wire, value))
+    return out
+
+
+def posted_notifications(b64):
+    """The notifications showing, from `dumpsys notification --proto` (as
+    base64: NotificationServiceDumpProto, its records = 1; each record's
+    key = 1, state = 2 (POSTED = 1), flags = 3, package = 11): {key:
+    (package, flags)}. Its strings are length-prefixed, so no word of a
+    notification can pass for another record, as words can in the text
+    dump (review of Oct 7). None when it can't be read. Pure."""
+    import base64
+    try:
+        data = base64.b64decode((b64 or "").strip(), validate=True)
+        if not data:
+            return None
+        out = {}
+        for number, wire, value in _proto_fields(data):
+            if number != 1 or wire != 2:
+                continue
+            rec = {n: v for n, w, v in _proto_fields(value)}
+            if rec.get(2) != 1 or not isinstance(rec.get(1), bytes):
+                continue  # queued or snoozed, not showing
+            pkg = rec.get(11)
+            out[rec[1].decode("utf-8", "replace")] = (
+                pkg.decode("utf-8", "replace") if isinstance(pkg, bytes) else "",
+                rec.get(3) if isinstance(rec.get(3), int) else 0)
+        return out
+    except (ValueError, TypeError):
+        return None
 
 
 def _extra_value(raw):
@@ -5308,17 +5372,19 @@ def parse_notification_dump(text):
     notification's own, never its lock screen version's. found is None
     when the text holds no dump (dumpsys failed: the shade, then), [] when
     the phone shows no notification (the dump has no list then). With the
-    keys of the notifications showing (the lines before "<<dump>>"), a
-    record counts only under a key listed, and listed once: words print
-    raw, and a text holding a record's lines would read as another app's
-    notification (review of Oct 7); left_out counts the records dropped
-    so. Pure."""
+    notifications showing from the proto dump (the line before
+    "<<dump>>", see posted_notifications), a record counts only under one
+    of their keys, once, and is that key's package with its flags: words
+    print raw, and a text holding a record's lines, or a tag holding a
+    key's, read as another app's notification (reviews of Oct 7);
+    left_out counts the records dropped so. Without the proto (an older
+    Android), the package is None: no app's name is vouched for. Pure."""
     head, sep, dump = (text or "").partition("<<dump>>")
     if not sep:
         head, dump = "", head
     if "Current Notification Manager state" not in dump:
         return None, 0
-    keys = {k.strip() for k in head.splitlines() if re.match(r"^-?\d+\|\S", k.strip())}
+    posted = posted_notifications(head)
     recs, rec, in_list = [], None, False
     for line in dump.splitlines():
         line = line.rstrip("\r")
@@ -5352,20 +5418,23 @@ def parse_notification_dump(text):
                 rec["seen"].add(m.group(1))
                 rec[m.group(1)] = _extra_value(m.group(2))
     count = {}
-    if keys:
+    if posted is not None:
         for r in recs:
-            r["key"] = next((k for k in keys if " key=" + k + ": " in r["head"]), None)
+            r["key"] = next((k for k in posted if " key=" + k + ": " in r["head"]), None)
             count[r["key"]] = count.get(r["key"], 0) + 1
     found, left_out = [], 0
     for r in recs:
-        if keys and (r["key"] is None or count[r["key"]] > 1):
+        if posted is not None and (r["key"] is None or count[r["key"]] > 1):
             left_out += 1
             continue
-        bits = _flag_bits(r["flags"])
+        if posted is not None:
+            pkg, bits = posted[r["key"]]
+        else:
+            pkg, bits = None, _flag_bits(r["flags"])
         words = r["text"] or r["bigText"]
         if bits & _FLAG_BITS["GROUP_SUMMARY"] or not (r["title"] or words):
             continue
-        found.append((r["when"], r["pkg"], r["title"], words, bool(bits & _ONGOING_BITS)))
+        found.append((r["when"], pkg, r["title"], words, bool(bits & _ONGOING_BITS)))
     found.sort(key=lambda r: -r[0])
     return found, left_out
 
@@ -5400,9 +5469,10 @@ def cmd_notifications(args):
     for _when, pkg, title, text, ongoing in found:
         words = ": ".join(w for w in (title, text) if w)
         words = words if len(words) <= 200 else words[:199] + "\u2026"
-        print("- {} ({}{})".format(words, pkg, ", ongoing" if ongoing else ""))
+        notes = ", ".join(n for n in (pkg, "ongoing" if ongoing else "") if n)
+        print("- {}{}".format(words, " ({})".format(notes) if notes else ""))
     if left_out:
-        print("({} more left out: {} record{} in the phone's list didn't match its keys)".format(
+        print("({} more left out: {} record{} didn't match the phone's own list of notifications)".format(
             left_out, "its" if left_out == 1 else "their", "" if left_out == 1 else "s"))
     return 0
 
