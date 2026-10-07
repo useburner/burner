@@ -735,7 +735,11 @@ def _helper_log(line):
     """A line in the UI helper's own log (run/u2mux.log), with the time of
     day, for what the CLI did about the helper. Never raises."""
     try:
-        with open(os.path.join(ROOT, "run", "u2mux.log"), "a", encoding="utf-8") as f:
+        # readable by its owner alone, as the helper keeps it (it holds
+        # what the screens said)
+        path = os.path.join(ROOT, "run", "u2mux.log")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write("{} {}\n".format(time.strftime("%H:%M:%S"), line))
     except OSError:
         pass

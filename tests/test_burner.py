@@ -5927,6 +5927,21 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(len(batches), 2)
         self.assertEqual(mod.words_changed(SAMPLE_XML, results), [("-", "Hello"), ("+", "Search results")])
         self.assertEqual(mod.words_changed(SAMPLE_XML, moved), [])
+        # a field's words never: a password its eye button shows (review, Oct 7)
+        pw = SAMPLE_XML.replace('content-desc="Search"', 'content-desc="Password"')
+        shown = pw.replace('text="" resource-id="com.example:id/q"', 'text="hunter2" resource-id="com.example:id/q"')
+        self.assertIn("hunter2", shown)
+        self.assertEqual(mod.words_changed(pw, shown), [])
+        # a tap that put the focus in a text field: its doing, no second look
+        unfocused = SAMPLE_XML.replace('focused="true"', 'focused="false"')
+        self.assertEqual(mod.focused_field(SAMPLE_XML), ("com.example:id/q", (500, 650)))
+        self.assertIsNone(mod.focused_field(unfocused))
+        self.assertEqual(run({"tap": [500, 650], "tapped_label": "Search", "idle": 1200}, SAMPLE_XML,
+                             before=unfocused), SAMPLE_XML)
+        self.assertEqual(len(batches), 1)
+        # the same read as before still gets it
+        run({"tap": [500, 650], "idle": 1200}, SAMPLE_XML, before=SAMPLE_XML)
+        self.assertEqual(len(batches), 2)
         # a tap by words, its row still there and nothing new, rows gone (the
         # page fading out for the screen it opened): a second look
         fading = SAMPLE_XML.replace('text="Hello"', 'text=""')

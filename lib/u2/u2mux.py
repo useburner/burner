@@ -53,6 +53,18 @@ LOG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
 LOG_CAP = 1 << 20  # the log starts over past this size
 
 
+def own_log(path, mode="a"):
+    """`path` opened to write, readable by its owner alone: it holds what
+    the screens said (review, Oct 7). An older file is made so too."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | (os.O_APPEND if mode == "a" else os.O_TRUNC), 0o600)
+    try:
+        if os.stat(path).st_mode & 0o077:
+            os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return os.fdopen(fd, mode, encoding="utf-8")
+
+
 def log(*a):
     """A line to stderr and to run/u2mux.log (the helper's stderr goes
     nowhere once it runs in the background; the file says what it did,
@@ -63,7 +75,7 @@ def log(*a):
         mode = "a"
         if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_CAP:
             mode = "w"
-        with open(LOG_FILE, mode, encoding="utf-8") as f:
+        with own_log(LOG_FILE, mode) as f:
             f.write("%s %s\n" % (time.strftime("%H:%M:%S"), line))
     except OSError:
         pass
@@ -1423,11 +1435,12 @@ def screen_words(xml):
         return None
 
 
-def nothing_new(xml, before):
+def nothing_new(xml, before, words=None):
     """Whether a read after an action shows no row the read before didn't
     (see screen_words: the same rows, or fewer, places and focus aside):
-    a screen still fading out for the next one. Pure."""
-    a, b = screen_words(xml), screen_words(before)
+    a screen still fading out for the next one. words: the two reads'
+    screen_words, when worked out already. Pure."""
+    a, b = words if words is not None else (screen_words(xml), screen_words(before))
     if not a or b is None:
         return False
     pool = list(b)
@@ -1440,15 +1453,33 @@ def nothing_new(xml, before):
 
 def words_changed(before, after):
     """The rows' words in one read and not the other, as ("-" or "+", the
-    words cut to 40 characters), switch states aside; None for a read that
-    can't be parsed. Pure."""
-    a, b = screen_words(before), screen_words(after)
-    if a is None or b is None:
+    words cut to 40 characters), switch states aside and text fields too:
+    what is typed in one can be a password its eye button shows, never
+    logged (review, Oct 7). None for a read that can't be parsed. Pure."""
+    def rows(xml):
+        try:
+            return [n["text"] or n["desc"] for n in iter_nodes(xml)
+                    if n["pkg"] != SYSTEM_UI and (n["text"] or n["desc"]) and not n["field"]]
+        except Exception:
+            return None
+    ta, tb = rows(before), rows(after)
+    if ta is None or tb is None:
         return None
-    ta, tb = [(t or d) for t, d, _c in a], [(t or d) for t, d, _c in b]
     gone = [w for w in ta if w not in tb]
     came = [w for w in tb if w not in ta]
     return [("-", w[:40]) for w in gone] + [("+", w[:40]) for w in came]
+
+
+def focused_field(xml):
+    """The text field with the focus on a read, as (resource id, centre),
+    or None. Pure."""
+    try:
+        for n in iter_nodes(xml):
+            if n["field"] and n["focused"]:
+                return n["rid"], tuple(n["center"])
+    except Exception:
+        pass
+    return None
 
 
 def worded_rows(xml):
@@ -2999,17 +3030,23 @@ class U2Daemon:
                 if woke and acted:
                     raise RuntimeError("act failed after sending: the screen was off, so "
                                        "it was probably dropped; the screen is on now")
-            if (before and acted and "set_text" not in spec and not sleeps_the_screen(spec)
-                    and not chrome_in(xml)
-                    and (screen_sig(xml) == screen_sig(before) or half_drawn_after(xml, before)
-                         or (screen_words(xml) is not None and screen_words(xml) == screen_words(before))
+            looked = before and acted and "set_text" not in spec
+            again = False
+            if looked and not sleeps_the_screen(spec) and not chrome_in(xml):
+                words = screen_words(xml), screen_words(before)
+                # the focus moved into a text field: the tap's own doing,
+                # there to see (a second look cost a read, review Oct 7)
+                into_field = focused_field(xml) not in (None, focused_field(before))
+                again = (screen_sig(xml) == screen_sig(before) or half_drawn_after(xml, before)
+                         or (not into_field and words[0] is not None and words[0] == words[1])
                          # a tap by words that left its row there and brought
                          # nothing new: the screen fading out for the next one
                          # (Settings' search, Oct 7)
-                         or (spec.get("tapped_label") and nothing_new(xml, before)
-                             and find_node(xml, spec["tapped_label"], fuzzy=False) is not None))):
+                         or (not into_field and spec.get("tapped_label") and nothing_new(xml, before, words)
+                             and find_node(xml, spec["tapped_label"], fuzzy=False) is not None))
+            if again:
                 xml = self._relook(xml)
-            elif before and acted and "set_text" not in spec:
+            elif looked:
                 # changed, and no second look: how (a tap that opened
                 # another app's screen read as the page before it, changed
                 # in some rows, and nothing said how, Oct 7)
