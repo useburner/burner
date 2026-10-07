@@ -5122,11 +5122,99 @@ def _shade(what):
         return False
 
 
+# What `dumpsys notification --noredact` is cut to on the phone: section
+# heads, record heads, flags, times and the words (the whole dump is
+# thousands of lines of channels and preferences).
+NOTIF_DUMP = ("dumpsys notification --noredact | grep -E "
+              "'^ ?[A-Za-z]|^  [A-Za-z]|NotificationRecord\\(|^ *flags=|^ *when=|^ *android\\.(title|text|bigText)='")
+
+
+def _extra_value(raw):
+    """A notification extra as dumpsys prints it ("String (Muse)",
+    "SpannableString (...)", "null"): its words, or None. Pure."""
+    raw = raw.strip()
+    if raw in ("", "null"):
+        return None
+    m = re.match(r"^[A-Za-z][\w.$]* \((.*)\)$", raw)
+    return (m.group(1) if m else raw).strip() or None
+
+
+def parse_notification_dump(text):
+    """The notifications of `dumpsys notification --noredact`, from its
+    "Notification List" section only (not the snoozed ones, nor the
+    archive): [(when_ms, pkg, title, text, ongoing)], the newest first.
+    The first title and text of a record are its own (a second pair is its
+    lock screen version); a record with neither (a group's summary) is left
+    out. Pure."""
+    out, rec, in_list = [], None, False
+
+    def flush(r):
+        if r and (r["title"] or r["text"]):
+            ongoing = any(f in r["flags"] for f in ("ONGOING_EVENT", "FOREGROUND_SERVICE"))
+            out.append((r["when"], r["pkg"], r["title"], r["text"] or r["bigText"], ongoing))
+    for line in (text or "").splitlines():
+        if re.match(r"^ {0,2}\S", line):  # a section's head
+            flush(rec)
+            rec, in_list = None, line.strip().startswith("Notification List")
+            continue
+        if not in_list:
+            continue
+        s = line.strip()
+        m = re.match(r"NotificationRecord\(0x[0-9a-fA-F]+: pkg=(\S+)", s)
+        if m:
+            flush(rec)
+            rec = {"pkg": m.group(1), "title": None, "text": None, "bigText": None,
+                   "when": 0, "flags": "", "seen": set()}
+            continue
+        if rec is None:
+            continue
+        if s.startswith("flags=") and not rec["flags"]:
+            rec["flags"] = s[len("flags="):]
+        elif s.startswith("when=") and not rec["when"]:
+            m = re.match(r"when=(\d+)", s)
+            rec["when"] = int(m.group(1)) if m else 0
+        else:
+            m = re.match(r"android\.(title|text|bigText)=(.*)$", s)
+            if m and m.group(1) not in rec["seen"]:
+                rec["seen"].add(m.group(1))
+                rec[m.group(1)] = _extra_value(m.group(2))
+    flush(rec)
+    out.sort(key=lambda r: -r[0])
+    return out
+
+
+def _notifications_from_dump():
+    """parse_notification_dump on the phone's dump, or None when it can't
+    be had or holds nothing (an older Android: the shade, then)."""
+    try:
+        r = adb_or_ensure("shell", NOTIF_DUMP, timeout=20)
+    except Exception as e:
+        _trace("notification dump failed: {}".format(e))
+        return None
+    found = parse_notification_dump(getattr(r, "stdout", "") or "")
+    return found or None
+
+
 def cmd_notifications(args):
     """Summarise every notification the phone is showing, without touching
-    them. Pulls the shade down, reads it (scrolling for more), closes it.
-    Android hides notification text from dumpsys, so the shade is the only
-    place the words are."""
+    them: the notification manager's own list (`dumpsys notification
+    --noredact`, one adb call, the screen untouched), else the shade pulled
+    down, read (scrolling for more) and closed. The shade's read was slow
+    and, with SystemUI holding a stale open shade, said "1 notification"
+    where the phone held eighteen (Oct 7)."""
+    found = _notifications_from_dump()
+    if found:
+        print("{} notification{} (newest first)".format(len(found), "" if len(found) == 1 else "s"))
+        for _when, pkg, title, text, ongoing in found:
+            words = ": ".join(w for w in (title, text) if w)
+            words = words if len(words) <= 200 else words[:199] + "\u2026"
+            print("- {} ({}{})".format(words, pkg, ", ongoing" if ongoing else ""))
+        return 0
+    return _notifications_from_shade()
+
+
+def _notifications_from_shade():
+    """The shade's way: pulled down, read (scrolling for more), closed."""
     # The scrcpy helper's open connection wakes the screen and pulls the
     # shade down in a few milliseconds; else one adb call does both (about
     # a second over the link). Closed first: SystemUI can keep a stale

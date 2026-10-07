@@ -4310,11 +4310,71 @@ class HelperStalenessTests(OfflineTestCase):
         pc._u2_checked = True
 
 
+NOTIFICATION_DUMP = """Current Notification Manager state:
+  Notification List:
+    NotificationRecord(0x00f6e923: pkg=com.facebook.aura user=UserHandle{0} id=-346505250 tag=null importance=4
+      flags=AUTO_CANCEL
+            when=1791343200000/1791343200000
+                android.title=String (Muse)
+                android.text=String (Ten o'clock, Zach (time to wind down))
+    NotificationRecord(0x002f5a9d: pkg=com.google.android.googlequicksearchbox user=UserHandle{0} id=0 tag=x::SUMMARY::
+      flags=GROUP_SUMMARY
+            when=1791343213898/1791343213898
+                android.title=null
+                android.text=null
+            when=1791343213908/1791343213908
+                android.title=String (Google)
+                android.text=String (You have a notification)
+    NotificationRecord(0x062c565e: pkg=com.google.android.googlequicksearchbox user=UserHandle{0} id=1 tag=wx
+      flags=0x0
+            when=1791343300000/1791343300000
+                android.title=SpannableString (Cooling over next 2 days)
+                android.text=SpannableString (See full forecast for Woodbury)
+     NotificationRecord(0x0b7b9482: pkg=com.wispr.flowapp user=UserHandle{0} id=7 tag=null
+       flags=ONGOING_EVENT|NO_CLEAR|FOREGROUND_SERVICE
+            when=1791340000000/1791340000000
+                android.title=String (Wispr Flow)
+                android.text=null
+                android.bigText=String (Dictation ready)
+  Notification attention state:
+  Snoozed notifications:
+    NotificationRecord(0x0aaaaaaa: pkg=com.snoozed.app user=UserHandle{0} id=9 tag=null
+      flags=0x0
+            when=1791343400000/1791343400000
+                android.title=String (Snoozed)
+                android.text=String (Not shown)
+"""
+
+
 class NotificationsTests(OfflineTestCase):
+    def test_notifications_come_from_the_notification_manager(self):
+        # Oct 7: the shade's read was slow and, with SystemUI holding a stale
+        # open shade, said "1 notification" where the phone held eighteen
+        found = pc.parse_notification_dump(NOTIFICATION_DUMP)
+        self.assertEqual([(p, t, x, o) for _w, p, t, x, o in found], [
+            ("com.google.android.googlequicksearchbox", "Cooling over next 2 days",
+             "See full forecast for Woodbury", False),
+            ("com.facebook.aura", "Muse", "Ten o'clock, Zach (time to wind down)", False),
+            ("com.wispr.flowapp", "Wispr Flow", "Dictation ready", True)])  # newest first; no summary, no snoozed
+        adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout=NOTIFICATION_DUMP, stderr=""))
+        sc = self.allow("scrcpy_send")
+        with self.cap() as (out, err):
+            rc = pc.cmd_notifications(self.parse(["notifications"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertIn("3 notifications (newest first)", out.getvalue())
+        self.assertIn("- Muse: Ten o'clock, Zach (time to wind down) (com.facebook.aura)", out.getvalue())
+        self.assertIn("- Wispr Flow: Dictation ready (com.wispr.flowapp, ongoing)", out.getvalue())
+        self.assertEqual(adb.call_count, 1)
+        self.assertIn("dumpsys notification --noredact", adb.call_args[0][1])
+        sc.assert_not_called()  # the shade is never touched
+        self.assertEqual(pc._extra_value("null"), None)
+        self.assertEqual(pc._extra_value("String (a (b) c)"), "a (b) c")
+
     def test_a_shade_that_draws_nothing_is_reset_once(self):
         # Oct 7: the shade window held the focus and drew nothing; neither
         # the command nor a finger opened it until quick settings opened
         # and closed
+        self.allow("_notifications_from_dump", return_value=None)
         self.allow("scrcpy_send", return_value=True)
         self.allow("u2_invalidate")
         self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
@@ -4339,6 +4399,7 @@ class NotificationsTests(OfflineTestCase):
 
     def test_the_shade_pages_over_the_scrcpy_helper(self):
         # Oct 7: twelve notifications took 5.5s, two adb swipes and pauses
+        self.allow("_notifications_from_dump", return_value=None)
         sc = self.allow("scrcpy_send", return_value=True)
         self.allow("wake")
         self.allow("u2_invalidate")
@@ -4369,6 +4430,7 @@ class NotificationsTests(OfflineTestCase):
         adb_swipe.assert_called_once_with("down")
 
     def test_the_shade_opens_and_closes_through_the_scrcpy_helper(self):
+        self.allow("_notifications_from_dump", return_value=None)  # an older Android: the shade's way
         sc = self.allow("scrcpy_send", return_value=True)
         settle = self.allow("settle_only")  # the shade drawn to its end first (Oct 7)
         adb = self.allow("adb_or_ensure")
