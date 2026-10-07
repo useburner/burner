@@ -2775,8 +2775,10 @@ class FastPathTests(OfflineTestCase):
         sc.assert_called_with("swipe 540 1920 540 480 250")
         adb.assert_not_called()
         dump.assert_not_called()  # the one read rides on the helper's act
+        # (the dump is the helper's newest read, from before the swipes: no
+        # trip to the phone)
         self.assertEqual([c[0][0] for c in u2sock.call_args_list],
-                         ["screen", "act", "screen"])
+                         ["screen", "dump", "act", "screen"])
         self.assertIn("scroll left com.example", err.getvalue())
         self.assertIn("screen: com.android.launcher", out.getvalue())
 
@@ -2818,7 +2820,9 @@ class FastPathTests(OfflineTestCase):
         self.assertIn("screen: com.example", out.getvalue())
         self.assertIn("Hello (300,250)", out.getvalue())
         # still in the app per the read: no second screen-info round trip
-        self.assertEqual([c[0][0] for c in pc.u2sock.call_args_list], ["screen", "act"])
+        # (the dump: the helper's newest read, no trip to the phone)
+        self.assertEqual([c[0][0] for c in pc.u2sock.call_args_list], ["screen", "dump", "act"])
+        self.assertEqual(pc.u2sock.call_args_list[1][0][:2], ("dump", "cached"))
 
     def test_plain_scroll_one_adb_call_and_no_dump(self):
         self.allow("wake")
@@ -11148,6 +11152,7 @@ class AirbnbRoundTests(OfflineTestCase):
         self.allow("live_screen_dims", return_value=(1080, 2400))
         self.allow("_scrcpy_swipe", return_value=True)
         self.allow("read_after_root", return_value=(ET.fromstring(SAMPLE_XML), ""))
+        self.allow("_cached_root", return_value=None)  # no read before the swipes known
         log = os.path.join(tempfile.mkdtemp(), "commands.log")
         with open(log, "w", encoding="utf-8") as f:
             f.write(up(30) + up(10))
@@ -11168,6 +11173,27 @@ class AirbnbRoundTests(OfflineTestCase):
             pc._scroll_plain("up", 2)
             pc._scroll_plain("down", 1)
         self.assertNotIn("in a row", out.getvalue())
+
+    def test_a_scroll_that_moved_nothing_says_so(self):
+        # YouTube's Shorts, Oct 7: `scroll up` on the first Short printed the
+        # same Short, and the swipes after it were taken for the next one
+        shorts = SAMPLE_XML.replace('text="Hello"', 'text="0:13 of 0:41"')
+        self.allow("live_screen_dims", return_value=(1080, 2400))
+        self.allow("_scrcpy_swipe", return_value=True)
+        self.allow("read_after_root", return_value=(ET.fromstring(shorts), ""))
+        self.allow("_cached_root", return_value=ET.fromstring(SAMPLE_XML.replace('text="Hello"', 'text="0:11 of 0:41"')))
+        log = os.path.join(tempfile.mkdtemp(), "none.log")
+        with mock.patch.object(pc, "COMMANDS_LOG", log), mock.patch.object(pc, "_screen_pkg", "com.example"), \
+                mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertEqual(pc._scroll_plain("up", 1), 0)
+        self.assertIn("scrolled up x1\n  (nothing moved: this is the top. In a feed of videos or posts, the next "
+                      "one is `burner scroll down`)", out.getvalue())
+        # it moved: nothing said
+        self.allow("_cached_root", return_value=ET.fromstring(SAMPLE_XML.replace('text="Hello"', 'text="Earlier"')))
+        with mock.patch.object(pc, "COMMANDS_LOG", log), mock.patch.object(pc, "_screen_pkg", "com.example"), \
+                mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertEqual(pc._scroll_plain("down", 1), 0)
+        self.assertNotIn("nothing moved", out.getvalue())
 
     def test_burner_tabs_lists_chrome_s_tabs(self):
         mod = _u2mux()

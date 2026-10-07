@@ -5184,6 +5184,11 @@ def _scroll_plain(direction, times, quiet=False):
         rc = _web_scroll(direction, times, quiet=quiet)
         if rc is not None:
             return rc
+    # the screen before the swipes, the helper's newest read (no trip):
+    # a scroll that moved nothing is said (a `scroll up` on the first of
+    # YouTube's Shorts printed the same Short, unremarked, and the next
+    # swipes the same way were taken for the next one, Oct 7)
+    before = None if quiet else _cached_root()
     for i in range(times):
         if not _scrcpy_swipe(direction):
             return _scroll_plain_adb(direction, times - i, quiet=quiet)
@@ -5214,13 +5219,31 @@ def _scroll_plain(direction, times, quiet=False):
               file=sys.stderr)
     else:
         print("scrolled {} x{}".format(direction, times))
-        if times == 1:
+        if root is not None and before is not None and same_rows(root, before):
+            print("  " + SCROLL_STILL.get(direction, "(nothing moved this way)"))
+        elif times == 1:
             hint = scroll_hint(direction)
             if hint:
                 print("  " + hint)
     if root is not None:
         print_screen(root, note=note)
     return 1 if left else 0
+
+
+# Said when a scroll moved nothing: the end of the list that way. A feed
+# of videos or posts shows its next one with `scroll down` (the finger
+# swipes up); `scroll up` on its first one moves nothing.
+SCROLL_STILL = {"up": "(nothing moved: this is the top. In a feed of videos or posts, the next one "
+                      "is `burner scroll down`)",
+                "down": "(nothing moved: the end of the list this way, or the swipe was dropped)"}
+
+
+def same_rows(a, b):
+    """Whether two reads show the same rows, their digits aside (a video's
+    time and a like count go on changing by themselves). Pure."""
+    def rows(root):
+        return [re.sub(r"\d+", "#", line) for line in visible_lines(walk(root))]
+    return rows(a) == rows(b)
 
 
 def _scroll_plain_adb(direction, times, quiet=False):
