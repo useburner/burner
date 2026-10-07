@@ -1352,27 +1352,56 @@ TEXT_JS = r"""
   const text = raw.replace(/[ \t\u00a0]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
   const inside = i => i > 0 && i < text.length && (text.charCodeAt(i) & 0xFC00) === 0xDC00
     && (text.charCodeAt(i - 1) & 0xFC00) === 0xD800;
-  let a = Math.max(0, Math.min(start, text.length)), at = -1;
+  let a = Math.max(0, Math.min(start, text.length));
   if (find) {
-    // the first place at or after `start` with the words (any case, any run
-    // of spaces between them, a curly quote for a straight one); the text
-    // from the start of its line, or of the line a little before it
+    // every place at or after `start` with the words (any case, any run of
+    // spaces between them, a curly quote for a straight one), each with the
+    // line before it and the three after (a table's row, a card's price),
+    // `count` characters in all at most: the first place in a page's text
+    // is often its menu's (coinmarketcap.com, Oct 7)
     const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const q1 = '[\'' + String.fromCharCode(0x2018, 0x2019, 0x2bc) + ']', q2 = '["' + String.fromCharCode(0x201c, 0x201d) + ']';
     const pat = find.trim().split(/\s+/).map(w => esc(w).replace(/'/g, q1).replace(/"/g, q2)).join('\\s+');
-    const m = pat ? new RegExp(pat, 'i').exec(text.slice(a)) : null;
-    if (!m) return {title: document.title, url: location.href, total: text.length, start: a, next: a, text: '', at: -1};
-    at = a + m.index;
-    let s = text.lastIndexOf('\n', Math.max(0, at - 200)) + 1;
-    if (at - s > 600) s = Math.max(0, at - 200);
-    a = Math.max(a, s);
-    count = Math.max(count, at + m[0].length - a);  // the words themselves, whatever the count
+    const places = [];
+    let more = -1;
+    if (pat) {
+      const re = new RegExp(pat, 'gi');
+      re.lastIndex = a;
+      let used = 0, m;
+      while ((m = re.exec(text))) {
+        if (!m[0].length) { re.lastIndex++; continue; }
+        const at = m.index, end = at + m[0].length;
+        // lines with words: a page's paragraphs come with blank lines between
+        let from = text.lastIndexOf('\n', at - 1) + 1;
+        for (let k = 0, n = 0; k < 1 && from > 0 && n < 6; n++) {
+          const s0 = text.lastIndexOf('\n', from - 2) + 1;
+          if (text.slice(s0, from - 1).trim()) k++;
+          from = s0;
+        }
+        let to = text.indexOf('\n', end);
+        if (to < 0) to = text.length;
+        for (let k = 0, n = 0; k < 3 && to < text.length && n < 12; n++) {
+          let e2 = text.indexOf('\n', to + 1);
+          if (e2 < 0) e2 = text.length;
+          if (text.slice(to + 1, e2).trim()) k++;
+          to = e2;
+        }
+        if (to - from > 600) { from = Math.max(from, at - 200); to = Math.min(to, Math.max(end, at + 400)); }
+        if (inside(from)) from--;
+        if (inside(to)) to++;
+        if (places.length >= 12 || (places.length && used + to - from > count)) { more = at; break; }
+        places.push({at: at, text: text.slice(from, to).split('\n').filter(l => l.trim()).join('\n')});
+        used += to - from;
+        re.lastIndex = Math.max(re.lastIndex, to);
+      }
+    }
+    return {title: document.title, url: location.href, total: text.length, start: a, places: places, more: more};
   }
   let b = Math.min(text.length, a + Math.max(1, count));
   if (inside(a)) a--;
   if (inside(b)) b = b - 1 > a ? b - 1 : b + 1;
   return {title: document.title, url: location.href, total: text.length, start: a, next: b,
-          text: text.slice(a, b), at: at};
+          text: text.slice(a, b)};
 })"""
 
 
@@ -2089,10 +2118,12 @@ def type_text(page, text, idle_ms=800):
 
 
 def page_text(page, start=0, count=20000, find=""):
-    """The page's words, `count` characters from `start` (see TEXT_JS), or
-    from a little before the first place at or after it with the words
-    `find`: {"title", "url", "total", "start", "next", "text", "at"} ("at":
-    where the words are, -1 when they aren't there)."""
+    """The page's words, `count` characters from `start` (see TEXT_JS):
+    {"title", "url", "total", "start", "next", "text"}; with `find`, the
+    places at or after `start` with those words instead, each with the
+    lines around it, `count` characters in all: {"title", "url", "total",
+    "start", "places": [{"at", "text"}], "more": where the next place
+    left out is, or -1}."""
     return page.eval(_js(TEXT_JS, int(start), int(count), find or ""), timeout=10.0) or {}
 
 

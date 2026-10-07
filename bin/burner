@@ -6156,8 +6156,8 @@ def build_parser():
     p.add_argument("--from", dest="start", type=int, default=0,
                    help="start at this character (for the rest of a long page)")
     p.add_argument("--find", metavar="WORDS",
-                   help="start just before the first place with these words (any case); "
-                        "with --from, the first place after it")
+                   help="every place with these words (any case), each with the lines around it; "
+                        "with --from, the places after it")
     p.add_argument("--max", type=int, default=None,
                    help="characters at most (default {}, {} with --find)".format(TEXT_MAX, TEXT_FIND_MAX))
     p.set_defaults(fn=cmd_text)
@@ -7858,25 +7858,72 @@ def log_command(ms, rc):
 
 
 TEXT_MAX = 20000  # characters `burner text` prints at a time (--max)
-TEXT_FIND_MAX = 3000  # ... with --find: the part around the words
+TEXT_FIND_MAX = 3000  # ... with --find: the places with the words, in all
 
 
-def find_in_text(text, words, start=0):
-    """Where the words are in `text`, at or after `start` (any case, any run
-    of spaces between them, a curly quote for a straight one), and where
-    to start printing: the start of their line, or of the line a little
-    before them (TEXT_JS's rule, for the screen's rows). (-1, start) when
-    they aren't there. Pure."""
+def find_places(text, words, start=0, budget=TEXT_FIND_MAX):
+    """The places at or after `start` in `text` with the words (any case,
+    any run of spaces between them, a curly quote for a straight one),
+    each with the line before it and the three after, `budget` characters
+    in all, 12 places at most (TEXT_JS's rule, for the screen's rows):
+    ([(where, its lines)], where the next place left out is, or -1). Pure."""
     parts = [re.escape(w).replace("'", "['\u2018\u2019\u02bc]").replace('"', '["\u201c\u201d]')
              for w in (words or "").split()]
-    m = re.compile(r"\s+".join(parts), re.I).search(text, start) if parts else None
-    if not m:
-        return -1, start
-    at = m.start()
-    s = text.rfind("\n", 0, max(0, at - 200) + 1) + 1
-    if at - s > 600:
-        s = max(0, at - 200)
-    return at, max(start, s)
+    places, used, more = [], 0, -1
+    if not parts:
+        return places, more
+    pat = re.compile(r"\s+".join(parts), re.I)
+    pos = start
+    while True:
+        m = pat.search(text, pos)
+        if not m:
+            break
+        at, end = m.start(), m.end()
+        # lines with words (blank ones between them aside)
+        frm, k, n = text.rfind("\n", 0, at) + 1, 0, 0
+        while k < 1 and frm > 0 and n < 6:
+            s0 = text.rfind("\n", 0, frm - 1) + 1
+            k += bool(text[s0:frm - 1].strip())
+            frm, n = s0, n + 1
+        to = text.find("\n", end)
+        to = len(text) if to < 0 else to
+        k = n = 0
+        while k < 3 and to < len(text) and n < 12:
+            e2 = text.find("\n", to + 1)
+            e2 = len(text) if e2 < 0 else e2
+            k += bool(text[to + 1:e2].strip())
+            to, n = e2, n + 1
+        if to - frm > 600:
+            frm, to = max(frm, at - 200), min(to, max(end, at + 400))
+        if len(places) >= 12 or (places and used + to - frm > budget):
+            more = at
+            break
+        places.append((at, "\n".join(l for l in text[frm:to].split("\n") if l.strip())))
+        used += to - frm
+        pos = max(end, to)
+    return places, more
+
+
+def print_places(where, total, find, places, more, start):
+    """`text --find`'s answer: the places, or why there are none (exit 1).
+    Returns the exit code."""
+    print('{}, {} characters; "{}" in {} place{}{}'.format(
+        where, total, find, len(places), "" if len(places) == 1 else "s",
+        " after {}".format(start) if start else "") + (":" if places else ""))
+    if not places:
+        print('no "{}" {}'.format(find, "in the page's text" if where.startswith("page:") else "on the screen"),
+              file=sys.stderr)
+        return 1
+    for at, lines in places:
+        print("[at {}]".format(at))
+        print(_readable(lines))
+    sys.stdout.flush()
+    if more >= 0:
+        print("(more places from {0}: `burner text --find {1} --from {0}`)".format(more, _shell_words(find)),
+              file=sys.stderr)
+    else:
+        print("(`burner text --from N` reads on from a place)", file=sys.stderr)
+    return 0
 
 
 def _readable(s):
@@ -7930,21 +7977,21 @@ def cmd_text(args):
             page = json.loads(out)
         except ValueError:
             page = None
+    if isinstance(page, dict) and find and isinstance(page.get("places"), list):
+        return print_places("page: {} ({})".format(_readable(page.get("title") or "") or "(no title)",
+                                                   _readable(page.get("url") or "")),
+                            int(page.get("total") or 0), find,
+                            [(p.get("at", 0), p.get("text") or "") for p in page["places"]],
+                            int(page.get("more", -1)), start)
     if isinstance(page, dict) and isinstance(page.get("text"), str):
         # places as the page counts them (an emoji is two), from the page:
         # counting here said "cut" on a page with emoji (review, Oct 7)
         total, text = int(page.get("total") or 0), page["text"]
         at = page["start"] if isinstance(page.get("start"), int) else start
         nxt = page["next"] if isinstance(page.get("next"), int) else at + len(text)
-        where = page.get("at") if isinstance(page.get("at"), int) else None
-        print("page: {} ({}), {} characters{}{}".format(
+        print("page: {} ({}), {} characters{}".format(
             _readable(page.get("title") or "") or "(no title)", _readable(page.get("url") or ""), total,
-            ", from {}".format(at) if at else "",
-            ' ("{}" at {})'.format(find, where) if find and where is not None and where >= 0 else ""))
-        if find and where is not None and where < 0:
-            print('no "{}" in the page\'s text{}'.format(find, " after {}".format(start) if start else ""),
-                  file=sys.stderr)
-            return 1
+            ", from {}".format(at) if at else ""))
         if text:
             print(_readable(text))
         if nxt < total:
@@ -7964,16 +8011,11 @@ def cmd_text(args):
         print("burner: the page's own text couldn't be read; the screen's rows instead", file=sys.stderr)
     rows = screen_text(walk(root), h)
     text = _readable("\n".join(rows))
-    where = None
     if find:
-        where, start = find_in_text(text, find, start)
-        if where < 0:
-            print("screen: {}, {} characters".format(pkg or "?", len(text)))
-            print('no "{}" on the screen'.format(find), file=sys.stderr)
-            return 1
-    print("screen: {}, {} characters{}{}".format(pkg or "?", len(text),
-                                                 ", from {}".format(start) if start else "",
-                                                 ' ("{}" at {})'.format(find, where) if where is not None else ""))
+        places, more = find_places(text, find, start, count)
+        return print_places("screen: {}".format(pkg or "?"), len(text), find, places, more, start)
+    print("screen: {}, {} characters{}".format(pkg or "?", len(text),
+                                               ", from {}".format(start) if start else ""))
     part = text[start:start + count]
     if part:
         print(part)

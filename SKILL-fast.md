@@ -29,8 +29,8 @@ Every step you take costs a round trip, so the fewer steps, the faster.
 2. **Screenshots only to see pictures** (a photo, a map, a chart):
    `burner shot --out .`, then send the file. For words, the rows are enough;
    a row cut short with … or a long page reads whole with `burner text` (in
-   Chrome, the whole page, top to bottom; `burner text --find preheat` starts
-   at the words).
+   Chrome, the whole page, top to bottom; `burner text --find preheat` lists
+   each place with the words, with the lines around it).
 3. **Never sleep, and don't wait for what is already there.** Every action
    prints the screen it ends on: when the words you need are on it, act on
    them. `burner wait "Text" --timeout 30` is for a page still loading, when
@@ -94,7 +94,7 @@ Every step you take costs a round trip, so the fewer steps, the faster.
 | "Check my notifications" / "anything new?" | `burner notifications` prints them and changes nothing. |
 | "Check my Amazon order" | `burner amazon-status`. |
 | "Check my messages" | `burner apps messages`, `burner start <package>`, read the rows; open a conversation only to read it. |
-| "Read this article" / a recipe / a long page / a JSON answer | `burner open "https://…" com.android.chrome`, then `burner text`: the page's whole text, top to bottom (`burner text --find bake` starts at the part you need; `--from N` for more of a very long one). |
+| "Read this article" / a recipe / a long page / a JSON answer | `burner open "https://…" com.android.chrome`, then `burner text`: the page's whole text, top to bottom (`burner text --find bake` lists each place with the words and the lines around it; `--from N` reads on from one). |
 | "When is Target in Woodbury open?" / a place's hours, phone or address | `burner open "https://www.google.com/search?q=Target+Woodbury+MN+hours" com.android.chrome`, then `burner text`: the answer and the store pages, as words. The Maps app's result cards give the screen reader no names or hours, so they show only in a screenshot. |
 | "Scroll down" / "scroll to the top" | `burner scroll down`, `burner scroll top`: inside the open app, never HOME or an edge swipe. |
 | "Do this every time" / "save that" | Turn the steps that worked into a recipe with `burner save <name> 'step' ...` (labels, not coordinates; `$VARIABLE` for text that changes), test it once with `burner recipe <name>`. |

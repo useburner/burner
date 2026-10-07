@@ -7320,9 +7320,9 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(dm.handle("text {}"), b"__NOT_FOUND__")
         dm.d.info.assert_not_called()
 
-    def test_text_finds_the_words_and_starts_there(self):
-        # coinmarketcap.com, Oct 7: Ethereum's price was four `burner text`
-        # calls down the page (20,000 characters each)
+    def test_text_lists_the_places_with_the_words(self):
+        # coinmarketcap.com, Oct 7: Ethereum's price took four `burner text`
+        # calls, and the first "Ethereum" in the page's text is its menu's
         sent = []
         answers = []
 
@@ -7330,29 +7330,42 @@ class WebPathTests(OfflineTestCase):
             sent.append(json.loads(arg))
             return answers.pop(0)
         self.allow("u2sock", side_effect=u2)
-        answers[:] = [json.dumps({"title": "CMC", "url": "u", "total": 90000, "start": 31200, "next": 34200,
-                                  "text": "Ethereum ETH $2,300.45 4.94%", "at": 31377})]
+        answers[:] = [json.dumps({"title": "CMC", "url": "u", "total": 7473, "start": 0, "more": -1,
+                                  "places": [{"at": 661, "text": "Bitcoin ETFs\nEthereum ETFs"},
+                                             {"at": 1890, "text": "2\nEthereum\nETH\n$2,300.45"}]})]
         with self.cap() as (out, err):
             rc = pc.cmd_text(self.parse(["text", "--find", "Ethereum"]))
         self.assertEqual(rc, 0)
         self.assertEqual(sent[-1], {"from": 0, "max": pc.TEXT_FIND_MAX, "find": "Ethereum"})
-        self.assertEqual(out.getvalue().splitlines()[0], 'page: CMC (u), 90000 characters, from 31200 ("Ethereum" at 31377)')
-        self.assertIn("burner text --from 34200", err.getvalue())
+        self.assertEqual(out.getvalue().splitlines(), [
+            'page: CMC (u), 7473 characters; "Ethereum" in 2 places:', "[at 661]", "Bitcoin ETFs", "Ethereum ETFs",
+            "[at 1890]", "2", "Ethereum", "ETH", "$2,300.45"])
+        self.assertIn("burner text --from N", err.getvalue())
+        # more than fit: where the next one is
+        answers[:] = [json.dumps({"title": "CMC", "url": "u", "total": 7473, "start": 0, "more": 5000,
+                                  "places": [{"at": 661, "text": "Ethereum ETFs"}]})]
+        with self.cap() as (out, err):
+            pc.cmd_text(self.parse(["text", "--find", "Ethereum"]))
+        self.assertIn('burner text --find "Ethereum" --from 5000', err.getvalue())
         # not there: said, exit 1
-        answers[:] = [json.dumps({"title": "CMC", "url": "u", "total": 90000, "start": 0, "next": 0, "text": "",
-                                  "at": -1})]
+        answers[:] = [json.dumps({"title": "CMC", "url": "u", "total": 7473, "start": 0, "more": -1,
+                                  "places": []})]
         with self.cap() as (out, err):
             self.assertEqual(pc.cmd_text(self.parse(["text", "--find", "Dogecorn"])), 1)
         self.assertIn('no "Dogecorn" in the page\'s text', err.getvalue())
-        # a native screen: the rows' words, from the line a little before the words
-        text = "Wi-Fi\nConnected\nBluetooth\nOn\nBattery\n48%"
-        self.assertEqual(pc.find_in_text(text, "battery"), (text.index("Battery"), 0))
-        far = "x" * 900 + "\nline one\n" + "y" * 300 + "\nBattery 48%"
-        at, s = pc.find_in_text(far, "battery  48")
-        self.assertEqual((far[at:at + 7], far[s:s + 4]), ("Battery", "yyyy"))
-        # a curly quote for a straight one
-        self.assertEqual(pc.find_in_text("Don" + chr(0x2019) + "t allow", "don't allow")[0], 0)
-        self.assertEqual(pc.find_in_text(text, "battery", start=len(text)), (-1, len(text)))
+        # the screen's rows (a native app): the same rule
+        text = "Wi-Fi\nConnected\nBluetooth\nOn\nBattery\n48%\nScreen\nDark"
+        places, more = pc.find_places(text, "battery")
+        self.assertEqual((places, more), ([(text.index("Battery"), "On\nBattery\n48%\nScreen\nDark")], -1))
+        # two places, the second inside the first one's lines: one place
+        self.assertEqual(len(pc.find_places("a\nBattery\nb\nBattery saver\nc\nd\ne", "battery")[0]), 1)
+        # a curly quote for a straight one, any run of spaces
+        self.assertEqual(pc.find_places("Don" + chr(0x2019) + "t   allow", "don't allow")[0][0][0], 0)
+        self.assertEqual(pc.find_places(text, "battery", start=len(text)), ([], -1))
+        many = "\n".join("row %d Battery" % i for i in range(100))
+        places, more = pc.find_places(many, "battery", budget=100)
+        self.assertEqual((len(places) < 12, more > 0), (True, True))
+        self.assertEqual(pc.find_places(many, "battery", budget=10 ** 6)[1], many.index("row 48 ") + 7)  # 12 at most (one each 4 rows)
 
     def test_text_counts_places_as_the_page_does(self):
         # review, Oct 7: places counted here (code points) against the page's
