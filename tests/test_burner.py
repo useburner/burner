@@ -9907,6 +9907,44 @@ class CoordinateTapTests(OfflineTestCase):
         self.assertEqual(dm.cmd_dump("page"), b"")
         self.assertEqual(fake.front_page.call_count, dm.LAUNCH_CONTACT_TRIES)
 
+    def test_a_launch_asks_the_page_in_hand_first_when_chrome_comes_back(self):
+        # Oct 7: an open from the home screen saw the launcher on its first
+        # look ("not Chrome yet"), dropped the page in hand, and scanned
+        # Chrome's tabs for a new session (1.6s) instead of one probe
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = WebPathTests._fake_cdp(self, mod, calls)
+        fake.LOAD_PROBE_S = 6.0
+        given = []
+        fake.front_page = lambda dev, current=None, first_probe_s=None, **kw: given.append(current) or _FakePage()
+        dm = EmptyScreenTests._daemon(self, mod)
+        mod.log = lambda *a: None
+        old = _FakePage()
+        old.visible_at = 1e9
+        dm._web = old
+        launcher = SAMPLE_XML.replace("com.example", "com.google.android.apps.nexuslauncher")
+        dm.d = _FakeServer([launcher, CHROME_XML])
+        dm._last_xml, dm._last_xml_t = launcher, mod._time.monotonic()
+        self.assertIn('text="Box Score"', dm.cmd_dump("page https://coinmarketcap.com").decode())
+        self.assertEqual(given, [old])  # asked once, with the page in hand
+        self.assertEqual(old.visible_at, 0.0)  # and asked for real: no proof from before Chrome left
+        # the page in hand failing is another matter: the next try scans
+        given.clear()
+        answers = iter([OSError("refused"), _FakePage()])
+
+        def failing(dev, current=None, first_probe_s=None, **kw):
+            given.append(current)
+            a = next(answers)
+            if isinstance(a, Exception):
+                raise a
+            return a
+        fake.front_page = failing
+        dm._web = old
+        dm.d = _FakeServer([CHROME_XML, CHROME_XML])
+        dm.cmd_dump("page https://coinmarketcap.com")
+        self.assertEqual(given, [old, None])
+
     def test_a_launch_with_the_screen_off_wakes_it_to_look_for_the_page(self):
         # Oct 6: a Wikipedia open took 66s with the screen off: "nothing
         # readable" and pages "hidden" on every try, the screen woken only after

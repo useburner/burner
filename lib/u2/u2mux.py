@@ -1043,6 +1043,11 @@ def window_over(windows_xml, rect, front_pkg):
     return None
 
 
+class _NotChromeYet(RuntimeError):
+    """Chrome, just launched, isn't the app in front yet: the page in hand
+    is kept for the next try (see U2Daemon._page)."""
+
+
 def _log_handshake(page):
     """Say in the log, once per session, that the page's session took a
     second handshake (Chrome dropped the first: see cdp.Page.DROPPED)."""
@@ -1953,6 +1958,11 @@ class U2Daemon:
         hinted = {"hint": hint} if hint else {}
         if assume_chrome:
             woke = False
+            if current is not None:
+                # Chrome comes up on the tab it was left on: the page in hand
+                # is asked first (one probe, not a scan of its tabs and a new
+                # session, 1.6s, Oct 7), and asked for real
+                current.visible_at = 0.0
             for i in range(self.LAUNCH_CONTACT_TRIES):
                 try:
                     # Chrome's window in front first (its address bar, when
@@ -1974,7 +1984,7 @@ class U2Daemon:
                         self._front_cache = (xml, screen_of(xml))
                     front = (screen_of(xml) or (0, 0, ""))[2]
                     if not _cdp().is_chrome(front):
-                        raise RuntimeError("%s in front, not Chrome yet" % (front or "nothing readable"))
+                        raise _NotChromeYet("%s in front, not Chrome yet" % (front or "nothing readable"))
                     bar = url_bar_of(xml)
                     with _t("web page (after a launch)"):
                         self._web = _cdp().front_page(getattr(self.d, "_dev", None), current,
@@ -1982,7 +1992,8 @@ class U2Daemon:
                     _log_handshake(self._web)
                     return self._web
                 except Exception as e:
-                    current = None
+                    if not isinstance(e, _NotChromeYet):
+                        current = None  # the page in hand failed (front_page closed it): a scan next
                     if i == self.LAUNCH_CONTACT_TRIES - 1:
                         self._web = None
                         self._web_retry_at = _time.monotonic() + WEB_BUSY_RETRY_S
