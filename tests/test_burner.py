@@ -11174,6 +11174,16 @@ class AirbnbRoundTests(OfflineTestCase):
             pc._scroll_plain("down", 1)
         self.assertNotIn("in a row", out.getvalue())
 
+    def test_state_reads_the_screen_afresh(self):
+        # YouTube's Subscriptions, Oct 7: `state` 2s after a tap printed the
+        # helper's cached read (the tap's own screen), and the assistant ran
+        # it again for the screen now
+        dump = self.allow("ui_dump", return_value=ET.fromstring(SAMPLE_XML))
+        with self.cap() as (out, err):
+            self.assertEqual(pc.cmd_state(self.parse(["state"])), 0)
+        dump.assert_called_once_with(fresh=True)
+        self.assertIn("Hello (300,250)", out.getvalue())
+
     def test_a_scroll_that_moved_nothing_says_so(self):
         # YouTube's Shorts, Oct 7: `scroll up` on the first Short printed the
         # same Short, and the swipes after it were taken for the next one

@@ -3941,8 +3941,11 @@ def cmd_press(args):
 
 def cmd_state(args):
     """The app in front and the screen's rows, from one screen read (the
-    app comes from the read itself: no second call over the link)."""
-    root = ui_dump()
+    app comes from the read itself: no second call over the link). Read
+    afresh: asked for right after an action, the helper's 2s-old read was
+    the screen that action had just printed, and the assistant ran `state`
+    again for the screen now (YouTube's Subscriptions, five times, Oct 7)."""
+    root = ui_dump(fresh=True)
     nodes = walk(root)
     app = dump_package(root) or "?"
     if as_json(args):
