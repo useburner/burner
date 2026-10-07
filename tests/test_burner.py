@@ -1889,20 +1889,41 @@ class SetupWizardTests(OfflineTestCase):
                     "    com.android.settings/.Settings\n")
         calls = []
 
+        own = ["package:com.tinder", "package:com.vinted"]
+
         def adb(*args, timeout=30):
             calls.append(args)
-            out = launcher if "query-activities" in " ".join(args) else "package:com.tinder\npackage:com.vinted\n"
+            out = "\n".join(own) + "\n"
+            if "query-activities" in " ".join(args):
+                out += "<<launcher>>\n" + launcher
             return SimpleNamespace(returncode=0, stdout=out, stderr="")
         self.allow("adb_or_ensure", side_effect=adb)
         for name, want in (("calendar", "com.google.android.calendar\n"),
                            ("Google Calendar", "com.google.android.calendar\n"),
                            ("messages", "com.google.android.apps.messaging\n"),
-                           ("tinder", "com.tinder\n")):
+                           ("tinder", "com.tinder\n"),
+                           ("Google Chrome", "com.android.chrome\n")):
             calls.clear()
             with self.cap() as (out, err):
                 rc = pc.cmd_apps(SimpleNamespace(match=name, all=False))
             self.assertEqual((rc, out.getvalue()), (0, want), name)
-        self.assertEqual(len(calls), 1)  # a third-party match: no launcher query
+            self.assertEqual(len(calls), 1)  # both lists in one call
+        # review, Oct 7: a third-party calendar took "google calendar" by its
+        # last word, and Google Calendar was never looked for
+        own.append("package:com.simplemobiletools.calendar.pro")
+        own.append("package:com.here.app.maps")
+        for name, want in (("Google Calendar", "com.google.android.calendar\n"),
+                           ("calendar", "com.google.android.calendar\ncom.simplemobiletools.calendar.pro\n"),
+                           ("Google Maps", "com.here.app.maps\n")):
+            with self.cap() as (out, err):
+                rc = pc.cmd_apps(SimpleNamespace(match=name, all=False))
+            self.assertEqual((rc, out.getvalue()), (0, want), name)
+        # Google Maps isn't there: another maker's maps app, and that said
+        self.assertIn('no app holds every word of "Google Maps"; these hold "maps"', err.getvalue())
+        self.assertEqual(pc.app_matches(["com.google.android.apps.maps", "com.here.app.maps"], "google maps"),
+                         ["com.google.android.apps.maps"])
+        self.assertEqual(pc.app_matches(["com.example.notes"], "my notes"), [])
+        self.assertEqual(pc.app_matches(["a.b"], "  "), [])
         with self.cap() as (out, err):
             rc = pc.cmd_apps(SimpleNamespace(match="snapchat", all=False))
         self.assertEqual((rc, out.getvalue()), (1, ""))
