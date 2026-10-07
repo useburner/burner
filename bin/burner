@@ -2096,6 +2096,10 @@ def act_and_read(action, prev_root=None, idle_ms=IDLE_ACT_MS, rereads=2):
     if unchanged and not note and root is marked:
         note = ("(unchanged: the row tapped is a heading or a label, which opens nothing)"
                 if unchanged == "inert" else "(unchanged)")
+    if marked.get("unjudged"):
+        # the page saw nothing of the touch: a frame over the target took it
+        # (an ad that slid in, review of Oct 7)
+        note = (note + " " if note else "") + "(the touch went to a frame over the page, such as an ad, not to the page)"
     return "ok", root, note
 
 

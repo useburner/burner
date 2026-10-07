@@ -103,16 +103,41 @@ PAGES = {
               "<a href='/plain?from=twice'><h2>Bishop jailed</h2></a>" + TAIL,
     "/twodests": HEAD + STORIES + "<a href='/plain?from=a'>Edit</a>" + MIDDLE +
                  "<a href='/plain?from=b'>Edit</a>" + TAIL,
+    # an option whose box is hidden (a screen reader's only) inside its label
+    "/option": HEAD + STORIES + "<style>.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}"
+               "</style><ul><li role=option><label><input type=checkbox class=sr name=a> Option A</label></li>"
+               "<li role=option><label><input type=checkbox class=sr name=b> Option B</label></li></ul>" + TAIL,
+    # a link wrapped over two lines, its middle between them, in a card that takes a tap
+    "/wrapgap": HEAD + STORIES + "<div role=button onclick='0' style='padding:10px;border:1px solid #999'>"
+                "<p style='width:220px;margin:0;line-height:20px'>Words Words Words <a href='#wrap' "
+                "style='display:inline;height:auto;line-height:20px;border:0'>a link that wraps</a> and after it more "
+                "words.</p></div>" + TAIL,
+    # an ad's frame slides over the target just after the tap's scroll
+    "/ad": "<html><body style='margin:0;background:#fd0'>"
+           "<script>addEventListener('click',()=>{document.body.textContent='AD CLICKED'})</script>an ad</body></html>",
+    "/adframe": HEAD + STORIES + "<a href='#a'>Story A</a><a id=t href='#more'>More</a>" + TAIL +
+                "<iframe id=ad src='/ad' style='position:absolute;display:none;width:100%;height:60px;border:0;left:0'>"
+                "</iframe><script>let shown=false;addEventListener('scroll',()=>{if(shown)return;shown=true;"
+                "setTimeout(()=>{const t=document.getElementById('t').getBoundingClientRect();"
+                "const f=document.getElementById('ad');f.style.top=(scrollY+t.top-8)+'px';f.style.display='block'},"
+                "150)});</script>",
+    # a lazy image hidden at phone width (never loads) above the target
+    "/hiddenlazy": HEAD + STORIES + "<img loading=lazy src='/img.png?d=5000' style='display:none' alt=''>"
+                   "<a href='#a'>Story A</a><a id=t href='#more'>More</a>" + TAIL,
 }
 # (page, the words tapped, what the page must see: the link's text, the
-# address it goes to, or "ambiguous": nothing touched, the rows counted;
-# a target that never stops moving may be left untapped, never tapped wrong)
+# address it goes to, "ambiguous": nothing touched, the rows counted, or
+# "frame": nothing on the page, the touch said to have gone to a frame and
+# the next touch not held; a target that never stops moving may be left
+# untapped, never tapped wrong)
 CASES = [("plain", "More", "More"), ("lazy", "More", "More"), ("slot", "More", "More"),
          ("carousel", "More", "More"), ("overlay", "Cabin in the woods", ""), ("nested", "More stories", "More stories"),
          ("slotted", "Read more", "Read more"), ("wrapped", "a long link that wraps across lines",
                                                   "a long link that wraps across lines"),
          ("banner", "More", "More"), ("away", "More", "/plain?from=away"),
-         ("twice", "Bishop jailed", "/plain?from=twice"), ("twodests", "Edit", "ambiguous")]
+         ("twice", "Bishop jailed", "/plain?from=twice"), ("twodests", "Edit", "ambiguous"),
+         ("option", "Option B", "checked:b"), ("wrapgap", "a link that wraps", "a link that wraps"),
+         ("adframe", "More", "frame"), ("hiddenlazy", "More", "More")]
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -224,14 +249,26 @@ def main():
                 address, clicks = seen[0], seen[1:]
                 if want == "ambiguous":
                     right = r.get("count", 1) > 1 and not clicks and address.startswith("/" + case)
+                elif want.startswith("checked:"):
+                    right = page.eval("[...document.querySelectorAll('input[type=checkbox]')].filter(i => i.checked)"
+                                      ".map(i => i.name).join(',')") == want[8:]
+                elif want == "frame":
+                    # and a touch after it, on what is on screen, isn't held
+                    pt = page.eval("(()=>{const a=[...document.querySelectorAll('a')].find(a=>a.textContent==='Tail 2');"
+                                   "const b=a.getBoundingClientRect();return [b.left+b.width/2, b.top+b.height/2]})()")
+                    cdp.touch(page, pt[0], pt[1])
+                    time.sleep(0.4)
+                    after = page.eval("window.__clicks.slice()")
+                    right = bool(r.get("unjudged")) and not clicks and after == ["Tail 2"]
                 elif want.startswith("/"):
                     right = address == want and not clicks
                 else:
-                    right = clicks == [want] or bool(not clicks and err)
+                    right = clicks == [want] or bool(not clicks and err and case == "carousel")
                 wrong += not right
                 print("%-9s %4dms trip: %-6s %.2fs, %s%s%s" % (
                     case, trip, "ok" if right else "WRONG", took,
                     "%d rows, nothing touched" % r.get("count", 1) if want == "ambiguous" and right else
+                    "the touch went to the frame; the next one went through" if want == "frame" and right else
                     address if want.startswith("/") else "clicked %s" % json.dumps(clicks),
                     ", %d held" % held if held else "", "; " + err if err else ""))
     finally:

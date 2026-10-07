@@ -5767,6 +5767,19 @@ class WebPathTests(OfflineTestCase):
         with self.assertRaises(RuntimeError) as cm:
             dm.cmd_act(json.dumps({"tap_label": "Nope"}))
         self.assertEqual(str(cm.exception), "act not sent: not on the page")
+        # rows of Chrome's that the words only name, found twice: said so,
+        # and the CLI plans the tap (it said "not on the page", review of Oct 7)
+        two = CHROME_XML.replace("</hierarchy>", '<node text="" content-desc="Comments (3)" class="android.view.View" '
+                                 'package="com.android.chrome" bounds="[40,900][500,980]" clickable="true"/>'
+                                 '<node text="" content-desc="Comments (12)" class="android.view.View" '
+                                 'package="com.android.chrome" bounds="[40,1500][500,1580]" clickable="true"/></hierarchy>')
+        dm.d = _FakeServer([two])
+        page_tap = mod._CDP.tap
+        mod._CDP.tap = lambda page, label, index=None, idle_ms=1200: {"found": False}  # not on the page itself
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"tap_label": "Comments"}))
+        self.assertEqual(str(cm.exception), "act not sent: 2 rows hold 'Comments'")
+        mod._CDP.tap = page_tap
         # the screen reader not answering is no "not on the page": the CLI looks its own way
         dm.d = _FakeServer([])
         with self.assertRaises(RuntimeError) as cm:
@@ -6149,16 +6162,22 @@ class WebPathTests(OfflineTestCase):
         exact = tabs.replace('text="Good evening"', 'text="Search"')
         self.assertEqual(mod.label_node(exact, "Search", loose=True)[0]["text"], "Search")
         self.assertIsNone(mod.loose_words(*mod.label_node(exact, "Search", loose=True)))
-        # anything less is the CLI's to plan: two rows named, no row named
-        # ("Search with your voice" is not), a field holding the words
-        for screen in (tabs.replace("Your Library, Tab 3 of 4", "Search, Tab 3 of 4"),
-                       tabs.replace("Search, Tab 2 of 4", "Browse, Tab 2 of 4"),
-                       tabs.replace('text="" content-desc="Search, Tab 2 of 4" class="android.widget.FrameLayout"',
-                                    'text="Search, Tab 2 of 4" class="android.widget.EditText"').replace(
-                           "Search with your voice", "Voice")):
+        # anything less is the CLI's to plan, and said: two rows named, no
+        # row named ("Search with your voice" is not), a field holding the
+        # words; never "not on the last read" (Chrome's own rows read as
+        # "not on the page" then, review of Oct 7)
+        for screen, why in ((tabs.replace("Your Library, Tab 3 of 4", "Search, Tab 3 of 4"), "2 rows hold 'Search'"),
+                            (tabs.replace("Search, Tab 2 of 4", "Browse, Tab 2 of 4"),
+                             "1 row holds 'Search' without being named by it"),
+                            (tabs.replace('text="" content-desc="Search, Tab 2 of 4" class="android.widget.FrameLayout"',
+                                          'text="Search, Tab 2 of 4" class="android.widget.EditText"').replace(
+                                "Search with your voice", "Voice"), "a text field holds 'Search'")):
             with self.assertRaises(RuntimeError) as cm:
                 mod.label_node(screen, "Search", loose=True)
-            self.assertEqual(str(cm.exception), "not on the last read")
+            self.assertEqual(str(cm.exception), why)
+        with self.assertRaises(RuntimeError) as cm:
+            mod.label_node(tabs, "Podcasts", loose=True)  # no row holds them at all
+        self.assertEqual(str(cm.exception), "not on the last read")
         # a row with its words as text: its text is the selector
         inbox = tabs.replace('text="" content-desc="Home, Tab 1 of 4"', 'text="Inbox, 3 unread"')
         node, alt = mod.label_node(inbox, "Inbox", loose=True)
@@ -7092,6 +7111,28 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(str(cm.exception), "no field has the focus on the page "
                          "(2 text fields in view; tap one, or type --field with its label)")
 
+    def test_a_touch_a_frame_took_is_said_with_the_read(self):
+        # review of Oct 7: an ad's frame slid over the target and took the
+        # touch; the tap read as done, and the guard stayed armed
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        fake = self._fake_cdp(mod, calls)
+        fake.tap = lambda page, label, index=None, idle_ms=1200: {
+            "found": True, "count": 1, "label": label, "screen": WEB_SCREEN, "unjudged": True, "at": [1, 2]}
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        xml = dm.cmd_act(json.dumps({"tap_label": "More"})).decode()
+        self.assertIn('<hierarchy unjudged="1"', xml)
+        self.assertNotIn("unjudged", dm._last_xml)  # the read kept for later is the page's own
+        # the CLI says it with the screen
+        self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30: xml)
+        self.allow("_update_screen_from_dump")
+        status, root, note = pc.act_and_read({"tap_label": "More"})
+        self.assertEqual(status, "ok")
+        self.assertIn("the touch went to a frame over the page", note)
+
     def test_helper_says_nothing_was_tapped_when_every_touch_was_held(self):
         # the review of Oct 7: a target the page keeps moving is never
         # tapped where it was; the tap says nothing was tapped, and the
@@ -7583,7 +7624,7 @@ class WebPathTests(OfflineTestCase):
         cdp = _cdp()
         page = _ScriptedPage(cdp, {"PLACE_JS": {"x": 1, "y": 2}})
         touched = []
-        with mock.patch.object(cdp, "touch", lambda pg, x, y, then=(): touched.append((x, y)) or ("touch", [])):
+        with mock.patch.object(cdp, "touch", lambda pg, x, y, then=(), mark=False: touched.append((x, y)) or ("touch", [])):
             cdp.touch_hit(page, {"x": 30, "y": 400, "moved": True, "settled": True})
             self.assertEqual((touched[-1], page.calls), ((30, 400), []))  # no trip for the place
             cdp.touch_hit(page, {"x": 30, "y": 400, "moved": True})  # an older find: placed afresh
@@ -7597,33 +7638,53 @@ class WebPathTests(OfflineTestCase):
         page = _ScriptedPage(cdp, {"PLACE_JS": [{"x": 5, "y": 600}, {"x": 5, "y": 700}, {"x": 5, "y": 800}]})
         verdicts, touched = [], []
 
-        def touch(pg, x, y, then=()):
+        def touch(pg, x, y, then=(), mark=False):
             touched.append((x, y))
+            marks.append(mark)
             return "touch", [{"result": {"value": verdicts.pop(0)}}, "read"]
+        marks = []
         hit = {"x": 30, "y": 400, "moved": True, "settled": True, "used": "More"}
         with mock.patch.object(cdp, "touch", touch):
             verdicts[:] = [{"verdict": "moved", "hit": "img"}, {"verdict": "ok"}]
             self.assertEqual(cdp.touch_hit(page, hit, then=["READ"]), ("touch", ["read"]))
             self.assertEqual((touched, hit["held"]), ([(30, 400), (5, 600)], 1))
             self.assertEqual(page.calls, [("many", ["PLACE_JS", "GUARD_JS"])])  # placed again, armed again
-            # held every time: nothing was tapped, and it says so
+            self.assertEqual(set(marks), {True})  # the guard judges burner's own touch only
+            # held every time: nothing was tapped, and it says so; no place
+            # taken after the last (it armed the guard again, review of Oct 7),
+            # and the arm taken off
+            page.calls.clear()
+            page.answers["PLACE_JS"] = [{"x": 5, "y": 600}, {"x": 5, "y": 700}]
             verdicts[:] = [{"verdict": "moved", "hit": "div"}] * 3
             with self.assertRaises(cdp.Held) as cm:
                 cdp.touch_hit(page, dict(hit, held=0), then=["READ"])
             self.assertTrue(str(cm.exception).startswith(
                 "nothing was tapped: the page moved 'More' from under the touch 3 times (moved, div under the point;"))
             self.assertEqual(cm.exception.verdict, "moved")
+            self.assertEqual(page.calls, [("many", ["PLACE_JS", "GUARD_JS"])] * 2 + [("eval", cdp.DISARM[:40])])
+            # covered where it was, and nothing moved: no second try at the same point
+            page.calls.clear()
+            page.answers["PLACE_JS"] = [{"x": 30, "y": 400}]
+            verdicts[:] = [{"verdict": "covered", "hit": "div Cookies?"}]
+            with self.assertRaises(cdp.Held) as cm:
+                cdp.touch_hit(page, dict(hit, x=30, y=400), then=["READ"])
+            self.assertEqual((str(cm.exception), cm.exception.verdict), (
+                "nothing was tapped: something else was over 'More' where it was (covered, div Cookies? under the point)",
+                "covered"))
             # the target gone (the page drew it again): nothing to aim at here
             verdicts[:] = [{"verdict": "gone"}]
             with self.assertRaises(cdp.Held) as cm:
                 cdp.touch_hit(page, dict(hit), then=["READ"])
             self.assertEqual(cm.exception.verdict, "gone")
-            # no verdict (nothing armed, or a frame took the touch): as before
-            for v in (None, {"verdict": None}):
+            # no verdict (nothing armed, or a frame took the touch): as
+            # before, and a touch no event of which reached the page is said
+            for v, unjudged in ((None, False), ({"verdict": None}, True)):
                 verdicts[:] = [v]
-                self.assertEqual(cdp.touch_hit(page, dict(hit), then=["READ"]), ("touch", ["read"]))
+                h = dict(hit)
+                self.assertEqual(cdp.touch_hit(page, h, then=["READ"]), ("touch", ["read"]))
+                self.assertEqual(bool(h.get("unjudged")), unjudged)
         # a verdict that can't be read (the touch started a load): it went in
-        with mock.patch.object(cdp, "touch", lambda pg, x, y, then=(): ("touch", [RuntimeError("context destroyed"), "read"])):
+        with mock.patch.object(cdp, "touch", lambda pg, x, y, then=(), mark=False: ("touch", [RuntimeError("context destroyed"), "read"])):
             self.assertEqual(cdp.touch_hit(page, dict(hit), then=["READ"]), ("touch", ["read"]))
         # in a tap: a target the page replaced is found again by its words, once
         found = {"found": True, "count": 1, "label": "more", "used": "More", "x": 300, "y": 400, "url": "u"}

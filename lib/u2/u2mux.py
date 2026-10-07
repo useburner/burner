@@ -1384,14 +1384,18 @@ def loose_label_node(nodes, alts):
     text, else their description) hold the words, never a status or
     navigation bar icon (see bar_icon); of those not fields, the ones
     the words name (see fuzzy_ok: Spotify's tab "Search, Tab 2 of 4" for
-    `tap Search`, Oct 7). One control, whole, with nothing over it; None
-    for anything else (more than one, a field the words may name, cut
-    off, covered): the CLI plans that tap itself. Pure."""
+    `tap Search`, Oct 7). One control, whole, with nothing over it. None
+    when no row holds the words; anything else (more than one, a field
+    holding them, rows they don't name, cut off, covered) raises
+    RuntimeError saying so, and the CLI plans that tap itself (rows that
+    hold them are never "not on the last read": Chrome's own rows read
+    as "not on the page" then, review of Oct 7). Pure."""
     h = max((n["rect"][3] for n in nodes), default=0)
 
     def words(n):
         return plain_words(n["text"] or n["desc"]).lower()
 
+    why = None
     for alt in alts:
         low = plain_words(alt).lower()
         rows = [n for n in nodes if low and low in words(n) and not bar_icon(n, h)]
@@ -1401,7 +1405,12 @@ def loose_label_node(nodes, alts):
         hits = [n for n in rows_not_fields if fuzzy_ok(alt, n["text"] or n["desc"])]
         if not hits:
             if len(rows_not_fields) < len(rows):
-                return None  # a field holds the words: the CLI's plan decides whether they name it
+                # the CLI's plan decides whether the words name the field
+                raise RuntimeError("a text field holds %r" % alt)
+            # rows hold the words without being named by them: the next
+            # alternative, as the CLI's plan goes on to it
+            why = why or "%d row%s hold%s %r without being named by it" % (
+                len(rows), "" if len(rows) == 1 else "s", "s" if len(rows) == 1 else "", alt)
             continue
         controls = []  # one control drawn twice reads the same words twice (see plan_tap)
         for n in hits:
@@ -1411,11 +1420,16 @@ def loose_label_node(nodes, alts):
                     break
             else:
                 controls.append([n])
-        if len(controls) != 1 or any(cut_off(n) for n in controls[0]):
-            return None
-        if row_over(nodes, controls[0], tuple(controls[0][0]["center"]), screen_size(nodes)) is not None:
-            return None
+        if len(controls) != 1:
+            raise RuntimeError("%d rows hold %r" % (len(controls), alt))
+        if any(cut_off(n) for n in controls[0]):
+            raise RuntimeError("%r is cut off at the screen's edge" % alt)
+        over = row_over(nodes, controls[0], tuple(controls[0][0]["center"]), screen_size(nodes))
+        if over is not None:
+            raise RuntimeError("%r is under %r" % (alt, (over["text"] or over["desc"])[:40]))
         return controls[0][0], alt
+    if why:
+        raise RuntimeError(why)
     return None
 
 
@@ -2854,7 +2868,9 @@ class U2Daemon:
                         ", scrolled into view" if r.get("moved") else "",
                         ", under a cover" if r.get("covered") else "",
                         ", after %d touch%s held back (the page moved it)" % (
-                            r["held"], "" if r["held"] == 1 else "es") if r.get("held") else ""))
+                            r["held"], "" if r["held"] == 1 else "es") if r.get("held") else "")
+                        + ("; no event of the touch reached the page (a frame over it took it?)"
+                           if r.get("unjudged") else ""))
                 if not r.get("found"):
                     # Chrome's own prompts (a permission ask, "Save
                     # password?") are not on the page; the screen reader
@@ -2877,6 +2893,10 @@ class U2Daemon:
                         r["count"], label, " (%s)" % ", ".join(r["tags"]) if r.get("tags") else ""))
                 xml = self._new_tab_read(r) if r.get("new_tab") else self._after_page(r["screen"])
                 self._remember(xml)
+                if r.get("unjudged"):
+                    # no event of the touch reached the page: a frame over the
+                    # target took it (an ad slid in): said with the read
+                    xml = re.sub(r"<hierarchy\b", '<hierarchy unjudged="1"', xml, count=1)
             return xml.encode()
         if "set_text" in spec and spec.get("field") and self._page() is not None:
             # Text into the page's field with this label, by the page
