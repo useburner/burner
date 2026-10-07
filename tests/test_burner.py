@@ -6176,6 +6176,43 @@ class WebPathTests(OfflineTestCase):
             self.assertIn("\\u2019", getattr(cdp, name), name)
         self.assertNotIn("\\u2019", cdp.READ_JS)
 
+    def test_a_plain_type_takes_the_one_text_field_in_one_trip(self):
+        # Translate, Oct 7: nothing had the focus, the focused selector found
+        # nothing, and the slow way took four more trips (5.2s)
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm.d = _FakeServer([])
+        sent = []
+        dm._act_batch = lambda spec: sent.append(spec) or SAMPLE_XML.encode()
+        unfocused = SAMPLE_XML.replace('focused="true"', 'focused="false"')
+        dm._last_xml, dm._last_xml_t = unfocused, mod._time.monotonic()
+        dm.cmd_act(json.dumps({"set_text": "hola", "idle": 1200}))
+        self.assertEqual(sent[-1]["field_selector"], mod.field_selector("com.example:id/q"))
+        self.assertNotIn("focused", sent[-1]["field_selector"])
+        # focused already, two fields, or an old read: the focused selector, as before
+        two = unfocused.replace("</hierarchy>", '<node text="" class="android.widget.EditText" package="com.example" '
+                                'bounds="[100,900][900,1000]" enabled="true" focused="false"/></hierarchy>')
+        for xml, age in ((SAMPLE_XML, 0), (two, 0), (unfocused, 60)):
+            sent.clear()
+            dm._last_xml, dm._last_xml_t = xml, mod._time.monotonic() - age
+            dm.cmd_act(json.dumps({"set_text": "hola", "idle": 1200}))
+            self.assertNotIn("field_selector", sent[-1])
+        self.assertEqual(mod.field_selector()["mask"], 0x10)
+        # a tap naming the field by its kind: the one text field
+        box = ('<hierarchy rotation="0"><node text="Enter text" class="android.widget.EditText" package="com.example" '
+               'bounds="[100,600][900,700]" clickable="true" enabled="true"/><node text="Spanish" '
+               'class="android.widget.Button" package="com.example" bounds="[100,200][500,300]" clickable="true" '
+               'enabled="true"/></hierarchy>')
+        plan = pc.plan_tap(pc.walk(ET.fromstring(box)), 1080, 2400, text="text field")
+        self.assertEqual((plan["action"], plan["node"]["text"]), ("tap", "Enter text"))
+        two_boxes = box.replace("</hierarchy>", '<node text="" class="android.widget.EditText" package="com.example" '
+                                'bounds="[100,900][900,1000]" clickable="true" enabled="true"/></hierarchy>')
+        self.assertEqual(pc.plan_tap(pc.walk(ET.fromstring(two_boxes)), 1080, 2400, text="text field")["action"],
+                         "nomatch")
+        self.assertEqual(pc.plan_tap(pc.walk(ET.fromstring(box)), 1080, 2400, text="Spanish")["node"]["text"],
+                         "Spanish")
+
     def test_a_native_type_with_a_field_label_is_not_sent_by_the_helper(self):
         mod = _u2mux()
         EmptyScreenTests.no_sleep(self, mod)

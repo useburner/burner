@@ -1489,6 +1489,18 @@ def focused_field_selector(rid=""):
     return sel
 
 
+def field_selector(rid=""):
+    """The phone's selector for a text field, focused or not: by its
+    resource id when known, else any EditText (the caller knows there is
+    one). uiautomator2's Selector shape (class name: 0x10, resource id:
+    0x200000). Pure."""
+    sel = {"childOrSibling": [], "childOrSiblingSelector": [], "className": "android.widget.EditText",
+           "mask": 0x10}
+    if rid:
+        sel.update(mask=0x10 | 0x200000, resourceId=rid)
+    return sel
+
+
 TAP_OPENED_S = 30.0  # a control tapped this recently may have opened the box a `type --field` names
 FIELD_AGAIN_S = 0.4  # a field not (or not yet) where the typing wants it is looked for again this much later
 WAKE_RPC_S = 3.0     # the wake before a launch: a no-op, or 500ms on the phone
@@ -2763,7 +2775,28 @@ class U2Daemon:
             spec["tap"] = list(center)
         if "set_text" in spec and spec.get("field"):
             return self._type_into_field(spec)
+        if "set_text" in spec and not spec.get("field_selector"):
+            # no field named: the focused one; with none focused on the
+            # newest read and one text field on it, that one, in the same
+            # trip (Translate's box: the focused selector found nothing, and
+            # the slow way took four more trips, 5.2s, Oct 7)
+            lone = self._lone_field()
+            if lone is not None:
+                spec["field_selector"] = field_selector(lone.get("rid", ""))
         return self._act_batch(spec)
+
+    def _lone_field(self):
+        """The one enabled text field on the newest read (BY_WORDS_S old
+        at most), when none has the focus; None otherwise."""
+        if not self._last_xml or _time.monotonic() - self._last_xml_t >= BY_WORDS_S:
+            return None
+        try:
+            fields = [n for n in iter_nodes(self._last_xml) if n["field"] and n["enabled"]]
+        except Exception:
+            return None
+        if any(n["focused"] for n in fields) or len(fields) != 1:
+            return None
+        return fields[0]
 
     NO_FIELD_TAP = "act not sent: --field on a native screen needs a tap on the field first"
 

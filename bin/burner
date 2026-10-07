@@ -1190,6 +1190,11 @@ def _is_text_field(n):
 SECRET_WORDS = ("password", "passcode", "passphrase", "pin", "cvv", "cvc")
 
 
+# Words that name a field by its kind, not by its label
+FIELD_KIND_WORDS = {"text field", "text box", "textbox", "text input", "input", "input field", "input box",
+                    "edit text", "edittext", "edit box", "field", "the text field", "the field", "the text box"}
+
+
 def field_named(sel, n, focused_ok=False):
     """Whether text field `n` is named loosely by the words `sel`: the head
     of its words, a leading symbol aside, is theirs as whole words ("Email
@@ -2643,6 +2648,13 @@ def plan_tap(nodes, w, h, text=None, xy=None, fuzzy=False, index=None,
             for words in (_row_words(n) for n in loose):
                 if words and words not in near:  # one control drawn twice is named once
                     near.append(words)
+    if not hits and plain_words(text).lower() in FIELD_KIND_WORDS:
+        # a field named by its kind, not its words ("tap the text field"):
+        # the one text field on the screen, as a person takes it
+        # (Translate's box reads "Enter text", Oct 7)
+        fields = [n for n in nodes if _is_text_field(n) and _bounds_rect(n.get("bounds"))]
+        if len(fields) == 1:
+            hits, used = fields, text
     if not hits:
         return {"action": "nomatch", "near": near[:3]}
     controls = dedupe_same_control(hits)
