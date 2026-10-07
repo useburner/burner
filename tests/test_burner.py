@@ -5763,9 +5763,15 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(calls[-1], ("tap", "Box Score", None, 900))
         self.assertIn('text="Box Score"', xml)
         self.assertEqual(dm._last_xml, xml)
+        dm.d = _FakeServer([CHROME_XML])  # Chrome's own rows: no "Nope" either
         with self.assertRaises(RuntimeError) as cm:
             dm.cmd_act(json.dumps({"tap_label": "Nope"}))
         self.assertEqual(str(cm.exception), "act not sent: not on the page")
+        # the screen reader not answering is no "not on the page": the CLI looks its own way
+        dm.d = _FakeServer([])
+        with self.assertRaises(RuntimeError) as cm:
+            dm.cmd_act(json.dumps({"tap_label": "Nope"}))
+        self.assertEqual(str(cm.exception), "act not sent: the screen reader couldn't be asked")
         with self.assertRaises(RuntimeError) as cm:
             dm.cmd_act(json.dumps({"tap_label": "Twice"}))
         self.assertEqual(str(cm.exception), "act not sent: 2 rows on the page read 'Twice'")
@@ -10021,6 +10027,19 @@ class CoordinateTapTests(OfflineTestCase):
             rc = pc.cmd_tap(self.parse(["tap", "Edit"]))
         self.assertEqual((rc, calls), (1, ["act"]))
         self.assertIn("ambiguous tap: 2 rows on the page read 'Edit' (a, a); use --index N", err.getvalue())
+        # not on the page (searched whole, and Chrome's own rows with it):
+        # said at once, with no wait and no read of the screen reader's rows
+        calls.clear()
+
+        def u2_none(cmd, arg="", timeout=30):
+            calls.append(cmd)
+            pc._u2_status = "err act not sent: not on the page"
+            return None
+        self.allow("u2sock", side_effect=u2_none)
+        with mock.patch.object(pc.time, "sleep", side_effect=AssertionError("no wait")), self.cap() as (out, err):
+            rc = pc.cmd_tap(self.parse(["tap", "Nope"]))
+        self.assertEqual((rc, calls), (1, ["act"]))
+        self.assertIn('no match for "Nope" on the page (all of it was searched', err.getvalue())
 
     def test_a_tap_by_xy_plans_from_the_helper_s_newest_read(self):
         self.allow("wake_async", return_value=mock.Mock())

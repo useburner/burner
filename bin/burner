@@ -2780,6 +2780,13 @@ def cmd_tap(args):
             # (bbc.com, Oct 7: "no match", then a scroll to find them)
             return _tap_fail(args, "ambiguous tap: {}; use --index N (0 is the first on the page) or a longer "
                                    "label".format(_u2_status.split("act not sent: ", 1)[-1]), evidence=False)
+        if status == "unsent" and _u2_status.endswith("act not sent: not on the page"):
+            # the page was searched whole (below the fold too, and once more
+            # a moment later), and Chrome's own rows with it: the screen
+            # reader's rows, looked at next, are a lagging view of the same
+            # page (a 0.7s wait and a read before the same answer, Oct 7)
+            return _tap_fail(args, 'no match for "{}" on the page (all of it was searched, below the fold too); '
+                                   '`burner text` prints its words'.format(args.text), evidence=False)
         if status != "unsent":
             snap_invalidate()
             try:

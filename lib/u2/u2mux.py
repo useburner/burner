@@ -2847,9 +2847,12 @@ class U2Daemon:
                     # Chrome's own prompts (a permission ask, "Save
                     # password?") are not on the page; the screen reader
                     # has them: one read there, and the row tapped where it is
-                    center = self._native_row(label)
+                    center, why = self._native_row(label)
                     if center is None:
-                        raise RuntimeError("act not sent: not on the page")
+                        # "not on the page": searched whole, and Chrome's own
+                        # rows with it (the CLI says so, and looks no further)
+                        raise RuntimeError("act not sent: %s" % (
+                            "not on the page" if why == "not on the last read" else why))
                     native = {"tap": list(center), "idle": spec.get("idle", 1200)}
                     if spec.get("quiet"):
                         native["quiet"] = True
@@ -3238,21 +3241,25 @@ class U2Daemon:
             raise
 
     def _native_row(self, label):
-        """The centre of the row with these words on a fresh read by the
-        screen reader (not the page: Chrome's own prompts live only
-        there), or None. The read is the newest one known."""
+        """(The centre of the row with these words on a fresh read by the
+        screen reader, or None; why not): not the page, Chrome's own
+        prompts live only there. A row the words name counts, as in any
+        tap by words (see label_node). Why not: "not on the last read"
+        when no row has them, else what kept the tap from it (two rows, a
+        row cut off or covered: the CLI's own plan takes those), or the
+        read failing. The read is the newest one known."""
         try:
             with _t("dump rpc (native row)"):
                 xml = read_screen(self.d)
         except Exception as e:
             log("the screen reader couldn't be asked for %r (%s)" % (label, err_text(e, 80)))
-            return None
+            return None, "the screen reader couldn't be asked"
         if has_words(xml):
             self._remember(xml)
         try:
-            return label_target(xml, label)
-        except RuntimeError:
-            return None
+            return label_target(xml, label, loose=True), None
+        except RuntimeError as e:
+            return None, str(e)
 
     def _act_batch(self, spec):
         """The act's calls (see act_calls) in one round trip, and what
