@@ -6380,7 +6380,7 @@ def record_command_line(args):
                           "route", "forget", "record", "replay", "recipe", "do",
                           "ensure", "gcode", "vcode", "amazon-status", "setup",
                           "uninstall", "update", "apps", "status", "dismiss", "notifications",
-                          "recipes", "save", "log"}
+                          "recipes", "save", "log", "text"}
         if argv[0] in non_recordable:
             return None
         # Reconstruct with proper quoting
@@ -7690,6 +7690,15 @@ def log_command(ms, rc):
 TEXT_MAX = 20000  # characters `burner text` prints at a time (--max)
 
 
+def _readable(s):
+    """`s` safe to print: line ends as newlines, other control characters
+    out, and a lone half of a two-part character (a broken page's text)
+    as the replacement mark, since it can't be written as UTF-8. Pure."""
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(chr(0xFFFD) if 0xD800 <= ord(c) <= 0xDFFF else c for c in s
+                   if c in "\n\t" or not (ord(c) < 32 or ord(c) == 127))
+
+
 def screen_text(nodes, h):
     """Every row's words on a read, uncut and in order (`burner text`
     off a page): the status bar, the navigation bar and the keyboard
@@ -7725,28 +7734,37 @@ def cmd_text(args):
         except ValueError:
             page = None
     if isinstance(page, dict) and isinstance(page.get("text"), str):
+        # places as the page counts them (an emoji is two), from the page:
+        # counting here said "cut" on a page with emoji (review, Oct 7)
         total, text = int(page.get("total") or 0), page["text"]
+        at = page["start"] if isinstance(page.get("start"), int) else start
+        nxt = page["next"] if isinstance(page.get("next"), int) else at + len(text)
         print("page: {} ({}), {} characters{}".format(
-            page.get("title") or "(no title)", page.get("url") or "", total,
-            ", from {}".format(start) if start else ""))
+            _readable(page.get("title") or "") or "(no title)", _readable(page.get("url") or ""), total,
+            ", from {}".format(at) if at else ""))
         if text:
-            print(text)
-        end = start + len(text)
-        if end < total:
-            print("(cut at {} of {}: `burner text --from {}` for the rest)".format(end, total, end))
+            print(_readable(text))
+        if nxt < total:
+            # on stderr, so `burner text | grep ...` keeps it in sight
+            print("(cut at {} of {}: `burner text --from {}` for the rest)".format(nxt, total, nxt),
+                  file=sys.stderr)
         return 0
     root = ui_dump()
     _w, h = screen_dims()
+    pkg = dump_package(root)
+    if out is None and pkg in WEB_APPS:
+        # the helper couldn't read the page: its rows, cut as rows are
+        print("burner: the page's own text couldn't be read; the screen's rows instead", file=sys.stderr)
     rows = screen_text(walk(root), h)
-    text = "\n".join(rows)
-    print("screen: {}, {} characters{}".format(dump_package(root) or "?", len(text),
+    text = _readable("\n".join(rows))
+    print("screen: {}, {} characters{}".format(pkg or "?", len(text),
                                                ", from {}".format(start) if start else ""))
     part = text[start:start + count]
     if part:
         print(part)
     if start + len(part) < len(text):
         print("(cut at {} of {}: `burner text --from {}` for the rest)".format(
-            start + len(part), len(text), start + len(part)))
+            start + len(part), len(text), start + len(part)), file=sys.stderr)
     return 0
 
 

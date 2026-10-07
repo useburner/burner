@@ -2153,7 +2153,9 @@ class U2Daemon:
         p = json.loads(arg) if arg.strip() else {}
         page = self._page()
         if page is None:
-            raise RuntimeError("not a page")
+            # a plain miss: no retry, which would cost a round trip to the
+            # phone for the same answer (review, Oct 7)
+            raise U2NotFound("not a page")
         with self._lock:
             try:
                 with _t("web text"):

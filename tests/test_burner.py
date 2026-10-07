@@ -6778,10 +6778,12 @@ class WebPathTests(OfflineTestCase):
                          .format(len(body)))
         self.assertIn('{"title": "post 399"}', out.getvalue())  # the whole answer, uncut
         self.assertEqual(sent, [("text", {"from": 0, "max": pc.TEXT_MAX})])
-        # a long one, a part at a time
+        # a long one, a part at a time; the cut said on stderr, where a
+        # `| grep` keeps it in sight
         with self.cap() as (out, err):
             pc.cmd_text(self.parse(["text", "--max", "100"]))
-        self.assertIn("(cut at 100 of {}: `burner text --from 100` for the rest)".format(len(body)), out.getvalue())
+        self.assertIn("(cut at 100 of {}: `burner text --from 100` for the rest)".format(len(body)), err.getvalue())
+        self.assertNotIn("cut at", out.getvalue())
         with self.cap() as (out, err):
             pc.cmd_text(self.parse(["text", "--from", "100", "--max", "50"]))
         self.assertIn(", from 100\n" + body[100:150] + "\n", out.getvalue())
@@ -6813,8 +6815,55 @@ class WebPathTests(OfflineTestCase):
         dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
         self.assertEqual(json.loads(dm.cmd_text(json.dumps({"from": 1, "max": 3})))["text"], "ell")
         dm._last_xml = SAMPLE_XML
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(mod.U2NotFound):
             dm.cmd_text("")
+        # a plain miss: no retry (one more round trip for the same answer)
+        dm.d = mock.Mock()
+        self.assertEqual(dm.handle("text {}"), b"__NOT_FOUND__")
+        dm.d.info.assert_not_called()
+
+    def test_text_counts_places_as_the_page_does(self):
+        # review, Oct 7: places counted here (code points) against the page's
+        # total (UTF-16 units) said "cut" on a page with emoji, and a cut
+        # inside an emoji sent half of it, which crashed the print
+        emoji = chr(0x1F600)
+        whole = "Bake " + emoji * 3 + " at 350"
+        units = len(whole.encode("utf-16-le")) // 2
+        answers = []
+
+        def u2(cmd, arg="", timeout=30):
+            return answers.pop(0)
+        self.allow("u2sock", side_effect=u2)
+        answers.append(json.dumps({"title": "Bread", "url": "u", "total": units, "start": 0, "next": units,
+                                   "text": whole}))
+        with self.cap() as (out, err):
+            self.assertEqual(pc.cmd_text(self.parse(["text"])), 0)
+        self.assertEqual(out.getvalue().splitlines()[1], whole)
+        self.assertNotIn("cut at", out.getvalue() + err.getvalue())
+        # a lone half and control characters: printable, nothing lost but them
+        broken = json.dumps({"title": "T" + chr(7), "url": "u", "total": 40, "start": 0, "next": 9,
+                             "text": "ab" + chr(0xD83D) + "c" + chr(27) + "[2Jd\r\ne"})
+        answers.append(broken)
+        buf = io.BytesIO()
+        out = io.TextIOWrapper(buf, encoding="utf-8")  # errors="strict", as a real stdout
+        with mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", io.StringIO()) as err:
+            self.assertEqual(pc.cmd_text(self.parse(["text"])), 0)
+        out.flush()
+        lines = buf.getvalue().decode("utf-8").splitlines()
+        self.assertEqual(lines[0], "page: T (u), 40 characters")
+        self.assertEqual(lines[1:], ["ab" + chr(0xFFFD) + "c[2Jd", "e"])
+        self.assertIn("(cut at 9 of 40: `burner text --from 9` for the rest)", err.getvalue())
+        # the page couldn't be read in Chrome: its rows, and why
+        answers.append(None)
+        self.allow("ui_dump", return_value=ET.fromstring(CHROME_XML))
+        self.allow("screen_dims", return_value=(1080, 2400))
+        with self.cap() as (out, err):
+            self.assertEqual(pc.cmd_text(self.parse(["text"])), 0)
+        self.assertIn("the page's own text couldn't be read; the screen's rows instead", err.getvalue())
+        self.assertTrue(out.getvalue().startswith("screen: com.android.chrome, "))
+        # read-only: never recorded into a flow
+        with mock.patch.object(sys, "argv", ["burner", "text", "--from", "5"]):
+            self.assertIsNone(pc.record_command_line(self.parse(["text", "--from", "5"])))
 
     def test_scroll_to_on_a_page_asks_the_page(self):
         # allrecipes.com, Oct 7: ten scrolls (469px each) never reached

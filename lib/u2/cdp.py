@@ -1186,12 +1186,20 @@ SCROLL_TO_JS = r"""
 # reading order, its line breaks kept), `count` characters from `start`,
 # with the whole length: `burner text`. Rows cut a long text at 160
 # characters, and an assistant went around burner to read a JSON answer
-# in full (Oct 7).
+# in full (Oct 7). Places count the page's own way (UTF-16 units: an
+# emoji is two) and a cut never falls inside a character (half of one
+# can't be printed, review Oct 7): `next` is where the rest starts.
 TEXT_JS = r"""
 (function(start, count){
   const raw = (document.body || document.documentElement).innerText || '';
   const text = raw.replace(/[ \t\u00a0]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
-  return {title: document.title, url: location.href, total: text.length, text: text.slice(start, start + count)};
+  const inside = i => i > 0 && i < text.length && (text.charCodeAt(i) & 0xFC00) === 0xDC00
+    && (text.charCodeAt(i - 1) & 0xFC00) === 0xD800;
+  let a = Math.max(0, Math.min(start, text.length)), b = Math.min(text.length, a + Math.max(1, count));
+  if (inside(a)) a--;
+  if (inside(b)) b = b - 1 > a ? b - 1 : b + 1;
+  return {title: document.title, url: location.href, total: text.length, start: a, next: b,
+          text: text.slice(a, b)};
 })"""
 
 
@@ -1839,7 +1847,7 @@ def type_text(page, text, idle_ms=800):
 
 def page_text(page, start=0, count=20000):
     """The page's words, `count` characters from `start` (see TEXT_JS):
-    {"title", "url", "total", "text"}."""
+    {"title", "url", "total", "start", "next", "text"}."""
     return page.eval(_js(TEXT_JS, int(start), int(count)), timeout=10.0) or {}
 
 

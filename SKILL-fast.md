@@ -93,7 +93,7 @@ Every step you take costs a round trip, so the fewer steps, the faster.
 | "Check my notifications" / "anything new?" | `burner notifications` prints them and changes nothing. |
 | "Check my Amazon order" | `burner amazon-status`. |
 | "Check my messages" | `burner apps messages`, `burner start <package>`, read the rows; open a conversation only to read it. |
-| "Read this article" / a recipe / a long page / a JSON answer | `burner open "https://…" com.android.chrome`, then `burner text`: the page's whole text, top to bottom (`burner text \| grep -i bake` for the part you need, `--from N` for more of a very long one). |
+| "Read this article" / a recipe / a long page / a JSON answer | `burner open "https://…" com.android.chrome`, then `burner text`: the page's whole text, top to bottom (pipe it through `grep -i bake` for the part you need; `--from N` for more of a very long one). |
 | "Scroll down" / "scroll to the top" | `burner scroll down`, `burner scroll top`: inside the open app, never HOME or an edge swipe. |
 | "Do this every time" / "save that" | Turn the steps that worked into a recipe with `burner save <name> 'step' ...` (labels, not coordinates; `$VARIABLE` for text that changes), test it once with `burner recipe <name>`. |
 | "Update my burner" | `burner update` (it stays on this version), then re-read `~/burner/SKILL-fast.md`. |
