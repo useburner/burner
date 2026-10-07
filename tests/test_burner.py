@@ -8598,6 +8598,53 @@ class WindowOverPageTests(OfflineTestCase):
         dm.d = SimpleNamespace(jsonrpc_call=mock.Mock(side_effect=OSError("stream closed")), info={"screenOn": True})
         self.assertIn('text="Box Score"', dm._dump(fresh=True))
 
+    def test_an_app_over_the_page_is_the_newest_read_at_once(self):
+        # Oct 7: `settings home` over a Wikipedia page: the launch's read
+        # came before Settings was drawn and showed Chrome; the page's read
+        # saw Settings over it and gave way, and the stale read stood, so
+        # the next tap tried the page first (~4s)
+        mod = _u2mux()
+        EmptyScreenTests.no_sleep(self, mod)
+        calls = []
+        WebPathTests._fake_cdp(self, mod, calls)
+        dm = EmptyScreenTests._daemon(self, mod)
+        dm._web = _FakePage()
+        dm._web.visible_at = 1e9
+        dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
+        settings = ('<hierarchy rotation="0"><node text="" package="com.android.settings" '
+                    'class="android.widget.FrameLayout" bounds="[0,0][1080,2400]"><node text="Search settings" '
+                    'package="com.android.settings" class="android.widget.TextView" bounds="[160,180][800,270]"/>'
+                    '<node text="Network &amp; internet" package="com.android.settings" class="android.widget.TextView" '
+                    'bounds="[160,600][800,680]"/></node></hierarchy>')
+        dm.d = _FakeServer([settings], windows=settings)
+        dm._batch = lambda calls, timeout=45.0: [True] * (len(calls) - 1) + [CHROME_XML]
+        xml = dm._act_batch({"idle": 1000}).decode()
+        self.assertIn("Search settings", xml)  # the screen now, not the read from before Settings came
+        self.assertEqual(dm._last_xml, xml)  # the newest read: the next tap goes to Settings' rows
+        self.assertEqual(dm.d.calls, ["dumpWindowHierarchy"])  # one read, after the window
+        self.assertEqual(dm._web.visible_at, 0.0)  # the page's proof of being on screen ended
+        self.assertIsNone(dm._page())  # Settings in front: no page
+        # the CLI's `settings`: read again while another app still shows
+        reads = [CHROME_XML, CHROME_XML, settings]
+
+        def u2(cmd, arg="", timeout=30):
+            return reads.pop(0) if len(reads) > 1 else reads[0]
+        self.allow("u2sock", side_effect=u2)
+        self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
+        self.allow("u2_invalidate")
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertEqual(pc.cmd_settings(self.parse(["settings", "home"])), 0)
+        self.assertIn("screen: com.android.settings", out.getvalue())
+        # a page of Settings shown by another package: the quick reads,
+        # then the screen as it is, no long wait for Settings
+        reads[:] = [SAMPLE_XML]
+        installed = self.allow("app_installed", return_value=True)
+        with mock.patch.object(pc.time, "sleep") as slept, self.cap() as (out, err):
+            self.assertEqual(pc.cmd_settings(self.parse(["settings", "home"])), 0)
+        self.assertIn("screen: com.example", out.getvalue())
+        installed.assert_not_called()
+        self.assertLessEqual(len(slept.call_args_list), pc.LAUNCH_REREADS + 3)
+
     def test_a_wait_on_a_page_moves_to_the_screen_reader_under_a_window(self):
         mod = _u2mux()
         EmptyScreenTests.no_sleep(self, mod)

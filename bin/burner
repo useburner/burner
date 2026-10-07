@@ -3945,7 +3945,7 @@ def _launch_failed(pkg, front):
             "or `burner press HOME`, then start it again.".format(pkg, front))
 
 
-def launch_read(quiet, expect=None):
+def launch_read(quiet, expect=None, patient=True):
     """The screen after a launch or a link: one round trip that waits for
     the new window, lets it go quiet (IDLE_LAUNCH_MS at most: a web page
     with ads never does, and a person reads it as soon as the part they
@@ -3955,8 +3955,10 @@ def launch_read(quiet, expect=None):
     (a start from the home screen read the launcher 0.8s in and said the
     app didn't come to the front, Oct 5), and then, for an app that is
     installed, until LAUNCH_SLOW_S have passed (a heavy app's cold start
-    takes longer than those reads: a person waits for it). Returns the
-    package in front, or None when it isn't known."""
+    takes longer than those reads: a person waits for it). patient=False:
+    the quick reads only, then the screen as it is (a page of Settings
+    may be another package's). Returns the package in front, or None when
+    it isn't known."""
     if quiet:
         read_after(quiet=True, idle_ms=IDLE_LAUNCH_MS)
         return None
@@ -3986,6 +3988,8 @@ def launch_read(quiet, expect=None):
             front = expect
             break
         attempt += 1
+        if attempt > LAUNCH_REREADS and not patient:
+            break
         if attempt > LAUNCH_REREADS:
             # the quick reads are spent: an app that is installed is still
             # starting (one that isn't gets its verdict now); with no app's
@@ -5755,7 +5759,10 @@ def cmd_settings(args):
     adb_or_ensure("shell", script)
     u2_invalidate()
     print("opened settings: {}".format(page if page != "app" else "app " + args.package))
-    launch_read(getattr(args, "quiet", False))
+    # read again while another app still shows (the launch's read came
+    # before Settings was drawn over a Chrome page and printed Chrome's
+    # screen, Oct 7); the quick reads only
+    launch_read(getattr(args, "quiet", False), expect=SETTINGS_PKG, patient=False)
     if listed:
         print("(pages by name: `burner settings <page>`: " + ", ".join(sorted(SETTINGS_PAGES))
               + ", app <package>)")
@@ -5763,6 +5770,7 @@ def cmd_settings(args):
 
 
 CHROME_PKG = "com.android.chrome"
+SETTINGS_PKG = "com.android.settings"
 
 
 def cmd_open(args):

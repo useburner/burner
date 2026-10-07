@@ -1930,6 +1930,20 @@ class U2Daemon:
         over = look.over()
         if over is not None:
             log("a window over the page (%s %r): the screen reader's read" % over)
+            # the page isn't the screen: its proof of being on it ends, and
+            # the screen is read now, after that window (a read taken
+            # before it was drawn showed Chrome: `settings home` printed
+            # Chrome's screen, and the next tap tried the page first, ~4s,
+            # Oct 7); _dump and _act_batch take this read (_front_look)
+            page.visible_at = 0.0
+            try:
+                with self._lock:
+                    with _t("dump rpc (window over the page)"):
+                        xml = read_screen(self.d)
+                if has_words(xml):
+                    self._front_look = xml
+            except Exception as e:
+                log("the read after the window over the page failed (%s)" % err_text(e, 80))
             return None
         log("web read: %d rows, %sms in the page" % (len(screen.get("rows") or []), screen.get("ms", "?")))
         return self._page_xml(screen)
@@ -3066,7 +3080,12 @@ class U2Daemon:
             # in front on it (HOME from a page: no question to a page in
             # the background, whose rows printed as the screen, Oct 5).
             self._remember(xml)
+            self._front_look = None
             page_xml = self._page_read()
+            if page_xml is None and getattr(self, "_front_look", None):
+                # the page check's own read of what is in front (another
+                # app's window over the page): newer than the act's
+                page_xml, self._front_look = self._front_look, None
             if page_xml is not None:
                 xml = page_xml
                 self._remember(xml)
