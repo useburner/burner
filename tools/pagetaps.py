@@ -132,7 +132,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             time.sleep(int(delay) / 1000.0)
             body, ctype = IMG, "image/png"
         elif path in PAGES:
-            body, ctype = PAGES[path].encode(), "text/html"
+            body, ctype = PAGES[path].encode(), "text/html; charset=utf-8"
         else:
             self.send_response(404)
             self.end_headers()

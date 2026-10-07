@@ -1347,16 +1347,32 @@ SCROLL_TO_JS = r"""
 # emoji is two) and a cut never falls inside a character (half of one
 # can't be printed, review Oct 7): `next` is where the rest starts.
 TEXT_JS = r"""
-(function(start, count){
+(function(start, count, find){
   const raw = (document.body || document.documentElement).innerText || '';
   const text = raw.replace(/[ \t\u00a0]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
   const inside = i => i > 0 && i < text.length && (text.charCodeAt(i) & 0xFC00) === 0xDC00
     && (text.charCodeAt(i - 1) & 0xFC00) === 0xD800;
-  let a = Math.max(0, Math.min(start, text.length)), b = Math.min(text.length, a + Math.max(1, count));
+  let a = Math.max(0, Math.min(start, text.length)), at = -1;
+  if (find) {
+    // the first place at or after `start` with the words (any case, any run
+    // of spaces between them, a curly quote for a straight one); the text
+    // from the start of its line, or of the line a little before it
+    const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const q1 = '[\'' + String.fromCharCode(0x2018, 0x2019, 0x2bc) + ']', q2 = '["' + String.fromCharCode(0x201c, 0x201d) + ']';
+    const pat = find.trim().split(/\s+/).map(w => esc(w).replace(/'/g, q1).replace(/"/g, q2)).join('\\s+');
+    const m = pat ? new RegExp(pat, 'i').exec(text.slice(a)) : null;
+    if (!m) return {title: document.title, url: location.href, total: text.length, start: a, next: a, text: '', at: -1};
+    at = a + m.index;
+    let s = text.lastIndexOf('\n', Math.max(0, at - 200)) + 1;
+    if (at - s > 600) s = Math.max(0, at - 200);
+    a = Math.max(a, s);
+    count = Math.max(count, at + m[0].length - a);  // the words themselves, whatever the count
+  }
+  let b = Math.min(text.length, a + Math.max(1, count));
   if (inside(a)) a--;
   if (inside(b)) b = b - 1 > a ? b - 1 : b + 1;
   return {title: document.title, url: location.href, total: text.length, start: a, next: b,
-          text: text.slice(a, b)};
+          text: text.slice(a, b), at: at};
 })"""
 
 
@@ -2072,10 +2088,12 @@ def type_text(page, text, idle_ms=800):
             "direct": bool(sel.get("direct")), "only": bool(sel.get("only"))}
 
 
-def page_text(page, start=0, count=20000):
-    """The page's words, `count` characters from `start` (see TEXT_JS):
-    {"title", "url", "total", "start", "next", "text"}."""
-    return page.eval(_js(TEXT_JS, int(start), int(count)), timeout=10.0) or {}
+def page_text(page, start=0, count=20000, find=""):
+    """The page's words, `count` characters from `start` (see TEXT_JS), or
+    from a little before the first place at or after it with the words
+    `find`: {"title", "url", "total", "start", "next", "text", "at"} ("at":
+    where the words are, -1 when they aren't there)."""
+    return page.eval(_js(TEXT_JS, int(start), int(count), find or ""), timeout=10.0) or {}
 
 
 def scroll_to(page, label, direction="down"):

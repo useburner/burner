@@ -6155,8 +6155,11 @@ def build_parser():
                                     "top to bottom (changes nothing)")
     p.add_argument("--from", dest="start", type=int, default=0,
                    help="start at this character (for the rest of a long page)")
-    p.add_argument("--max", type=int, default=TEXT_MAX,
-                   help="characters at most (default {})".format(TEXT_MAX))
+    p.add_argument("--find", metavar="WORDS",
+                   help="start just before the first place with these words (any case); "
+                        "with --from, the first place after it")
+    p.add_argument("--max", type=int, default=None,
+                   help="characters at most (default {}, {} with --find)".format(TEXT_MAX, TEXT_FIND_MAX))
     p.set_defaults(fn=cmd_text)
 
     p = sub.add_parser("apps", help="list apps installed on the phone")
@@ -7855,6 +7858,25 @@ def log_command(ms, rc):
 
 
 TEXT_MAX = 20000  # characters `burner text` prints at a time (--max)
+TEXT_FIND_MAX = 3000  # ... with --find: the part around the words
+
+
+def find_in_text(text, words, start=0):
+    """Where the words are in `text`, at or after `start` (any case, any run
+    of spaces between them, a curly quote for a straight one), and where
+    to start printing: the start of their line, or of the line a little
+    before them (TEXT_JS's rule, for the screen's rows). (-1, start) when
+    they aren't there. Pure."""
+    parts = [re.escape(w).replace("'", "['\u2018\u2019\u02bc]").replace('"', '["\u201c\u201d]')
+             for w in (words or "").split()]
+    m = re.compile(r"\s+".join(parts), re.I).search(text, start) if parts else None
+    if not m:
+        return -1, start
+    at = m.start()
+    s = text.rfind("\n", 0, max(0, at - 200) + 1) + 1
+    if at - s > 600:
+        s = max(0, at - 200)
+    return at, max(start, s)
 
 
 def _readable(s):
@@ -7895,8 +7917,13 @@ def cmd_text(args):
     elsewhere every row's words. Rows cut a long text at LABEL_MAX, and an
     assistant went around burner to read a JSON answer in full (Oct 7).
     Changes nothing on the phone."""
-    start, count = max(0, args.start), max(1, args.max)
-    out = u2sock("text", json.dumps({"from": start, "max": count}), timeout=30)
+    find = (args.find or "").strip()
+    start = max(0, args.start)
+    count = max(1, args.max if args.max is not None else TEXT_FIND_MAX if find else TEXT_MAX)
+    spec = {"from": start, "max": count}
+    if find:
+        spec["find"] = find
+    out = u2sock("text", json.dumps(spec), timeout=30)
     page = None
     if out is not None and out != U2_NOT_FOUND:
         try:
@@ -7909,9 +7936,15 @@ def cmd_text(args):
         total, text = int(page.get("total") or 0), page["text"]
         at = page["start"] if isinstance(page.get("start"), int) else start
         nxt = page["next"] if isinstance(page.get("next"), int) else at + len(text)
-        print("page: {} ({}), {} characters{}".format(
+        where = page.get("at") if isinstance(page.get("at"), int) else None
+        print("page: {} ({}), {} characters{}{}".format(
             _readable(page.get("title") or "") or "(no title)", _readable(page.get("url") or ""), total,
-            ", from {}".format(at) if at else ""))
+            ", from {}".format(at) if at else "",
+            ' ("{}" at {})'.format(find, where) if find and where is not None and where >= 0 else ""))
+        if find and where is not None and where < 0:
+            print('no "{}" in the page\'s text{}'.format(find, " after {}".format(start) if start else ""),
+                  file=sys.stderr)
+            return 1
         if text:
             print(_readable(text))
         if nxt < total:
@@ -7931,8 +7964,16 @@ def cmd_text(args):
         print("burner: the page's own text couldn't be read; the screen's rows instead", file=sys.stderr)
     rows = screen_text(walk(root), h)
     text = _readable("\n".join(rows))
-    print("screen: {}, {} characters{}".format(pkg or "?", len(text),
-                                               ", from {}".format(start) if start else ""))
+    where = None
+    if find:
+        where, start = find_in_text(text, find, start)
+        if where < 0:
+            print("screen: {}, {} characters".format(pkg or "?", len(text)))
+            print('no "{}" on the screen'.format(find), file=sys.stderr)
+            return 1
+    print("screen: {}, {} characters{}{}".format(pkg or "?", len(text),
+                                                 ", from {}".format(start) if start else "",
+                                                 ' ("{}" at {})'.format(find, where) if where is not None else ""))
     part = text[start:start + count]
     if part:
         print(part)

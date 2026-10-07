@@ -7303,12 +7303,15 @@ class WebPathTests(OfflineTestCase):
         EmptyScreenTests.no_sleep(self, mod)
         calls = []
         fake = self._fake_cdp(mod, calls)
-        fake.page_text = lambda page, start=0, count=20000: {"title": "t", "url": "u", "total": 5,
-                                                            "text": "hello"[start:start + count]}
+        asked = []
+        fake.page_text = lambda page, start=0, count=20000, find="": asked.append(find) or {
+            "title": "t", "url": "u", "total": 5, "text": "hello"[start:start + count]}
         dm = EmptyScreenTests._daemon(self, mod)
         dm.d = _FakeServer([])
         dm._last_xml, dm._last_xml_t = CHROME_XML, mod._time.monotonic()
         self.assertEqual(json.loads(dm.cmd_text(json.dumps({"from": 1, "max": 3})))["text"], "ell")
+        dm.cmd_text(json.dumps({"from": 0, "max": 3, "find": "llo"}))
+        self.assertEqual(asked, ["", "llo"])
         dm._last_xml = SAMPLE_XML
         with self.assertRaises(mod.U2NotFound):
             dm.cmd_text("")
@@ -7316,6 +7319,40 @@ class WebPathTests(OfflineTestCase):
         dm.d = mock.Mock()
         self.assertEqual(dm.handle("text {}"), b"__NOT_FOUND__")
         dm.d.info.assert_not_called()
+
+    def test_text_finds_the_words_and_starts_there(self):
+        # coinmarketcap.com, Oct 7: Ethereum's price was four `burner text`
+        # calls down the page (20,000 characters each)
+        sent = []
+        answers = []
+
+        def u2(cmd, arg="", timeout=30):
+            sent.append(json.loads(arg))
+            return answers.pop(0)
+        self.allow("u2sock", side_effect=u2)
+        answers[:] = [json.dumps({"title": "CMC", "url": "u", "total": 90000, "start": 31200, "next": 34200,
+                                  "text": "Ethereum ETH $2,300.45 4.94%", "at": 31377})]
+        with self.cap() as (out, err):
+            rc = pc.cmd_text(self.parse(["text", "--find", "Ethereum"]))
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent[-1], {"from": 0, "max": pc.TEXT_FIND_MAX, "find": "Ethereum"})
+        self.assertEqual(out.getvalue().splitlines()[0], 'page: CMC (u), 90000 characters, from 31200 ("Ethereum" at 31377)')
+        self.assertIn("burner text --from 34200", err.getvalue())
+        # not there: said, exit 1
+        answers[:] = [json.dumps({"title": "CMC", "url": "u", "total": 90000, "start": 0, "next": 0, "text": "",
+                                  "at": -1})]
+        with self.cap() as (out, err):
+            self.assertEqual(pc.cmd_text(self.parse(["text", "--find", "Dogecorn"])), 1)
+        self.assertIn('no "Dogecorn" in the page\'s text', err.getvalue())
+        # a native screen: the rows' words, from the line a little before the words
+        text = "Wi-Fi\nConnected\nBluetooth\nOn\nBattery\n48%"
+        self.assertEqual(pc.find_in_text(text, "battery"), (text.index("Battery"), 0))
+        far = "x" * 900 + "\nline one\n" + "y" * 300 + "\nBattery 48%"
+        at, s = pc.find_in_text(far, "battery  48")
+        self.assertEqual((far[at:at + 7], far[s:s + 4]), ("Battery", "yyyy"))
+        # a curly quote for a straight one
+        self.assertEqual(pc.find_in_text("Don" + chr(0x2019) + "t allow", "don't allow")[0], 0)
+        self.assertEqual(pc.find_in_text(text, "battery", start=len(text)), (-1, len(text)))
 
     def test_text_counts_places_as_the_page_does(self):
         # review, Oct 7: places counted here (code points) against the page's
