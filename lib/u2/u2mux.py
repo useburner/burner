@@ -1982,12 +1982,14 @@ class U2Daemon:
                 current.visible_at = 0.0
             for i in range(self.LAUNCH_CONTACT_TRIES):
                 try:
-                    if current is not None and reuse:
+                    if current is not None and reuse and getattr(self, "_chrome_frame", None):
                         # the page in hand, asked first: when it says it is
                         # visible, Chrome is in front on it, and no read of
                         # the screen is needed (one took 1.6s while Chrome
                         # came up, Oct 7); a tab still in the background
-                        # answers only on the probe's bound
+                        # answers only on the probe's bound. Only with
+                        # Chrome's layout known from an earlier read: the
+                        # page's rows are placed under it (see _page_xml)
                         with _t("web page (probe after a launch)"):
                             if _cdp().visible(current, _cdp().QUICK_PROBE_S):
                                 self._web = current
@@ -2089,7 +2091,16 @@ class U2Daemon:
             page.last_read = screen  # the page's pixels to the screen's: a touch by --xy maps back
         last = getattr(self, "_last_xml", "")
         info = screen_of(last) if last else None
-        return _cdp().page_xml(screen, webview_top(last), info[1] if info else 0)
+        top = webview_top(last)
+        if not (info and _cdp().is_chrome(info[2])) and getattr(self, "_chrome_frame", None):
+            # the newest read is another app's (an open from the home screen
+            # asks the page in hand with no read of the screen): Chrome's
+            # own layout, from its last read (the page was placed at the
+            # top, without its address bar, and a point from a screenshot
+            # landed a bar too low, review of Oct 7)
+            top, h = self._chrome_frame
+            return _cdp().page_xml(screen, top, h)
+        return _cdp().page_xml(screen, top, info[1] if info else 0)
 
     def _after_page(self, screen):
         """The screen after an action on the page: its read as a screen
@@ -2193,6 +2204,13 @@ class U2Daemon:
         if words:
             self._mute_since, self._wordless_seen = None, False
         self._last_xml, self._last_xml_t = xml, _time.monotonic()
+        if 'page="1"' not in (xml or "")[:300] and webview_top(xml):
+            # a read of the screen with Chrome's page on it: where Chrome
+            # draws its page, kept for a page read with no read of Chrome's
+            # screen before it (see _page_xml)
+            info = screen_of(xml)
+            if info and _cdp().is_chrome(info[2]):
+                self._chrome_frame = (webview_top(xml), info[1])
 
     def _dump(self, fresh=False, replace=True, page_first=False, hint=None):
         """Hierarchy XML; served from cache if < DUMP_TTL old unless fresh.

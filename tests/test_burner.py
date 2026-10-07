@@ -7726,15 +7726,21 @@ class WebPathTests(OfflineTestCase):
                 "nothing was tapped: the page moved 'More' from under the touch 3 times (moved, div under the point;"))
             self.assertEqual(cm.exception.verdict, "moved")
             self.assertEqual(page.calls, [("many", ["PLACE_JS", "GUARD_JS"])] * 2 + [("eval", cdp.DISARM[:40])])
-            # covered where it was, and nothing moved: no second try at the same point
+            # covered where it was: tried again at the same point (a loading
+            # veil gone by then, review of Oct 7)
             page.calls.clear()
             page.answers["PLACE_JS"] = [{"x": 30, "y": 400}]
-            verdicts[:] = [{"verdict": "covered", "hit": "div Cookies?"}]
+            touched.clear()
+            verdicts[:] = [{"verdict": "covered", "hit": "div Loading"}, {"verdict": "ok"}]
+            self.assertEqual(cdp.touch_hit(page, dict(hit, x=30, y=400), then=["READ"]), ("touch", ["read"]))
+            self.assertEqual(touched, [(30, 400), (30, 400)])
+            # covered every time: said so
+            page.answers["PLACE_JS"] = [{"x": 30, "y": 400}]
+            verdicts[:] = [{"verdict": "covered", "hit": "div Cookies?"}] * 3
             with self.assertRaises(cdp.Held) as cm:
                 cdp.touch_hit(page, dict(hit, x=30, y=400), then=["READ"])
-            self.assertEqual((str(cm.exception), cm.exception.verdict), (
-                "nothing was tapped: something else was over 'More' where it was (covered, div Cookies? under the point)",
-                "covered"))
+            self.assertEqual(cm.exception.verdict, "covered")
+            self.assertTrue(str(cm.exception).startswith("nothing was tapped: something else was over 'More' where it was"))
             # the target gone (the page drew it again): nothing to aim at here
             verdicts[:] = [{"verdict": "gone"}]
             with self.assertRaises(cdp.Held) as cm:
@@ -10056,12 +10062,26 @@ class CoordinateTapTests(OfflineTestCase):
         fake.navigate = lambda page, url, idle_ms=1000: loaded.append((page, url)) or {"screen": WEB_SCREEN}
         dm._web = old
         launcher = SAMPLE_XML.replace("com.example", "com.google.android.apps.nexuslauncher")
+        dm._remember(CHROME_XML)  # an earlier read of Chrome's screen: where it draws its page
         dm.d = _FakeServer([])
         dm._last_xml, dm._last_xml_t = launcher, mod._time.monotonic()
         xml = dm.cmd_act(json.dumps({"open": "https://coinmarketcap.com", "launched": True})).decode()
         self.assertIn('text="Box Score"', xml)
         self.assertEqual((probes, given, dm.d.calls, loaded),
                          ([(0.0, fake.QUICK_PROBE_S)], [], [], [(old, "https://coinmarketcap.com")]))
+        # the page placed under Chrome's bars as that read had them, not
+        # at the top of the launcher's read (review of Oct 7)
+        self.assertEqual(mod.webview_rect(xml)[1], mod.webview_top(CHROME_XML))
+        self.assertIn("android.widget.EditText", xml)  # its address bar row
+        # with Chrome's layout unknown, the screen is read first, as before
+        del dm._chrome_frame
+        probes.clear()
+        dm._web = old
+        dm.d = _FakeServer([CHROME_XML])
+        dm._last_xml, dm._last_xml_t = launcher, mod._time.monotonic()
+        dm.cmd_act(json.dumps({"open": "https://coinmarketcap.com", "launched": True}))
+        self.assertEqual((probes, dm.d.calls), ([], ["dumpWindowHierarchy"]))
+        given.clear()
         # after a launch by intent the link may not have started loading in
         # it: no such shortcut there
         old.visible_at = 1e9

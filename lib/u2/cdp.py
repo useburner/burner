@@ -940,6 +940,10 @@ FIND_JS = r"""
   // calendar) is not: its controls are small
   let over = null;
   if (covered) { const oc = top.closest(ACTIVE); if (oc && spans(box(oc), r)) { over = oc; covered = false; window.__burnerTarget = oc; } }
+  // a frame is the target itself (a pay or sign-in button, a video, by
+  // its title): its touch goes into it, where the page hears none of it,
+  // and isn't judged (it read as one a frame took, review of Oct 7)
+  if (/^(IFRAME|FRAME|EMBED|OBJECT)$/.test((over || el).tagName)) window.__burnerArm = null;
   const link = (over || el).closest('a[href]');
   return {found: true, count: 1, used: used, label: (names(el)[0] || '').slice(0, 60),
           x: cx - (vv ? vv.offsetLeft : 0), y: cy - (vv ? vv.offsetTop : 0),
@@ -1130,8 +1134,11 @@ PLACE_JS = r"""
     const oc = over.closest(ACTIVE), b = oc && oc.getBoundingClientRect();
     if (b && b.left <= r.left + 2 && b.top <= r.top + 2 && b.right >= r.right - 2 && b.bottom >= r.bottom - 2) { covered = false; window.__burnerTarget = oc; }
   }
-  // the touch that follows is judged where it lands (see GUARD_JS)
-  window.__burnerArm = {until: performance.now() + 3000, verdict: null};
+  // the touch that follows is judged where it lands (see GUARD_JS), unless
+  // it goes into a frame, the target itself (see FIND_JS)
+  const target = window.__burnerTarget;
+  window.__burnerArm = /^(IFRAME|FRAME|EMBED|OBJECT)$/.test(target.tagName) ? null
+    : {until: performance.now() + 3000, verdict: null};
   return {x: cx - (vv ? vv.offsetLeft : 0), y: cy - (vv ? vv.offsetTop : 0), covered: covered};
 })"""
 
@@ -1975,15 +1982,13 @@ def touch_hit(page, hit, then=()):
         if verdict.get("verdict") not in MISSES:
             return how, after[1:]
         # held back: the page saw none of it; aimed again where the target
-        # is, unless that is where it was (nothing moved: a third try at the
-        # same point is held the same way), or this was the last try
+        # is now (a cover gone, a target drawn again: tried again at the same
+        # point too, review of Oct 7), unless this was the last try
         v = verdict["verdict"]
         held.append(v + (", %s under the point" % verdict["hit"] if verdict.get("hit") else ""))
         hit["held"] = len(held)
         place = _place(page) if v != "gone" and len(held) < GUARD_TRIES else {}
-        same = (place.get("x") is not None and abs(place["x"] - hit["x"]) < 1 and abs(place["y"] - hit["y"]) < 1
-                and v == "covered" and not place.get("covered"))
-        if place.get("x") is None or same:
+        if place.get("x") is None:
             try:
                 page.eval(DISARM)  # nothing after it is judged (review of Oct 7)
             except Exception:
