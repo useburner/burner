@@ -4486,7 +4486,9 @@ class HiddenControlTests(OfflineTestCase):
             'content-desc="Video player" clickable="false" enabled="true" bounds="[0,250][1080,858]">'
             '<node text="" class="android.widget.ImageView" package="com.google.android.youtube" '
             'content-desc="Play video" clickable="true" enabled="true" bounds="[459,474][619,634]"/>')
-        self.assertIsNone(mod.hid_itself(PLAYER_SHOWN_XML, took, node))
+        why = []
+        self.assertIsNone(mod.hid_itself(PLAYER_SHOWN_XML, took, node, why))
+        self.assertEqual(why, ["'Play video' is at its point now"])  # said in the helper's log
         # a progress bar beside the player counts the seconds on its own:
         # the same row (YouTube, Oct 7: the reveal didn't happen for it)
         def bar(xml, at):
@@ -4495,8 +4497,21 @@ class HiddenControlTests(OfflineTestCase):
                                'minutes 30 seconds" clickable="true" enabled="true" bounds="[0,850][1080,870]"/>'
                                '<node text="What It Takes"' % at)
         self.assertEqual(mod.hid_itself(bar(PLAYER_SHOWN_XML, 3), bar(PLAYER_HIDDEN_XML, 7), node), "Video player")
+        # the captions over the video change as it plays, in the player's
+        # rectangle but beside its own rows (captions on, the live check)
+        def captions(xml, *lines):
+            return xml.replace('<node text="What It Takes"', "".join(
+                '<node text="%s" class="android.widget.TextView" package="com.google.android.youtube" '
+                'content-desc="" clickable="false" enabled="true" bounds="[100,%d][980,%d]"/>'
+                % (t, 640 + 50 * i, 685 + 50 * i) for i, t in enumerate(lines)) + '<node text="What It Takes"')
+        self.assertEqual(mod.hid_itself(
+            captions(PLAYER_SHOWN_XML, "For over two decades, it has been our", "home in outer space"),
+            captions(PLAYER_HIDDEN_XML, "exceptional. Human beings from all over", "the world living together",
+                     "in a place"), node), "Video player")
         # something outside the player changed too: not the controls hiding
-        self.assertIsNone(mod.hid_itself(PLAYER_SHOWN_XML, PLAYER_HIDDEN_XML.replace("What It Takes", "Next up"), node))
+        why = []
+        self.assertIsNone(mod.hid_itself(PLAYER_SHOWN_XML, PLAYER_HIDDEN_XML.replace("What It Takes", "Next up"), node, why))
+        self.assertEqual(why, ["'What It Takes' went from outside 'Video player' too"])
         # a screen the app moved to: its own words, none of the player's
         moved = PLAYER_HIDDEN_XML.replace("What It Takes", "Library").replace('text="NASA"', 'text="History"') \
             .replace('content-desc="Comments"', 'content-desc="Playlists"').replace("Video player", "Banner")

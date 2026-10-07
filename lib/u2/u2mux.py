@@ -1439,31 +1439,38 @@ def loose_label_node(nodes, alts):
     return None
 
 
-NEW_WORDS_MAX = 2  # rows with words new on a read where controls hid themselves (a
-                   # player's thin progress bar); a screen the app moved to has more
+BOX_AREA_MAX = 0.6  # a box around a hidden control with no words of its own is
+                    # smaller than this share of the screen (a page's whole body is no box)
 _DIGITS = re.compile(r"\d+")
 
 
-def hid_itself(before, now, node):
+def hid_itself(before, now, node, why=None):
     """Whether the control `node` of `before` (the read the assistant was
     shown), not on `now`, was hidden by its own app, as a video's controls
     hide a few seconds after a touch: the assistant's turn is longer, and
     three taps on "Pause video" missed (YouTube, Oct 7). So when, the
     system UI aside:
-    - a box around it is on `now` as it was: the nearest that has words
-      or holds rows with words on both reads, not a window's root (a
-      screen the app moved to keeps no words but its bars');
-    - every row gone from `before` was in that box, every row new on
-      `now` is in it, and NEW_WORDS_MAX of them at most have words;
+    - a box around it is on `now` as it was: the nearest that has words,
+      or holds rows with words on both reads and is smaller than
+      BOX_AREA_MAX of the screen; not a window's root;
+    - every row gone from `before`, and every row new on `now`, is in that
+      box: inside it, or within its rectangle (the captions over a video
+      change as it plays, beside the player's own rows);
     - nothing that takes a tap is at the control's point on `now` but the
       box or what holds it (a button that took the control's place, "Play
       video", would take the touch).
     Then a touch where the control was brings it back. Returns the box's
-    words (its class when it has none), or None. Pure."""
+    words (its class when it has none), or None, with the reason added to
+    the list `why` when one is given (the helper logs it). Pure."""
+    def no(reason):
+        if why is not None:
+            why.append(reason)
+        return None
+
     try:
         old, new = list(iter_nodes(before or "")), list(iter_nodes(now or ""))
-    except Exception:
-        return None
+    except Exception as e:
+        return no("a read can't be parsed (%s)" % err_text(e, 60))
 
     def key(n):
         # a value that counts on its own is the same row while its digits
@@ -1480,37 +1487,52 @@ def hid_itself(before, now, node):
     def worded(n):
         return n["pkg"] != SYSTEM_UI and bool((n["text"] or n["desc"]).strip())
 
+    def said(n):
+        return repr((n["text"] or n["desc"] or n["cls"].split(".")[-1])[:40])
+
     at = next((i for i, n in enumerate(old) if key(n) == key(node)), None)
     if at is None:
-        return None
+        return no("it isn't on the read before")
     where, was = {key(n): i for i, n in enumerate(new)}, {key(n) for n in old}
     kept = [i for i, n in enumerate(new) if worded(n) and key(n) in was]
+    size = screen_size(new)
     box = None
     for i in chain(old, old[at]["parent"]):
         j = where.get(key(old[i]))
-        if j is not None and new[j]["parent"] is not None and (
-                worded(new[j]) or any(j in chain(new, k) for k in kept)):
+        if j is None or new[j]["parent"] is None:
+            continue
+        if worded(new[j]):
+            box = i, j
+            break
+        x1, y1, x2, y2 = new[j]["rect"]
+        if size and (x2 - x1) * (y2 - y1) >= BOX_AREA_MAX * size[0] * size[1]:
+            return no("the box around it that stayed is most of the screen")
+        if any(j in chain(new, k) for k in kept):
             box = i, j
             break
     if box is None:
-        return None
+        return no("no box around it stayed as it was")
     cx, cy = old[at]["center"]
-    x1, y1, x2, y2 = old[box[0]]["rect"]
-    if not (x1 <= cx <= x2 and y1 <= cy <= y2):
-        return None
-    if any(n["pkg"] != SYSTEM_UI and key(n) not in where and box[0] not in chain(old, n["parent"])
-           for n in old):
-        return None  # gone from outside the box
-    fresh = [n for n in new if n["pkg"] != SYSTEM_UI and key(n) not in was]
-    if (any(box[1] not in chain(new, n["parent"]) for n in fresh)
-            or sum(1 for n in fresh if worded(n)) > NEW_WORDS_MAX):
-        return None  # new outside the box, or a screen of its own
+    bx1, by1, bx2, by2 = old[box[0]]["rect"]
+    if not (bx1 <= cx <= bx2 and by1 <= cy <= by2):
+        return no("its point is outside the box around it, %s" % said(old[box[0]]))
+
+    def in_box(nodes, n, b):
+        x1, y1, x2, y2 = n["rect"]
+        return (bx1 <= x1 and by1 <= y1 and x2 <= bx2 and y2 <= by2) or b in chain(nodes, n["parent"])
+
+    gone = [n for n in old if n["pkg"] != SYSTEM_UI and key(n) not in where and not in_box(old, n, box[0])]
+    if gone:
+        return no("%s went from outside %s too" % (said(gone[0]), said(old[box[0]])))
+    came = [n for n in new if n["pkg"] != SYSTEM_UI and key(n) not in was and not in_box(new, n, box[1])]
+    if came:
+        return no("%s came outside %s" % (said(came[0]), said(new[box[1]])))
     holds = set(chain(new, box[1]))
     for i, n in enumerate(new):
         x1, y1, x2, y2 = n["rect"]
         if (x1 <= cx <= x2 and y1 <= cy <= y2 and (n["clickable"] or n["field"])
                 and i not in holds):
-            return None
+            return no("%s is at its point now" % said(n))
     b = new[box[1]]
     return b["text"] or b["desc"] or b["cls"].split(".")[-1]
 
@@ -3184,8 +3206,11 @@ class U2Daemon:
             try:
                 node, alt = label_node(xml, label, loose=True)
             except RuntimeError as e:
-                box = hid_itself(before, xml, shown) if shown is not None and str(e) == "not on the last read" else None
+                why = []
+                box = hid_itself(before, xml, shown, why) if shown is not None and str(e) == "not on the last read" else None
                 if box is None:
+                    if why:
+                        log("%r went from the screen since the last read, not hidden by its app: %s" % (label, why[0]))
                     raise RuntimeError("act not sent: %s" % e)
                 # on the assistant's screen a moment ago, hidden by its app
                 # since (a video's controls): a touch where it was brings it
