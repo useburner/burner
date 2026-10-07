@@ -4644,7 +4644,9 @@ class NotificationsTests(OfflineTestCase):
                                   [("android.title", "String (Game)"), ("android.text", forged)])
                         + ["  "]) + "\n"
         found, left_out = pc.parse_notification_dump(_on_the_phone(raw, [key]))
-        self.assertEqual((found, left_out), ([], 2))  # neither the made-up record nor the game's own
+        # neither the made-up record nor the game's own; the game's
+        # notification counted as left out (the made-up one is none)
+        self.assertEqual((found, left_out), ([], 1))
         self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout=_on_the_phone(raw, [key]),
                                                                  stderr=""))
         with self.cap() as (out, err):
@@ -4666,18 +4668,18 @@ class NotificationsTests(OfflineTestCase):
                                   [("android.title", "String (Game)"), ("android.text", forged)])
                         + ["  "]) + "\n"
         found, left_out = pc.parse_notification_dump(_on_the_phone(raw, ["0|com.game|1|null|10400"]))
-        self.assertEqual(([p for _w, p, *_ in found], left_out), (["com.game"], 1))
+        self.assertEqual(([p for _w, p, *_ in found], left_out), (["com.game"], 0))  # the made-up one is none
         # under a key the phone lists, twice: neither record stands
         both = ["0|com.game|1|null|10400", "0|com.chase.sig.android|1|null|10200"]
         raw2 = raw.replace("  \n", "\n".join(_record(both[1], "AUTO_CANCEL", "5/5", [
             ("android.title", "String (Chase)"), ("android.text", "String (Statement ready)")])) + "\n  \n")
         found, left_out = pc.parse_notification_dump(_on_the_phone(raw2, both))
-        self.assertEqual(([p for _w, p, *_ in found], left_out), (["com.game"], 2))
+        self.assertEqual(([p for _w, p, *_ in found], left_out), (["com.game"], 1))  # Chase's, not for sure
         self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout=_on_the_phone(raw2, both),
                                                                  stderr=""))
         with self.cap() as (out, err):
             pc.cmd_notifications(self.parse(["notifications"]))
-        self.assertIn("(2 more left out: their records didn't match the phone's own list of notifications)",
+        self.assertIn("(1 more left out: the phone shows it but its words couldn't be told for sure)",
                       out.getvalue())
         # no proto (an older Android): every record read, none vouched for
         found, left_out = pc.parse_notification_dump(_on_the_phone(raw2, proto=""))
@@ -4687,6 +4689,28 @@ class NotificationsTests(OfflineTestCase):
         with self.cap() as (out, err):
             pc.cmd_notifications(self.parse(["notifications"]))
         self.assertIn("- Chase: Statement ready\n", out.getvalue())  # no "(com.chase...)" on its word
+        self.assertIn("(no app names: this phone doesn't say for sure which app sent each)", out.getvalue())
+
+    def test_the_notifications_showing_are_all_accounted_for(self):
+        # review, Oct 7: a notification whose record didn't come was left
+        # out without a word; an app's words can hold line separators
+        title = "Hello" + chr(0x2028) + "World"
+        keys = ["0|com.a|1|null|1", "0|com.b|2|null|2", "0|com.c|3|null|3"]
+        raw = "\n".join(["Current Notification Manager state:", "  Notification List:"]
+                        + _record(keys[0], "AUTO_CANCEL", "2/2", [("android.title", "String (%s)" % title)])
+                        + ["  "]) + "\n"
+        found, left_out = pc.parse_notification_dump(
+            _on_the_phone(raw, keys, {keys[2]: pc._FLAG_BITS["GROUP_SUMMARY"]}))
+        self.assertEqual([(p, t) for _w, p, t, *_ in found], [("com.a", title)])  # its whole title
+        self.assertEqual(left_out, 1)  # com.b's; com.c's is a group's summary
+        # the key where AOSP prints it, not in the tag before it
+        tagged = raw.replace("tag=null", "tag=x key=%s: y" % keys[1])
+        found, left_out = pc.parse_notification_dump(_on_the_phone(tagged, [keys[1], keys[0]]))
+        self.assertEqual(([p for _w, p, *_ in found], left_out), (["com.a"], 1))
+        # a varint past ten bytes, a fixed field past the end: no proto
+        self.assertRaises(ValueError, pc._proto_fields, bytes([8] + [255] * 11 + [1]))
+        self.assertRaises(ValueError, pc._proto_fields, bytes([9, 1, 2]))
+        self.assertEqual(pc._proto_fields(bytes([8, 150, 1])), [(1, 0, 150)])
 
     def test_an_older_androids_dump_reads_too(self):
         # Android 9 and 10: no notification marks, no time, the words at 10

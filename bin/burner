@@ -5330,6 +5330,8 @@ def _proto_fields(data):
         while True:
             if i >= len(data):
                 raise ValueError("a varint runs past the end")
+            if shift > 63:
+                raise ValueError("a varint longer than ten bytes")
             c = data[i]
             i += 1
             n |= (c & 0x7F) << shift
@@ -5349,6 +5351,8 @@ def _proto_fields(data):
             value, i = data[i:i + size], i + size
         elif wire in (1, 5):
             size = 8 if wire == 1 else 4
+            if i + size > len(data):
+                raise ValueError("a field runs past the end")
             value, i = data[i:i + size], i + size
         else:
             raise ValueError("wire type {}".format(wire))
@@ -5414,8 +5418,10 @@ def parse_notification_dump(text):
     of their keys, once, and is that key's package with its flags: words
     print raw, and a text holding a record's lines, or a tag holding a
     key's, read as another app's notification (reviews of Oct 7);
-    left_out counts the records dropped so. Without the proto (an older
-    Android), the package is None: no app's name is vouched for. Pure."""
+    left_out counts the notifications showing (the proto's keys, group
+    summaries aside) that no record stands for so. Without the proto (an
+    older Android), the package is None: no app's name is vouched for.
+    Pure."""
     head, sep, dump = (text or "").partition("<<dump>>")
     if not sep:
         head, dump = "", head
@@ -5423,7 +5429,9 @@ def parse_notification_dump(text):
         return None, 0
     posted = posted_notifications(head)
     recs, rec, in_list = [], None, False
-    for line in dump.splitlines():
+    # at newlines only: an app's words can hold the separators that
+    # splitlines() also splits at (review, Oct 7)
+    for line in dump.split("\n"):
         line = line.rstrip("\r")
         if not in_list:
             in_list = line == "  Notification List:"
@@ -5457,15 +5465,16 @@ def parse_notification_dump(text):
     count = {}
     if posted is not None:
         for r in recs:
-            r["key"] = next((k for k in posted if " key=" + k + ": " in r["head"]), None)
+            # where AOSP prints it, after the tag (the app's own words)
+            r["key"] = next((k for k in posted if " key=" + k + ": Notification(" in r["head"]), None)
             count[r["key"]] = count.get(r["key"], 0) + 1
-    found, left_out = [], 0
+    found, stood = [], set()
     for r in recs:
         if posted is not None and (r["key"] is None or count[r["key"]] > 1):
-            left_out += 1
-            continue
+            continue  # no notification, or none for sure: counted below by its key
         if posted is not None:
             pkg, bits = posted[r["key"]]
+            stood.add(r["key"])
         else:
             pkg, bits = None, _flag_bits(r["flags"])
         words = r["text"] or r["bigText"]
@@ -5473,6 +5482,8 @@ def parse_notification_dump(text):
             continue
         found.append((r["when"], pkg, r["title"], words, bool(bits & _ONGOING_BITS)))
     found.sort(key=lambda r: -r[0])
+    left_out = 0 if posted is None else sum(
+        1 for k, (_pkg, bits) in posted.items() if k not in stood and not bits & _FLAG_BITS["GROUP_SUMMARY"])
     return found, left_out
 
 
@@ -5509,8 +5520,10 @@ def cmd_notifications(args):
         notes = ", ".join(n for n in (pkg, "ongoing" if ongoing else "") if n)
         print("- {}{}".format(words, " ({})".format(notes) if notes else ""))
     if left_out:
-        print("({} more left out: {} record{} didn't match the phone's own list of notifications)".format(
-            left_out, "its" if left_out == 1 else "their", "" if left_out == 1 else "s"))
+        print("({} more left out: the phone shows {} but {} words couldn't be told for sure)".format(
+            left_out, "it" if left_out == 1 else "them", "its" if left_out == 1 else "their"))
+    if found and all(pkg is None for _w, pkg, *_ in found):
+        print("(no app names: this phone doesn't say for sure which app sent each)")
     return 0
 
 
