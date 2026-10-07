@@ -846,7 +846,7 @@ FIND_JS = r"""
   if (fill && !notField) {
     // the field to fill: kept for FILL_JS, never touched (a touch opens a
     // picker or moves a slider; a text field is focused there)
-    if (!inView(r)) el.scrollIntoView({block: 'center', inline: 'nearest'});
+    if (!inView(r)) el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
     window.__burnerTarget = el;
     return {found: true, count: 1, used: used, label: (names(el)[0] || '').slice(0, 60),
             tag: el.tagName.toLowerCase(), type: (el.type || '').toLowerCase(), url: location.href};
@@ -854,14 +854,14 @@ FIND_JS = r"""
   if (!query && el.tagName === 'INPUT' && /^(date|time|month|week|datetime-local|color|range)$/.test(el.type)) {
     // focused, not touched (a touch opens Chrome's native picker, which a
     // page read can't see; a touch on a slider moves it): `type` sets its value
-    if (!inView(r)) el.scrollIntoView({block: 'center', inline: 'nearest'});
+    if (!inView(r)) el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
     el.focus();
     return {found: true, count: 1, used: used, label: (names(el)[0] || '').slice(0, 60), focused: true, url: location.href};
   }
   if (!query && el.tagName === 'SELECT') {
     // focused, not touched (a touch opens Chrome's native popup, which a
     // page read can't see): its options print as rows on the next read
-    if (!inView(r)) el.scrollIntoView({block: 'center', inline: 'nearest'});
+    if (!inView(r)) el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
     el.focus();
     return {found: true, count: 1, used: used, label: (names(el)[0] || '').slice(0, 60), focused: true, url: location.href};
   }
@@ -872,7 +872,7 @@ FIND_JS = r"""
             vs: vq ? vq.scale : 1, vx: vq ? vq.offsetLeft : 0, vy: vq ? vq.offsetTop : 0,
             enabled: !(el.disabled || el.getAttribute('aria-disabled') === 'true')};
   }
-  if (!inView(r) || r.top < 0 || r.bottom > vh) { el.scrollIntoView({block: 'center', inline: 'nearest'}); r = box(el); moved = true; }
+  if (!inView(r) || r.top < 0 || r.bottom > vh) { el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'}); r = box(el); moved = true; }
   window.__burnerTarget = el;
   // a text field with the focus keeps the keyboard up, which pushes the
   // visual viewport: leave it first (as a person tapping elsewhere does),
@@ -950,7 +950,7 @@ PLACE_JS = r"""
   const vv = window.visualViewport, vh = vv ? vv.height : innerHeight;
   let r = el.getBoundingClientRect();
   const top = r.top - (vv ? vv.offsetTop : 0), bottom = r.bottom - (vv ? vv.offsetTop : 0);
-  if (top < 0 || bottom > vh) { el.scrollIntoView({block: 'center', inline: 'nearest'}); r = el.getBoundingClientRect(); }
+  if (top < 0 || bottom > vh) { el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'}); r = el.getBoundingClientRect(); }
   const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
   const over = document.elementFromPoint(cx, cy);
   const ACTIVE = 'a[href],button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=switch],[role=option],[onclick]';
@@ -1677,7 +1677,12 @@ def touch_hit(page, hit, then=()):
                         ("Input.dispatchKeyEvent", {"type": "keyUp", "key": "Escape", "code": "Escape",
                                                     "windowsVirtualKeyCode": 27})], timeout=5.0)
     if hit.get("moved") or hit.get("blurred") or hit.get("covered"):
-        time.sleep(0.35)  # the scroll into view, the keyboard going, a popup closing
+        # the place taken afresh: the page's scroll into view is instant
+        # (its reflow is in by the time this trip reaches it); the keyboard
+        # going and a popup closing take a moment more (a link below the
+        # fold paid 0.35s for nothing, Oct 7)
+        if hit.get("blurred") or hit.get("covered"):
+            time.sleep(0.35)
         place = page.eval(_js(PLACE_JS)) or {}
         if place.get("x") is not None:
             hit["x"], hit["y"] = place["x"], place["y"]
