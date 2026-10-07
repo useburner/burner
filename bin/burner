@@ -2774,6 +2774,12 @@ def cmd_tap(args):
         if args.quiet:
             spec["quiet"] = True
         status, root, note = act_and_read(spec)
+        if status == "unsent" and " rows on the page read " in _u2_status:
+            # the page's own count, its rows out of view included: the
+            # screen reader's rows, looked at next, may hold none of them
+            # (bbc.com, Oct 7: "no match", then a scroll to find them)
+            return _tap_fail(args, "ambiguous tap: {}; use --index N (0 is the first on the page) or a longer "
+                                   "label".format(_u2_status.split("act not sent: ", 1)[-1]), evidence=False)
         if status != "unsent":
             snap_invalidate()
             try:

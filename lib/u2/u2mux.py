@@ -2855,7 +2855,10 @@ class U2Daemon:
                         native["quiet"] = True
                     return self._act_batch(native)
                 if r.get("count", 1) != 1:
-                    raise RuntimeError("act not sent: %d rows read %r%s" % (
+                    # the page's own count, its rows out of view too: said
+                    # as it is (the CLI's look at the screen reader's rows
+                    # found none below the fold and said "no match", Oct 7)
+                    raise RuntimeError("act not sent: %d rows on the page read %r%s" % (
                         r["count"], label, " (%s)" % ", ".join(r["tags"]) if r.get("tags") else ""))
                 xml = self._new_tab_read(r) if r.get("new_tab") else self._after_page(r["screen"])
                 self._remember(xml)

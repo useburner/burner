@@ -5768,7 +5768,7 @@ class WebPathTests(OfflineTestCase):
         self.assertEqual(str(cm.exception), "act not sent: not on the page")
         with self.assertRaises(RuntimeError) as cm:
             dm.cmd_act(json.dumps({"tap_label": "Twice"}))
-        self.assertEqual(str(cm.exception), "act not sent: 2 rows read 'Twice'")
+        self.assertEqual(str(cm.exception), "act not sent: 2 rows on the page read 'Twice'")
         xml = dm.cmd_act(json.dumps({"scroll": "down", "times": 2, "idle": 500})).decode()
         self.assertEqual(calls[-1], ("scroll", "down", 2, 500))
         self.assertIn("WebView", xml)
@@ -10001,6 +10001,26 @@ class CoordinateTapTests(OfflineTestCase):
         self.assertIn("--index", err.getvalue())
         self.assertEqual([c[0] for c in calls], ["act", "dump"])
         shot.assert_not_called()
+
+    def test_a_page_s_own_count_of_rows_is_said_with_no_look_at_the_screen_reader(self):
+        # bbc.com, Oct 7: the page had the headline twice, both out of view;
+        # the CLI's look at the screen reader's rows found none and said
+        # "no match", and the agent scrolled to find them
+        self.allow("wake_async", return_value=mock.Mock())
+        self.allow("u2_invalidate")
+        self.allow("ui_dump", side_effect=AssertionError("the page's count is the answer: no read"))
+        self.allow("_capture_evidence", side_effect=AssertionError("the count is the evidence"))
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append(cmd)
+            pc._u2_status = "err act not sent: 2 rows on the page read 'Edit' (a, a)"
+            return None
+        self.allow("u2sock", side_effect=u2)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_tap(self.parse(["tap", "Edit"]))
+        self.assertEqual((rc, calls), (1, ["act"]))
+        self.assertIn("ambiguous tap: 2 rows on the page read 'Edit' (a, a); use --index N", err.getvalue())
 
     def test_a_tap_by_xy_plans_from_the_helper_s_newest_read(self):
         self.allow("wake_async", return_value=mock.Mock())
