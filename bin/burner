@@ -3928,6 +3928,8 @@ def cmd_press(args):
                 pass
             if status == "ok":
                 print("pressed {}".format(args.key))
+                if code == 3:
+                    root, note = home_landed(root, note)
             return print_act(status, root, note, "key press")
 
     def send_one(key):
@@ -3964,6 +3966,17 @@ def cmd_press(args):
     except Exception:
         pass
     print("pressed {}".format(label))
+    if code == 3 and not mods:
+        # see home_landed: the screen once the home screen is surely in front
+        if quiet:
+            settle_only(idle_ms=IDLE_HOME_MS)
+            home_landed(None, "", quiet=True)
+            return 0
+        root, note = read_after_root(idle_ms=IDLE_HOME_MS)
+        root, note = home_landed(root, note)
+        if root is not None:
+            print_screen(root, note=note)
+        return 0
     read_after(quiet=quiet)
     return 0
 
@@ -4122,6 +4135,108 @@ def launch_and_check(pkg, home_first=False, fresh=False):
 def parse_front(text):
     m = re.search(r"mFocusedApp=.*?\s+u0\s+([\w.]+)/", text)
     return m.group(1) if m else None
+
+
+# The Home key is a request: Android can leave the app in front (a Pixel
+# 9 Pro XL's `press HOME`, twice, printed Settings > Developer options,
+# the app before it, Oct 9; `start` on the launcher went home), and the
+# read after it waits only IDLE_HOME_MS, so it can also show the app
+# still leaving. After the key, the app in front is checked against the
+# phone's home app, and the home app is started when it isn't in front
+# (`am start` with the HOME intent, its component named: never Settings'
+# FallbackHome, the stand-in Android uses while the launcher can't run,
+# nor the chooser).
+HOME_FILE = os.path.join(ROOT, "run", "home-package")  # the home app, from the last check
+
+HOME_SCRIPT = (
+    "h=$(cmd package resolve-activity --brief -a android.intent.action.MAIN "
+    "-c android.intent.category.HOME 2>/dev/null | tail -n 1 | tr -d ' \\r'); "
+    "case \"$h\" in android/*|com.android.settings/*|*/*/*) h=;; */*) ;; *) h=;; esac; "
+    "[ -z \"$h\" ] && h=$(cmd package query-activities --brief -a android.intent.action.MAIN "
+    "-c android.intent.category.HOME 2>/dev/null | tr -d ' \\r' | grep / "
+    "| grep -v -e '^android/' -e '^com.android.settings/' | head -n 1); "
+    "echo @@home; echo \"$h\"; p=${{h%%/*}}; "
+    "f=$({front}); echo @@was; echo \"$f\"; "
+    "if [ -n \"$h\" ]; then case \"$f\" in *\" $p/\"*) ;; *) "
+    "am start -a android.intent.action.MAIN -c android.intent.category.HOME -n \"$h\" "
+    ">/dev/null 2>&1 && echo @@started; "
+    "for i in 1 2 3 4 5 6 7 8 9 10; do sleep 0.3; f=$({front}); "
+    "case \"$f\" in *\" $p/\"*) break;; esac; done;; esac; fi; "
+    "echo @@front; echo \"$f\"").format(front=FRONT_LINES)
+
+
+def parse_home_check(text):
+    """HOME_SCRIPT's output: {"home": the home app's package or None,
+    "was": the app in front after the key, "started": whether the home
+    app was started, "front": the app in front at the end}. Pure."""
+    parts = split_marked(text or "")
+    comp = (parts.get("home") or "").strip()
+    return {"home": comp.split("/", 1)[0] if "/" in comp else None,
+            "was": parse_front(parts.get("was", "")),
+            "started": "started" in parts,
+            "front": parse_front(parts.get("front", ""))}
+
+
+def _known_home():
+    try:
+        with open(HOME_FILE) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def check_home(read_pkg):
+    """After the Home key: None when the read shows the home app known
+    from an earlier check (no call to the phone); else HOME_SCRIPT's
+    verdict (see parse_home_check), one adb call, which starts the home
+    app when another app is still in front."""
+    known = _known_home()
+    if read_pkg and known and read_pkg == known:
+        return None
+    r = adb_or_ensure("shell", HOME_SCRIPT, timeout=20)
+    res = parse_home_check(r.stdout)
+    if res["home"] and res["home"] != known:
+        try:
+            os.makedirs(os.path.dirname(HOME_FILE), exist_ok=True)
+            with open(HOME_FILE, "w") as f:
+                f.write(res["home"] + "\n")
+        except OSError:
+            pass
+    return res
+
+
+def home_landed(root, note, quiet=False):
+    """The Home key was sent and `root` read after it (None: not read).
+    Makes sure the home screen is in front (see check_home) and returns
+    the read to print with its note: read again when the home app had
+    to be started or the read showed another app. Never raises."""
+    read_pkg = dump_package(root) if root is not None else None
+    try:
+        res = check_home(read_pkg)
+    except Exception as e:
+        print("burner: couldn't check that the Home key reached the home screen ({})"
+              .format(" ".join(str(e).split())[:80]), file=sys.stderr)
+        return root, note
+    if res is None:
+        return root, note
+    home = res["home"]
+    if not home:
+        print("burner: the phone names no home app, so where the Home key went wasn't checked",
+              file=sys.stderr)
+        return root, note
+    if res["started"]:
+        print("the Home key left {} in front; opened the home screen ({}) instead"
+              .format(res["was"] or "another app", home))
+        u2_invalidate()
+    if res["front"] and res["front"] != home:
+        print("burner: {} is still in front after the Home key and a start of {}; "
+              "`burner start {}` opens the home screen".format(res["front"], home, home),
+              file=sys.stderr)
+    if quiet or (not res["started"] and read_pkg == home):
+        return root, note
+    # the home app started, or the read was of the app still leaving
+    again, again_note = read_after_root(idle_ms=IDLE_HOME_MS)
+    return (again, again_note) if again is not None else (root, note)
 
 
 def cmd_start(args):

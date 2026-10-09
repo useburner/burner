@@ -1,4 +1,4 @@
-> Install: curl -fsSL https://useburner.si/install.sh | bash (full guide below). Skill rev 205758cf: if `burner version` shows a different rev, run `burner update`.
+> Install: curl -fsSL https://useburner.si/install.sh | bash (full guide below). Skill rev 23dd2621: if `burner version` shows a different rev, run `burner update`.
 
 # burner
 
@@ -177,7 +177,8 @@ phone), use `burner dump --fresh` to read it as it is now.
 
 ## Rearranging the home screen
 
-`burner press HOME` shows the first page. `burner drag "Chrome" 0.5,0.3`
+`burner press HOME` shows the first page; if the key left an app in front,
+it opens the home screen itself and says so. `burner drag "Chrome" 0.5,0.3`
 long-presses the Chrome icon, carries it and lets go at that spot (0 to 1
 across and down); the icons there make room. Dropped on another app
 (`burner drag "Chrome" "Maps"`) it makes a folder, or joins one. `left` or

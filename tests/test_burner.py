@@ -11264,6 +11264,7 @@ class AirbnbRoundTests(OfflineTestCase):
     def test_the_home_key_waits_less_for_the_launcher(self):
         self.allow("u2_invalidate")
         self.allow("nav_record")
+        self.allow("check_home", return_value=None)  # the read shows the home app (see HomeKeyTests)
         calls = []
         self.allow("u2sock", side_effect=lambda cmd, arg="", timeout=30: calls.append((cmd, json.loads(arg))) or SAMPLE_XML)
         with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
@@ -11646,3 +11647,159 @@ class AirbnbRoundTests(OfflineTestCase):
         self.assertEqual(pc.plan_tap(pc.walk(ET.fromstring(two)), 1080, 2400, text="Alarms")["action"], "ambiguous")
         with self.assertRaises(RuntimeError):
             mod.label_node(two, "Alarms")
+
+
+# ------------------------------------------------- the Home key, checked
+
+HOME_PKG = "com.google.android.apps.nexuslauncher"
+LAUNCHER_XML = SAMPLE_XML.replace("com.example", HOME_PKG)
+LEFT_XML = SAMPLE_XML.replace("com.example", "com.android.settings")
+
+
+def home_out(was, front, started=False):
+    """HOME_SCRIPT's output on the phone."""
+    rec = "  mFocusedApp=ActivityRecord{{1a2b u0 {}/.Main t7}}"
+    return ("@@home\n{}/.NexusLauncherActivity\n@@was\n{}\n{}@@front\n{}\n".format(
+        HOME_PKG, rec.format(was), "@@started\n" if started else "", rec.format(front)))
+
+
+class HomeKeyTests(OfflineTestCase):
+    """A Pixel 9 Pro XL's `press HOME`, twice, printed Settings > Developer
+    options, the app before it (Oct 9): the key is checked, and the home
+    app started when another app is still in front."""
+
+    def setUp(self):
+        super().setUp()
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        self.allow("HOME_FILE", new=os.path.join(d, "run", "home-package"))
+        self.allow("u2_invalidate")
+        self.allow("nav_record")
+        self.acts = []
+        self.screens = []
+
+        def u2(cmd, arg="", timeout=30):
+            self.acts.append(json.loads(arg) if arg else {})
+            return self.screens.pop(0)
+        self.allow("u2sock", side_effect=u2)
+
+    def adb_says(self, out):
+        return self.allow("adb_or_ensure", return_value=SimpleNamespace(returncode=0, stdout=out, stderr=""))
+
+    def test_the_script_names_the_home_app_and_never_the_stand_ins(self):
+        s = pc.HOME_SCRIPT
+        self.assertIn("resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME", s)
+        self.assertIn('am start -a android.intent.action.MAIN -c android.intent.category.HOME -n "$h"', s)
+        # Settings' FallbackHome and the chooser are never started
+        self.assertIn("android/*|com.android.settings/*", s)
+        self.assertIn("grep -v -e '^android/' -e '^com.android.settings/'", s)
+        self.assertNotIn("keyevent", s)
+
+    def test_parse_home_check(self):
+        self.assertEqual(pc.parse_home_check(home_out("com.android.settings", HOME_PKG, started=True)),
+                         {"home": HOME_PKG, "was": "com.android.settings", "started": True, "front": HOME_PKG})
+        self.assertEqual(pc.parse_home_check(home_out(HOME_PKG, HOME_PKG)),
+                         {"home": HOME_PKG, "was": HOME_PKG, "started": False, "front": HOME_PKG})
+        self.assertEqual(pc.parse_home_check("@@home\n\n@@was\n\n@@front\n\n")["home"], None)
+        self.assertEqual(pc.parse_home_check("")["home"], None)
+
+    def test_the_key_left_settings_in_front_so_the_home_app_is_started(self):
+        adb = self.adb_says(home_out("com.android.settings", HOME_PKG, started=True))
+        self.screens[:] = [LEFT_XML, LAUNCHER_XML]
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            rc = pc.cmd_press(self.parse(["press", "HOME"]))
+        self.assertEqual(rc, 0, err.getvalue())
+        adb.assert_called_once_with("shell", pc.HOME_SCRIPT, timeout=20)
+        self.assertEqual(self.acts[0], {"key": 3, "idle": pc.IDLE_HOME_MS})
+        self.assertEqual(len(self.acts), 2)  # the key's read, then the home screen's
+        text = out.getvalue()
+        self.assertIn("the Home key left com.android.settings in front; opened the home screen ({})".format(HOME_PKG),
+                      text)
+        self.assertIn("screen: " + HOME_PKG, text)
+        self.assertNotIn("com.android.settings\n", text.split("opened the home screen")[1])
+        with open(pc.HOME_FILE) as f:
+            self.assertEqual(f.read().strip(), HOME_PKG)
+
+    def test_the_launcher_in_front_on_the_read_costs_no_call_once_known(self):
+        self.adb_says(home_out(HOME_PKG, HOME_PKG))
+        self.screens[:] = [LAUNCHER_XML]
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertEqual(pc.cmd_press(self.parse(["press", "HOME"])), 0)
+        # the first time the home app is learned; then a read of it is enough
+        adb = self.allow("adb_or_ensure")
+        self.screens[:] = [LAUNCHER_XML]
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertEqual(pc.cmd_press(self.parse(["press", "HOME"])), 0)
+        adb.assert_not_called()
+        self.assertNotIn("Home key left", out.getvalue())
+        self.assertIn("screen: " + HOME_PKG, out.getvalue())
+
+    def test_a_read_of_the_app_still_leaving_is_read_again(self):
+        # the phone says the launcher is in front: nothing started, the
+        # read (Settings still drawn) taken again
+        self.adb_says(home_out(HOME_PKG, HOME_PKG))
+        self.screens[:] = [LEFT_XML, LAUNCHER_XML]
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertEqual(pc.cmd_press(self.parse(["press", "HOME"])), 0)
+        self.assertEqual(len(self.acts), 2)
+        self.assertNotIn("Home key left", out.getvalue())
+        self.assertIn("screen: " + HOME_PKG, out.getvalue())
+        self.assertNotIn("screen: com.android.settings", out.getvalue())
+
+    def test_still_not_home_says_so(self):
+        self.adb_says(home_out("com.android.settings", "com.android.settings", started=True))
+        self.screens[:] = [LEFT_XML, LEFT_XML]
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertEqual(pc.cmd_press(self.parse(["press", "HOME"])), 0)
+        self.assertIn("com.android.settings is still in front after the Home key", err.getvalue())
+        self.assertIn("`burner start {}`".format(HOME_PKG), err.getvalue())
+
+    def test_a_check_that_fails_keeps_the_read(self):
+        self.allow("adb_or_ensure", side_effect=RuntimeError("adb: device offline"))
+        self.screens[:] = [LEFT_XML]
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertEqual(pc.cmd_press(self.parse(["press", "HOME"])), 0)
+        self.assertIn("couldn't check that the Home key reached the home screen (adb: device offline)",
+                      err.getvalue())
+        self.assertIn("screen: com.android.settings", out.getvalue())
+        # no home app named: said, nothing started
+        self.adb_says("@@home\n\n@@was\n\n@@front\n\n")
+        self.screens[:] = [LEFT_XML]
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertEqual(pc.cmd_press(self.parse(["press", "HOME"])), 0)
+        self.assertIn("the phone names no home app", err.getvalue())
+
+    def test_other_keys_are_not_checked(self):
+        adb = self.allow("adb_or_ensure")
+        self.screens[:] = [LEFT_XML]
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertEqual(pc.cmd_press(self.parse(["press", "BACK"])), 0)
+        adb.assert_not_called()
+
+    def test_the_two_step_way_and_a_quiet_press_are_checked_too(self):
+        # an older helper: the key by scrcpy, then the read
+        sc = self.allow("scrcpy_send", return_value=True)
+        adb = self.adb_says(home_out("com.android.settings", HOME_PKG, started=True))
+        calls = []
+
+        def u2(cmd, arg="", timeout=30):
+            calls.append((cmd, arg))
+            if cmd == "act" and json.loads(arg).get("key"):
+                pc._u2_status = "err unknown command: act"
+                return None
+            return LAUNCHER_XML
+        self.allow("u2sock", side_effect=u2)
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertEqual(pc.cmd_press(self.parse(["press", "HOME"])), 0, err.getvalue())
+        sc.assert_called_once_with("key HOME")
+        adb.assert_called_once()
+        self.assertIn("opened the home screen", out.getvalue())
+        self.assertIn("screen: " + HOME_PKG, out.getvalue())
+        # quiet: checked, nothing read or printed but the lines
+        adb.reset_mock()
+        calls.clear()
+        self.allow("u2sock", return_value="ok")
+        with mock.patch.object(pc.time, "sleep"), self.cap() as (out, err):
+            self.assertEqual(pc.cmd_press(self.parse(["press", "HOME", "--quiet"])), 0)
+        adb.assert_called_once()
+        self.assertNotIn("screen:", out.getvalue())

@@ -146,7 +146,7 @@ Act (each prints the screen it ends on)
   burner tap --xy 0.5,0.8           tap a spot (0 to 1 across and down)
   burner drag "Chrome" 0.5,0.3      long-press, carry, drop (label, @e3 or X,Y; left/right between turn a page; --hold, --dwell ms)
   burner type "text"                type into the focused field (--field "Hint", --clear, --enter)
-  burner press BACK|HOME|ENTER      press a key (--repeat N; MEDIA_PAUSE, MEDIA_PLAY for a video or music)
+  burner press BACK|HOME|ENTER      press a key (--repeat N; MEDIA_PAUSE, MEDIA_PLAY for a video or music; HOME checks it reached the home screen)
   burner scroll [down|up|left|right|top|bottom]   scroll the open app (--times N, --to "Text")
   burner wait "Text"                wait for text (--timeout 30, "A || B" for either, --absent to wait for it to go, --exact for the whole label only;
                                     above 30s it comes back every 30s with what the screen shows: tell the user, run it again)
