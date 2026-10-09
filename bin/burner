@@ -931,6 +931,7 @@ def _helper_said():
 def fast_dump(fresh=False):
     """UI hierarchy XML via uiautomator2 mux. None on failure. fresh skips
     the helper's 2-second cache (for re-reads that must see a change)."""
+    global _helper_waited
     t0 = time.time()
     xml = u2sock("dump", "fresh" if fresh else "", timeout=40)
     if xml is None:
@@ -943,13 +944,18 @@ def fast_dump(fresh=False):
         # it: while the UI helper's server runs on the phone, adb's own
         # `uiautomator dump` comes back empty, so the slow path can't read
         # the screen either (the first command after `burner update`).
+        # Once per process, like connect_helper's wait: a helper that never
+        # came up was waited for 15s on every read, and `setup --step
+        # self-pair` spent minutes in those waits (Pixel 9 Pro XL, Oct 9).
         u2_start_background()
-        t1 = time.time()
-        while time.time() - t1 < 15 and not os.path.exists(U2_SOCK):
-            time.sleep(0.5)
-        if os.path.exists(U2_SOCK):
-            xml = u2sock("dump", "fresh" if fresh else "", timeout=40)
-        _trace("u2 helper start wait {:.2f}s".format(time.time() - t1))
+        if not _helper_waited:
+            _helper_waited = True
+            t1 = time.time()
+            while time.time() - t1 < 15 and not os.path.exists(U2_SOCK):
+                time.sleep(0.5)
+            if os.path.exists(U2_SOCK):
+                xml = u2sock("dump", "fresh" if fresh else "", timeout=40)
+            _trace("u2 helper start wait {:.2f}s".format(time.time() - t1))
     if xml and ("<hierarchy" in xml or "<?xml" in xml):
         try:
             root = ET.fromstring(xml)
@@ -7635,23 +7641,6 @@ def _setup_app_status():
     return _setup_app_api("/api/status", timeout=15)
 
 
-def _setup_tap_label(label, scrolls=12):
-    """Tap the node labelled exactly `label`, scrolling down to find it.
-    Each look is a fresh read: the screen has just changed under it."""
-    for _ in range(scrolls):
-        nodes = walk(ui_dump(fresh=True))
-        hits = find_nodes(nodes, label)
-        if hits:
-            x, y = clickable_target(hits[0])
-            tap_center(x, y)
-            time.sleep(1.5)
-            return True
-        w, h = screen_dims()
-        adb("shell", "input", "swipe", w // 2, h * 3 // 4, w // 2, h // 4, 300)
-        time.sleep(0.8)
-    return False
-
-
 # Settings' Wireless debugging screen and its pairing dialog (AOSP
 # WirelessDebuggingFragment, AdbWirelessDialog, adb_wireless_dialog.xml).
 # The dialog opens empty: the code and the "IP address & Port" line come
@@ -7663,10 +7652,20 @@ def _setup_tap_label(label, scrolls=12):
 SETUP_PAIR_LABEL = "Pair device with pairing code"
 SETUP_PAIR_TITLE = "Pair with device"
 SETUP_PAIR_IDS = ("pairing_code", "ip_addr", "l_pairing_six_digit")
-SETUP_PAIR_READ_S = 12.0   # how long the code and the port are waited for
+SETUP_PAIR_READ_S = 10.0   # how long the code and the port are waited for
+SETUP_PAIR_OPEN_S = 20.0   # how long getting the dialog open may take, all in
+SETUP_TILE_GRACE_S = 3.0   # Developer options shows first; the tile's page follows
 SETUP_WIRELESS_TILE = ("com.android.settings/.development.qstile."
                        "DevelopmentTiles$WirelessDebugging")
 SETUP_DEV_ACTIVITY = "com.android.settings/.Settings$DevelopmentSettingsActivity"
+# Rows only the Wireless debugging page has (AOSP wireless_debugging_settings
+# .xml): its main switch, and the rows that show while it is on.
+SETUP_WD_PAGE_WORDS = ("use wireless debugging", "device name",
+                       "pair device with qr code", "paired devices")
+# The page's footer while Wireless debugging is off (the rows above hide).
+SETUP_WD_OFF_WORDS = "turn on wireless debugging"
+SETUP_DEV_WORDS = ("use developer options", "usb debugging", "developer options",
+                   "bug report shortcut", "oem unlocking", "running services")
 
 
 def _setup_six_digits(text):
@@ -7804,53 +7803,176 @@ def _setup_screen_words(nodes, n=14):
 
 
 def _setup_read_nodes():
+    """A fresh read of the screen, [] when it fails. One try on the slow
+    adb way: the steps here have their own time limits and look again."""
     try:
-        return walk(ui_dump(fresh=True))
+        return walk(ui_dump(retries=1, fresh=True))
     except Exception:
         return []
 
 
-def _setup_on_wireless_page(nodes):
-    hits = find_nodes(nodes, SETUP_PAIR_LABEL)
-    return bool(hits) or bool(find_nodes(nodes, "pair device with pairing",
-                                         exact=False))
+def classify_pair_screen(nodes, exclude=()):
+    """Where the screen is on the way to the pairing dialog. Pure.
+    Returns (state, node): "dialog" (the pairing dialog is open), "pair-row"
+    (the Wireless debugging page with its "Pair device with pairing code"
+    row, the node), "wd-off" (that page with Wireless debugging off: the
+    pairing rows are hidden), "wd-page" (that page, the row off screen),
+    "dev-row" (Developer options with its "Wireless debugging" row, the
+    title's node: never the switch beside it, which turns it off),
+    "dev" (Developer options, the row off screen), "other" or "empty"."""
+    if not nodes:
+        return "empty", None
+    if parse_pair_dialog(nodes, exclude)[2]:
+        return "dialog", None
+    words = []
+    for n in nodes:
+        w = plain_words(n.get("text") or n.get("desc") or "").lower()
+        if w:
+            words.append((w, n))
+    for w, n in words:
+        if w == SETUP_PAIR_LABEL.lower() or w.startswith("pair device with pairing"):
+            return "pair-row", n
+    if any(SETUP_WD_OFF_WORDS in w for w, _ in words):
+        return "wd-off", None
+    if any(w in SETUP_WD_PAGE_WORDS for w, _ in words):
+        return "wd-page", None
+    for w, n in words:
+        if w == "wireless debugging" and "switch" not in (n.get("class") or "").lower():
+            return "dev-row", n
+    if any(w in SETUP_DEV_WORDS for w, _ in words):
+        return "dev", None
+    return "other", None
+
+
+def _setup_rows_sig(nodes):
+    """What a read shows, to tell whether a swipe moved the list. Pure."""
+    return tuple(plain_words(n.get("text") or n.get("desc") or "") for n in nodes
+                 if n.get("text") or n.get("desc"))
+
+
+def _setup_start_wireless_page(action_only=False):
+    """Open the Wireless debugging page: the tile's long-press intent
+    (Android 14+; DevelopmentSettingsDashboardFragment pushes the page
+    on QS_TILE_PREFERENCES with the tile's component), in a fresh Settings
+    task so an old one (Developer options scrolled away, a page left
+    open) isn't brought back instead. Older Androids show Developer
+    options. action_only: just Developer options, by its action."""
+    if action_only:
+        argv = ["-a", "android.settings.APPLICATION_DEVELOPMENT_SETTINGS"]
+    else:
+        argv = ["-a", "android.service.quicksettings.action.QS_TILE_PREFERENCES",
+                "--ecn", "android.intent.extra.COMPONENT_NAME",
+                "'{}'".format(SETUP_WIRELESS_TILE),
+                "-n", "'{}'".format(SETUP_DEV_ACTIVITY)]
+    try:
+        adb("shell", "am", "start", "-W", "--activity-clear-task", *argv,
+            timeout=10)
+    except Exception as e:  # a slow -W: the reads below see where it landed
+        _trace("am start: {}".format(type(e).__name__))
+
+
+def _setup_swipe(down=True):
+    """One slow swipe of about a third of the screen: a fast long one flings
+    the list on, past the row it looks for."""
+    w, h = screen_dims()
+    y1, y2 = (h * 70 // 100, h * 35 // 100) if down else (h * 35 // 100, h * 70 // 100)
+    try:
+        adb("shell", "input", "swipe", w // 2, y1, w // 2, y2, 900, timeout=10)
+    except Exception:
+        pass
+
+
+def _setup_top_fragment():
+    """Which Settings page is on top, from the activity manager rather than
+    the screen read (for the error message). "" when it can't tell."""
+    out = _setup_sh("dumpsys activity top | grep -oE "
+                    "'WirelessDebuggingFragment|DevelopmentSettingsDashboardFragment'",
+                    timeout=10) or ""
+    names = sorted(set(out.split()))
+    return ", ".join(names)
 
 
 def _setup_open_pair_dialog():
     """Open Settings > Developer options > Wireless debugging > Pair
-    device with pairing code. True once the tap on it was made."""
-    # Android 14+: the Wireless debugging tile's long-press intent opens
-    # its page straight away. Older ones (and a Settings that ignores it)
-    # land on Developer options, and the row is tapped from there.
-    adb("shell", "am", "start", "-a",
-        "android.service.quicksettings.action.QS_TILE_PREFERENCES",
-        "--ecn", "android.intent.extra.COMPONENT_NAME",
-        "'{}'".format(SETUP_WIRELESS_TILE),
-        "-n", "'{}'".format(SETUP_DEV_ACTIVITY), timeout=15)
-    on_page = False
-    for _ in range(4):
-        time.sleep(1.5)
-        if _setup_on_wireless_page(_setup_read_nodes()):
-            on_page = True
+    device with pairing code, within SETUP_PAIR_OPEN_S. True once the
+    dialog is open or the tap on its row was made; False with the reason
+    on stderr. Every look is a fresh read, classified (classify_pair_screen):
+    already open, on the page, on Developer options (the row is looked for
+    with slow swipes, down to the end and back up once)."""
+    t0 = time.time()
+    deadline = t0 + SETUP_PAIR_OPEN_S
+    _setup_start_wireless_page()
+    nodes, state = [], "empty"
+    down, prev_sig, swiped = True, None, False
+    dev_taps = turned_on = reopened = 0
+    while True:
+        now = _setup_read_nodes()
+        nodes = now or nodes
+        state, hit = classify_pair_screen(now)
+        _trace("self-pair screen: {} at {:.1f}s".format(state, time.time() - t0))
+        if state == "dialog":
+            return True
+        if state == "pair-row" and (hit.get("center") or (None,))[0] is not None:
+            tap_center(*hit["center"])
+            time.sleep(1)
+            return True
+        if time.time() >= deadline:
             break
-    if not on_page:
-        adb("shell", "am", "start", "-a",
-            "android.settings.APPLICATION_DEVELOPMENT_SETTINGS", timeout=15)
-        time.sleep(2)
-        if not _setup_tap_label("Wireless debugging"):
-            print("could not find 'Wireless debugging' in Developer options "
-                  "on the phone.", file=sys.stderr)
-            return False
-    if _setup_tap_label(SETUP_PAIR_LABEL):
-        return True
-    hits = find_nodes(_setup_read_nodes(), "pair device with pairing",
-                      exact=False)
-    if hits:
-        tap_center(*clickable_target(hits[0]))
-        time.sleep(1.5)
-        return True
-    print("could not find '{}' on the Wireless debugging screen. Is "
-          "Wireless debugging on?".format(SETUP_PAIR_LABEL), file=sys.stderr)
+        sig = _setup_rows_sig(now)
+        if state == "wd-off":
+            if not turned_on:
+                # the pairing rows show once it is on; burner pairs over it
+                print("Wireless debugging is off on the phone; turning it on.",
+                      file=sys.stderr)
+                _setup_sh("settings", "put", "global", "adb_wifi_enabled", "1")
+                turned_on = 1
+            time.sleep(1)
+        elif state == "dev-row":
+            if dev_taps < 2 and (hit.get("center") or (None,))[0] is not None:
+                tap_center(*hit["center"])
+                dev_taps += 1
+                swiped = False
+            time.sleep(1)
+        elif state in ("dev", "wd-page"):
+            if state == "dev" and not swiped and time.time() - t0 < SETUP_TILE_GRACE_S:
+                time.sleep(0.5)  # the tile's page may still be on its way
+                continue
+            if swiped and sig == prev_sig:
+                if not down:
+                    break  # the end both ways: the row isn't there
+                down = False  # the end of the list: back up
+            prev_sig, swiped = sig, True
+            _setup_swipe(down)
+            time.sleep(0.6)
+        elif state == "other" and time.time() - t0 > SETUP_TILE_GRACE_S * 2 and not reopened:
+            # not Settings' pages at all: Developer options by its action
+            _setup_start_wireless_page(action_only=True)
+            reopened = 1
+        else:
+            time.sleep(0.5)
+    took = time.time() - t0
+    top = _setup_top_fragment()
+    words = _setup_screen_words(nodes)
+    if state == "empty":
+        why = ("the phone's screen could not be read ({}){}".format(
+            "UI helper: " + _u2_status[:80] if _u2_status != "ok" else "empty reads",
+            "; Settings shows " + top if top else ""))
+    elif state == "wd-off":
+        why = "Wireless debugging stayed off on its page"
+    elif state in ("dev", "dev-row", "wd-page") and swiped and not down:
+        why = ("no '{}' row in Developer options (scrolled to the end and "
+               "back; the screen read shows: {})".format(
+                   "Wireless debugging" if state == "dev" else SETUP_PAIR_LABEL, words))
+    else:
+        why = "the screen read shows: {}{}".format(
+            words, "; Settings shows " + top if top else "")
+    print("could not open the pairing dialog in {:.0f}s: {}.\n"
+          "Do it by hand: `burner settings developer`, tap 'Wireless "
+          "debugging' (the words, not the switch), tap '{}', `burner shot "
+          "--out .` and read the code and the port after the last ':' off "
+          "it; then run `burner setup --step self-pair --code NNNNNN "
+          "--pair-port PPPPP`.".format(took, why, SETUP_PAIR_LABEL),
+          file=sys.stderr)
     return False
 
 
@@ -7966,6 +8088,8 @@ def _run_self_pair(args):
         return 0
     print("the phone will open ADB Auto Enable and Settings by itself for a "
           "few seconds; nothing to tap.")
+    if not os.path.exists(U2_SOCK):
+        u2_start_background()  # the screen reads below need it: start it now
     adb("shell", "monkey", "-p", SETUP_APK_PKG, "-c",
         "android.intent.category.LAUNCHER", "1", timeout=20)
     time.sleep(3)

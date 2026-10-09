@@ -473,10 +473,11 @@ on while charging", "Tailscale will now start by itself after a restart").
   `com.tpn.adbautoenable`,
   https://github.com/mouldybread/adb-auto-enable/releases), grants it
   `WRITE_SECURE_SETTINGS` and exempts it from battery optimization.
-- `self-pair`: opens the app, opens Wireless debugging's pairing dialog, reads
-  the code and port (off the screen, waiting up to 12 seconds for them to
-  appear; else from Settings' log and the phone's listening ports) and hands
-  them to the app. Best effort: if the app's pairing page doesn't come up,
+- `self-pair`: opens the app, opens Wireless debugging's pairing dialog
+  (straight to the page, else through Developer options; 20 seconds at
+  most), reads the code and port (off the screen, waiting up to 10 seconds
+  for them to appear; else from Settings' log and the phone's listening
+  ports) and hands them to the app. Best effort: if the app's pairing page doesn't come up,
   the step skips itself. burner still works; the only cost is that after a
   restart the user turns Wireless debugging back on once. Tell them that in a
   sentence and carry on. There's nothing for them to fix.
@@ -486,6 +487,11 @@ on while charging", "Tailscale will now start by itself after a restart").
   read them off the phone), then run
   `burner setup --step self-pair --code NNNNNN`. It reuses the open dialog.
   If the dialog was closed meanwhile, the code is dead: run the step again.
+  If it says it could not open the pairing dialog, do what it says by hand:
+  `burner settings developer`, tap the words 'Wireless debugging' (not the
+  switch), tap 'Pair device with pairing code', read the code and the port
+  after the last ':' off `burner shot --out .`, then run
+  `burner setup --step self-pair --code NNNNNN --pair-port PPPPP`.
 - `always-on-vpn`: sets Tailscale as the always-on VPN, so it starts by itself
   after a restart. Lockdown stays off, so if Tailscale ever fails the phone
   still has normal internet.

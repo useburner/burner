@@ -2564,6 +2564,7 @@ class SetupWizardTests(OfflineTestCase):
             return reads.pop(0) if len(reads) > 1 else reads[0]
         api = mock.Mock(return_value={"success": pair_ok, "error": "bad code"})
         listens = list(listen or [None])
+        self.started = self.allow("u2_start_background")
         with mock.patch.object(pc, "_check_self_pair", return_value=False), \
                 mock.patch.object(pc, "_setup_app_status",
                                   return_value={"isPaired": False}), \
@@ -2662,20 +2663,136 @@ class SetupWizardTests(OfflineTestCase):
         self.assertEqual(rc, 1)
         self.assertIn("bad code", err)
 
-    def test_open_pair_dialog_quotes_the_dollar_signs(self):
+    # --- self-pair: getting the pairing dialog open ---
+
+    @staticmethod
+    def _rows(*texts, cls=""):
+        return [{"text": t, "desc": "", "rid": "", "class": cls,
+                 "center": (500, 300 + 100 * i)} for i, t in enumerate(texts)]
+
+    def _wd_page(self, on=True):
+        if not on:
+            return self._rows("Wireless debugging", "Use wireless debugging",
+                              "To see and use available devices, turn on wireless debugging")
+        return self._rows("Wireless debugging", "Use wireless debugging", "Device name",
+                          "IP address & Port", "100.64.1.2:41235",
+                          "Pair device with QR code", "Pair device with pairing code")
+
+    def _dev_page(self, row=True, first="Use developer options"):
+        rows = self._rows(first, "Bug report shortcut", "USB debugging",
+                          *(("Wireless debugging", "Debug mode when Wi\u2011Fi is connected")
+                            if row else ("Disable adb authorization timeouts",)))
+        if row:
+            rows.append({"text": "", "desc": "Wireless debugging", "rid": "android:id/switch_widget",
+                         "class": "android.widget.Switch", "center": (1000, 600)})
+        return rows
+
+    def test_classify_pair_screen(self):
+        cls = pc.classify_pair_screen
+        self.assertEqual(cls([]), ("empty", None))
+        self.assertEqual(cls(self._dialog_nodes(), {"41235"})[0], "dialog")
+        state, hit = cls(self._wd_page())
+        self.assertEqual((state, hit["text"]), ("pair-row", "Pair device with pairing code"))
+        self.assertEqual(cls(self._wd_page(on=False))[0], "wd-off")
+        self.assertEqual(cls(self._wd_page()[:4])[0], "wd-page")  # the row off screen
+        state, hit = cls(self._dev_page())
+        # the row's words, never its switch (that turns Wireless debugging off)
+        self.assertEqual((state, hit["text"], hit["class"]), ("dev-row", "Wireless debugging", ""))
+        self.assertEqual(cls(self._dev_page(row=False))[0], "dev")
+        self.assertEqual(cls(self._rows("Settings", "Network & internet"))[0], "other")
+
+    def _open(self, reads, budget=20.0, read_s=1.0):
+        """Run _setup_open_pair_dialog on a fake clock: each read takes
+        read_s, sleeps take their time. Returns (ok, err, adb mock, taps,
+        reads made)."""
+        clock = [1000.0]
+        reads = list(reads)
+        made = []
+
+        def read():
+            clock[0] += read_s
+            made.append(1)
+            return reads.pop(0) if len(reads) > 1 else reads[0]
+
+        def sleep(t):
+            clock[0] += t
         m = self.allow("adb")
         m.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
-        page = [{"text": "Pair device with pairing code", "desc": "", "rid": ""}]
-        with mock.patch.object(pc, "_setup_read_nodes", return_value=page), \
-                mock.patch.object(pc, "_setup_tap_label", return_value=True) as tap, \
-                mock.patch.object(pc.time, "sleep"):
-            self.assertTrue(pc._setup_open_pair_dialog())
+        taps = self.allow("tap_center")
+        with mock.patch.object(pc, "_setup_read_nodes", side_effect=read), \
+                mock.patch.object(pc, "SETUP_PAIR_OPEN_S", budget), \
+                mock.patch.object(pc.time, "time", lambda: clock[0]), \
+                mock.patch.object(pc.time, "sleep", sleep), \
+                self.cap() as (out, err):
+            ok = pc._setup_open_pair_dialog()
+        self.elapsed = clock[0] - 1000.0
+        return ok, err.getvalue(), m, taps, len(made)
+
+    def test_open_pair_dialog_lands_on_the_page(self):
+        ok, err, m, taps, _ = self._open([[], self._wd_page()])
+        self.assertTrue(ok, err)
         argv = m.call_args_list[0][0]
+        self.assertEqual(argv[:5], ("shell", "am", "start", "-W", "--activity-clear-task"))
         self.assertIn("'com.android.settings/.development.qstile."
                       "DevelopmentTiles$WirelessDebugging'", argv)
-        self.assertIn("'com.android.settings/.Settings$DevelopmentSettingsActivity'",
-                      argv)
-        tap.assert_called_once_with("Pair device with pairing code")
+        self.assertIn("'com.android.settings/.Settings$DevelopmentSettingsActivity'", argv)
+        taps.assert_called_once_with(500, 900)  # the pairing-code row
+        self.assertFalse([c for c in m.call_args_list if "swipe" in c[0]])
+
+    def test_open_pair_dialog_already_open(self):
+        ok, err, m, taps, _ = self._open([self._dialog_nodes()])
+        self.assertTrue(ok, err)
+        taps.assert_not_called()
+
+    def test_open_pair_dialog_from_developer_options(self):
+        # The tile's page didn't come (a Settings without it): the row is
+        # found with slow, short swipes, its words tapped, then the pairing row.
+        dev = self._dev_page(row=False)
+        ok, err, m, taps, _ = self._open([dev, dev, dev, dev, self._dev_page(), self._wd_page()])
+        self.assertTrue(ok, err)
+        self.assertEqual(taps.call_args_list, [mock.call(500, 600), mock.call(500, 900)])
+        swipes = [c[0] for c in m.call_args_list if "swipe" in c[0]]
+        self.assertTrue(swipes)
+        self.assertEqual(swipes[0][-1], 900)  # slow: a fling skips past the row
+
+    def test_open_pair_dialog_row_missing_fails_fast(self):
+        dev = self._dev_page(row=False)
+        ok, err, m, taps, n = self._open([dev])
+        self.assertFalse(ok)
+        taps.assert_not_called()
+        swipes = [c[0] for c in m.call_args_list if "swipe" in c[0]]
+        # down to the end (the read didn't change), back up once, then done
+        self.assertEqual(len(swipes), 2)
+        self.assertLess(swipes[0][6], swipes[0][4])  # down the list
+        self.assertGreater(swipes[1][6], swipes[1][4])  # back up
+        self.assertIn("no 'Wireless debugging' row in Developer options", err)
+        self.assertIn("burner settings developer", err)
+        self.assertIn("--pair-port PPPPP", err)
+        self.assertLess(self.elapsed, 20)
+
+    def test_open_pair_dialog_unreadable_screen_stops_in_time(self):
+        ok, err, m, taps, n = self._open([[]], budget=20.0, read_s=3.0)
+        self.assertFalse(ok)
+        self.assertLessEqual(self.elapsed, 24)
+        self.assertLessEqual(n, 7)
+        self.assertIn("could not open the pairing dialog in", err)
+        self.assertIn("could not be read", err)
+        self.assertFalse([c for c in m.call_args_list if "swipe" in c[0]])
+
+    def test_open_pair_dialog_turns_wireless_debugging_on(self):
+        ok, err, m, taps, _ = self._open([self._wd_page(on=False), self._wd_page()])
+        self.assertTrue(ok, err)
+        self.assertIn(mock.call("shell", "settings", "put", "global", "adb_wifi_enabled", "1",
+                                timeout=15), m.call_args_list)
+        self.assertIn("turning it on", err)
+
+    def test_open_pair_dialog_not_in_settings_opens_developer_options(self):
+        other = self._rows("Home", "Phone")
+        ok, err, m, taps, _ = self._open([other] * 8 + [self._wd_page()])
+        self.assertTrue(ok, err)
+        starts = [c[0] for c in m.call_args_list if c[0][:3] == ("shell", "am", "start")]
+        self.assertEqual(len(starts), 2)
+        self.assertIn("android.settings.APPLICATION_DEVELOPMENT_SETTINGS", starts[1])
 
     # --- fix-port ---
 
@@ -5211,6 +5328,28 @@ class TypeEnterTests(OfflineTestCase):
 
 
 class HelperStalenessTests(OfflineTestCase):
+    def test_fast_dump_waits_for_the_helper_start_once(self):
+        # setup --step self-pair read the screen ~20 times with no helper
+        # coming up, each read waiting 15s for it (Pixel 9 Pro XL, Oct 9)
+        self.allow("u2sock", return_value=None)
+        started = self.allow("u2_start_background")
+        clock = [0.0]
+
+        def sleep(t):
+            clock[0] += t
+        with mock.patch.object(pc, "fast_dump", self._guards["fast_dump"].temp_original), \
+                mock.patch.object(pc, "_helper_waited", False), \
+                mock.patch.object(pc.os.path, "exists", return_value=False), \
+                mock.patch.object(pc.time, "time", lambda: clock[0]), \
+                mock.patch.object(pc.time, "sleep", sleep):
+            self.assertIsNone(pc.fast_dump(fresh=True))
+            first = clock[0]
+            self.assertIsNone(pc.fast_dump(fresh=True))
+            self.assertIsNone(pc.fast_dump(fresh=True))
+        self.assertGreaterEqual(first, 15)
+        self.assertEqual(clock[0], first)  # no second wait
+        self.assertEqual(started.call_count, 3)  # still asked to start each time
+
     def test_a_command_waits_for_a_helper_that_is_starting(self):
         attempts = []
 
