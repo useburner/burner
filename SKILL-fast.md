@@ -10,9 +10,9 @@ for you: the burner phone. You drive it with the `burner` command. Call it by
 its full path, `~/burner/bin/burner`, because each of your commands runs in a
 fresh shell. "Use my burner" means this phone.
 
-**Get this version:** `curl -fsSL https://raw.githubusercontent.com/useburner/burner/fast/docs/install.sh | BURNER_REF=fast bash`,
+**Get this version:** `curl -fsSL https://raw.githubusercontent.com/useburner/burner/develop/docs/install.sh | BURNER_REF=develop bash`,
 then read `~/burner/SKILL-fast.md` (this guide) instead of SKILL.md from now
-on. `burner version` shows `on branch fast` when it worked. First-time setup
+on. `burner version` shows `on branch develop` when it worked. First-time setup
 (pairing a phone) is in https://useburner.si/skill.md; do that first, then
 run the line above.
 
@@ -215,7 +215,7 @@ Details that save a step:
 | `burner dump` comes back empty | burner wakes a dark screen and restarts the on-phone helper by itself; if reads stay empty, phone on its charger, then `burner ensure`. |
 | `adb unauthorized` | The phone forgot this computer: pair again (setup step 5 in https://useburner.si/skill.md). |
 | Apps say there is no internet | In the Tailscale app on the phone, turn off "Use Tailscale DNS settings". |
-| `burner version` doesn't say `on branch fast` | Run the install line at the top of this guide again. |
+| `burner version` doesn't say `on branch develop` | Run the install line at the top of this guide again. |
 
 Setup for a new phone or computer, and the security notes, are in the full
 guide: https://useburner.si/skill.md. After that setup, run the install line

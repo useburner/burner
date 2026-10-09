@@ -9,8 +9,8 @@
 # other local state are never deleted. No sudo. Safe to re-run.
 set -u
 
-# BURNER_REF picks a branch (default master). The fast branch installs with:
-#   curl -fsSL https://raw.githubusercontent.com/useburner/burner/fast/docs/install.sh | BURNER_REF=fast bash
+# BURNER_REF picks a branch (default master). The develop branch installs with:
+#   curl -fsSL https://raw.githubusercontent.com/useburner/burner/develop/docs/install.sh | BURNER_REF=develop bash
 REF="${BURNER_REF:-master}"
 case "$REF" in
   ""|*[!A-Za-z0-9._/-]*) echo "burner: ERROR: BURNER_REF must be a branch name (letters, digits, . _ / -)" >&2; exit 1 ;;
