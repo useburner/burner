@@ -1,0 +1,11 @@
+# Move a home screen app icon to a spot, or onto another app for a folder.
+# Usage: APP=Chrome TO=0.5,0.3 burner recipe home-move
+#        APP=Chrome TO=Maps burner recipe home-move    (a folder with Maps)
+#
+# Starts on the first home screen page. TO is X,Y (0 to 1 across and down)
+# or another app's name on that page. To another page, run
+# `burner drag "Chrome" right 0.5,0.3` yourself (each left/right turns one).
+# Look at the screen it prints: a shortcuts menu means the icon wasn't
+# picked up (`burner press BACK`, then the drag again with --hold 1200).
+press HOME
+drag "$APP" "$TO"

@@ -1,4 +1,4 @@
-> Install: curl -fsSL https://useburner.si/install.sh | bash (full guide below). Skill rev cca1b3df: if `burner version` shows a different rev, run `burner update`.
+> Install: curl -fsSL https://useburner.si/install.sh | bash (full guide below). Skill rev 205758cf: if `burner version` shows a different rev, run `burner update`.
 
 # burner
 
@@ -32,6 +32,7 @@ up: start Setup now, without asking whether they meant it.
 | A short word or name you don't recognize ("about", "weekly-orders") | It may be a saved recipe. Run `burner recipes`. If one matches, tell the user which one and what it does, and run it (`burner recipe <name>`) once they say yes. If they said "run <name>", just run it. |
 | "Uninstall burner" / "forget it" | Run `burner uninstall` first: it lists the phone changes it will undo (screen lock, stay awake, helper apps, Wireless debugging). Run it with `--yes` once the user agrees, then delete the `~/burner` folder and any notes you saved about burner. Don't search files or read the installer. |
 | "Update my burner" | Run `burner update`, then re-read `~/burner/SKILL.md` (the instructions change with updates), and say in one line that it's up to date. |
+| "Move Chrome to the second page" / "put these apps in a folder" | See "Rearranging the home screen" below: `burner drag`. |
 | "Scroll to the top" or "scroll down" | They mean inside the app that's open now. Use `burner scroll top`, `burner scroll down` and so on. Don't press HOME or swipe from a screen edge: that leaves the app or opens the app drawer. |
 
 ## Installing apps
@@ -174,6 +175,20 @@ A plain `burner dump` can reuse a read from the last 2 seconds. When the
 screen changes on its own (a page loading, an app updating, someone using the
 phone), use `burner dump --fresh` to read it as it is now.
 
+## Rearranging the home screen
+
+`burner press HOME` shows the first page. `burner drag "Chrome" 0.5,0.3`
+long-presses the Chrome icon, carries it and lets go at that spot (0 to 1
+across and down); the icons there make room. Dropped on another app
+(`burner drag "Chrome" "Maps"`) it makes a folder, or joins one. `left` or
+`right` between the two turns one page each: `burner drag "Chrome" right
+0.5,0.3` puts it on the next page (after a turn, give the drop as X,Y: names
+are found on the page you started on). A name shown twice (on the page and in
+the dock) needs `burner snap` and `@eN`. Check the screen it prints: if a
+shortcuts menu opened instead, `burner press BACK` and try `--hold 1200`.
+Move only what the user asked for, and never drop on "Remove" or "Uninstall"
+at the top of the screen.
+
 ## Commands
 
 Run `burner <command> --help` for every option.
@@ -198,6 +213,7 @@ Act
   burner tap "Text"                 tap by label (--index N, --fuzzy, --settle, "A || B")
   burner tap @e3                    tap a snap handle
   burner tap --xy 0.5,0.8           tap a spot (0 to 1 across and down)
+  burner drag "Chrome" 0.5,0.3      long-press, carry, drop (a label, @e3 or X,Y; left/right between turn a page; --hold, --move, --dwell ms)
   burner type "text"                type letter by letter (--field "Hint", --clear)
   burner scroll [down|up|left|right|top|bottom]   scroll the open app (--times N, --to "Text")
   burner press BACK|HOME|ENTER|…    press a key (--repeat N)

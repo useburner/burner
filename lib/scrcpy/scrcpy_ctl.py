@@ -122,6 +122,37 @@ class ScrcpyControl:
         time.sleep(0.05)
         self._touch(ACTION_UP, x2, y2, buttons=0, screen=screen)
 
+    def drag(self, x, y, hold_ms, legs, screen=None):
+        """Press at (x, y), hold `hold_ms` (a long-press: a launcher picks
+        the icon up), then carry it along `legs`, each (x, y, move_ms,
+        dwell_ms): a glide to the point in ~16ms steps, then a stay there
+        (a home screen turns the page while the finger stays at its edge,
+        and opens a folder or makes room under it). Lifts at the last
+        point; lifts even when a send fails part way, so the phone is never
+        left with a finger down."""
+        down = False
+        try:
+            self._touch(ACTION_DOWN, x, y, buttons=BUTTON_PRIMARY, screen=screen)
+            down = True
+            time.sleep(hold_ms / 1000)
+            for x2, y2, move_ms, dwell_ms in legs:
+                steps = max(1, int(move_ms) // 16)
+                for i in range(1, steps + 1):
+                    t = i / steps
+                    self._touch(ACTION_MOVE, x + (x2 - x) * t, y + (y2 - y) * t,
+                                buttons=BUTTON_PRIMARY, screen=screen)
+                    time.sleep(move_ms / 1000 / steps)
+                x, y = x2, y2
+                time.sleep(dwell_ms / 1000)
+            self._touch(ACTION_UP, x, y, buttons=0, screen=screen)
+            down = False
+        finally:
+            if down:
+                try:
+                    self._touch(ACTION_UP, x, y, buttons=0, screen=screen)
+                except OSError:
+                    pass
+
     def text(self, s):
         """Inject text as key events (ASCII-safe path; prefer set_text for fields)."""
         data = s.encode("utf-8")
@@ -193,8 +224,10 @@ class ScrcpyControl:
                 pass
 
 
-def _mux_send(line, timeout=30):
-    """Send a command to the mux; start the mux daemon if not running."""
+def _mux_send(line, timeout=30, resend=True):
+    """Send a command to the mux; start the mux daemon if not running.
+    Without `resend`, a reply lost after the line went out raises instead
+    of sending it again (a drag may be half done)."""
     import os as _os
     # The burner tree this file lives in (lib/scrcpy/scrcpy_ctl.py).
     root = _os.path.dirname(_os.path.dirname(_os.path.dirname(
@@ -208,12 +241,20 @@ def _mux_send(line, timeout=30):
         s.connect(sock_path)
         s.sendall((line + "\n").encode())
         data = b""
-        while not data.endswith(b"\n"):
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-        s.close()
+        try:
+            while not data.endswith(b"\n"):
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        except OSError as e:
+            if not resend:
+                raise RuntimeError(f"the mux's reply was lost part way: {e}")
+            raise
+        finally:
+            s.close()
+        if not resend and not data.endswith(b"\n"):
+            raise RuntimeError("the mux closed before it replied, part way")
         return data.decode("utf-8", "replace").strip()
 
     try:
@@ -239,7 +280,7 @@ def _mux_send(line, timeout=30):
 
 def main(argv):
     if len(argv) < 2:
-        print("usage: scrcpy_ctl.py tap X Y | swipe X1 Y1 X2 Y2 [MS] | key CODE | back | home | wake | text STR | scroll X Y [H V] | startapp PKG | ping")
+        print("usage: scrcpy_ctl.py tap X Y | swipe X1 Y1 X2 Y2 [MS] | drag HOLD X Y (X Y MOVE DWELL)... | key CODE | back | home | wake | text STR | scroll X Y [H V] | startapp PKG | ping")
         return 2
     cmd = argv[1]
     if cmd == "tap":
@@ -247,6 +288,8 @@ def main(argv):
     elif cmd == "swipe":
         ms = argv[6] if len(argv) > 6 else "300"
         line = f"swipe {argv[2]} {argv[3]} {argv[4]} {argv[5]} {ms}"
+    elif cmd == "drag":
+        line = "drag " + " ".join(argv[2:])
     elif cmd == "key":
         line = f"key {argv[2]}"
     elif cmd == "scroll":

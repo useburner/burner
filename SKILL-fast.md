@@ -98,6 +98,7 @@ Every step you take costs a round trip, so the fewer steps, the faster.
 | "Read this article" / a recipe / a long page / a JSON answer | `burner open "https://…" com.android.chrome`, then `burner text`: the page's whole text, top to bottom (`burner text --find bake` lists each place with the words and the lines around it; `--from N` reads on from one). |
 | "When is Target in Woodbury open?" / a place's hours, phone or address | `burner open "https://www.google.com/search?q=Target+Woodbury+MN+hours" com.android.chrome`, then `burner text`: the answer and the store pages, as words. The Maps app's result cards give the screen reader no names or hours, so they show only in a screenshot. |
 | "Scroll down" / "scroll to the top" / a row further down | `burner scroll down`, `burner scroll top`: inside the open app, never HOME or an edge swipe. For a row whose words you know (an IP address on a network's page, a setting), `burner scroll down --to "IP address"` scrolls until it is on screen, in one command. In a feed of videos or posts (Shorts, Reels, TikTok), the next one is `burner scroll down` (the finger swipes up). |
+| "Move Chrome to the second page" / "put these apps in a folder" | From the home screen (`burner press HOME`): `burner drag "Chrome" 0.5,0.3` long-presses the icon, carries it and drops it at that spot (0 to 1 across and down); onto another app (`burner drag "Chrome" "Maps"`) makes a folder. `left`/`right` between the two turn one page each (`burner drag "Chrome" right 0.5,0.3`; after a turn the drop is X,Y). A name shown twice: `burner snap`, then `@eN`. A shortcuts menu instead of a move: `burner press BACK`, again with `--hold 1200`. Never drop on "Remove" or "Uninstall". |
 | "Do this every time" / "save that" | Turn the steps that worked into a recipe with `burner save <name> 'step' ...` (labels, not coordinates; `$VARIABLE` for text that changes), test it once with `burner recipe <name>`. |
 | "Update my burner" | `burner update` (it stays on this version), then re-read `~/burner/SKILL-fast.md`. |
 | "Uninstall burner" / "forget it" | `burner uninstall` lists the phone changes it undoes; `--yes` once the user agrees, then delete `~/burner` and your notes about it. |
@@ -143,6 +144,7 @@ Look
 Act (each prints the screen it ends on)
   burner tap "Text"                 tap by label (--index N, --fuzzy, "A || B", @e3 from snap)
   burner tap --xy 0.5,0.8           tap a spot (0 to 1 across and down)
+  burner drag "Chrome" 0.5,0.3      long-press, carry, drop (label, @e3 or X,Y; left/right between turn a page; --hold, --dwell ms)
   burner type "text"                type into the focused field (--field "Hint", --clear, --enter)
   burner press BACK|HOME|ENTER      press a key (--repeat N; MEDIA_PAUSE, MEDIA_PLAY for a video or music)
   burner scroll [down|up|left|right|top|bottom]   scroll the open app (--times N, --to "Text")

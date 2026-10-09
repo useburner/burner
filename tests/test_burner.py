@@ -2661,6 +2661,171 @@ class SetupWizardTests(OfflineTestCase):
 
 
 
+# ------------------------------------------------------- drag
+
+HOME_XML = """<hierarchy rotation="0">
+  <node text="" class="android.widget.FrameLayout" package="com.google.android.apps.nexuslauncher" bounds="[0,0][1080,2400]" clickable="false" enabled="true" focused="false" checked="false">
+    <node text="Chrome" class="android.widget.TextView" package="com.google.android.apps.nexuslauncher" bounds="[40,1600][270,1880]" clickable="true" enabled="true" focused="false" checked="false"/>
+    <node text="Maps" class="android.widget.TextView" package="com.google.android.apps.nexuslauncher" bounds="[310,1600][540,1880]" clickable="true" enabled="true" focused="false" checked="false"/>
+    <node text="Photos" class="android.widget.TextView" package="com.google.android.apps.nexuslauncher" bounds="[580,1600][810,1880]" clickable="true" enabled="true" focused="false" checked="false"/>
+    <node text="Photos" class="android.widget.TextView" package="com.google.android.apps.nexuslauncher" bounds="[580,2000][810,2280]" clickable="true" enabled="true" focused="false" checked="false"/>
+  </node>
+</hierarchy>"""
+
+
+class DragTests(OfflineTestCase):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, pc, "_screen_wh", pc._screen_wh)
+        self.allow("_cached_root", side_effect=lambda: self._home())
+        self.allow("wake")
+        self.allow("u2_invalidate")
+        self.allow("snap_invalidate")
+        self.read = self.allow("read_after")
+
+    def _home(self):
+        root = pc.ET.fromstring(HOME_XML)
+        pc._update_screen_from_dump(root)
+        return root
+
+    def drag(self, *points, **kw):
+        args = self.parse(["drag"] + list(points) + list(kw.pop("extra", [])))
+        with self.cap() as (out, err):
+            rc = pc.cmd_drag(args)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_points_are_labels_handles_spots_or_edges(self):
+        self.assertEqual(pc.parse_drag_point("Chrome"), ("label", "Chrome"))
+        self.assertEqual(pc.parse_drag_point("0.5,0.25"), ("xy", (0.5, 0.25)))
+        self.assertEqual(pc.parse_drag_point("@e3"), ("handle", "@e3"))
+        self.assertEqual(pc.parse_drag_point("right"), ("edge", "right"))
+        with self.assertRaises(ValueError):
+            pc.parse_drag_point("1.5,0.2")
+
+    def test_an_edge_turns_one_page_and_comes_back_in(self):
+        legs = pc.drag_legs([(155, 1740), "right", (540, 900)], 1080, 2400)
+        self.assertEqual(legs, [(1069, 1740, pc.DRAG_MOVE_MS, pc.DRAG_EDGE_MS),
+                                (540, 1740, pc.DRAG_MOVE_MS, pc.DRAG_DWELL_MS),
+                                (540, 900, pc.DRAG_MOVE_MS, pc.DRAG_DWELL_MS)])
+        self.assertEqual(pc.drag_ms(800, legs), 800 + 3 * pc.DRAG_MOVE_MS + pc.DRAG_EDGE_MS
+                         + 2 * pc.DRAG_DWELL_MS)
+
+    def test_adb_script_holds_before_moving_and_lets_go_last(self):
+        script = pc.drag_adb_script(155, 1740, 800, [(540, 900, 500, 600)])
+        self.assertIn('if [ "$v" -ge 29 ]; then input motionevent DOWN 155 1740; sleep 0.8; '
+                      "input motionevent MOVE 251 1530", script)
+        self.assertIn("input motionevent MOVE 540 900; sleep 0.6; input motionevent UP 540 900;", script)
+        # Android 8-9: draganddrop, its hold the long-press time, inside its duration
+        self.assertIn('elif [ "$v" -ge 26 ]; then input draganddrop 155 1740 540 900 1300;', script)
+        two = pc.drag_adb_script(155, 1740, 800, [(1069, 1740, 500, 900), (540, 900, 500, 600)])
+        self.assertNotIn("draganddrop", two)  # stops on the way need motionevent
+        self.assertIn("burner-drag-unsupported", two)
+
+    def test_drag_by_labels_goes_over_the_scrcpy_helper_once(self):
+        send = self.allow("scrcpy_send", return_value=True)
+        adb = self.allow("adb_or_ensure")
+        rc, out, err = self.drag("Chrome", "Maps")
+        self.assertEqual(rc, 0, err)
+        send.assert_called_once_with("drag 800 155 1740 425 1740 500 600", retry=False)
+        adb.assert_not_called()
+        self.assertEqual(out, "dragged Chrome (155, 1740) -> Maps (425, 1740)\n")
+        self.read.assert_called_once()
+
+    def test_drag_to_the_next_page_and_a_spot_there(self):
+        send = self.allow("scrcpy_send", return_value=True)
+        rc, out, err = self.drag("Chrome", "right", "0.5,0.375", extra=["--hold", "1000", "-q"])
+        self.assertEqual(rc, 0, err)
+        send.assert_called_once_with(
+            "drag 1000 155 1740 1069 1740 500 900 540 1740 500 600 540 900 500 600", retry=False)
+        self.assertTrue(self.read.call_args.kwargs["quiet"])
+
+    def test_no_scrcpy_helper_drags_over_adb(self):
+        self.allow("scrcpy_send", side_effect=RuntimeError("scrcpy disabled (BURNER_SCRCPY=0)"))
+        adb = self.allow("adb_or_ensure", return_value=SimpleNamespace(stdout="", stderr="", returncode=0))
+        rc, out, err = self.drag("Chrome", "Maps")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(adb.call_args[0][0], "shell")
+        self.assertIn("input motionevent DOWN 155 1740", adb.call_args[0][1])
+
+    def test_old_android_without_a_way_says_so(self):
+        self.allow("scrcpy_send", side_effect=RuntimeError("scrcpy disabled"))
+        self.allow("adb_or_ensure", return_value=SimpleNamespace(
+            stdout="burner-drag-unsupported 25\n", stderr="", returncode=0))
+        rc, out, err = self.drag("Chrome", "Maps")
+        self.assertEqual(rc, 1)
+        self.assertIn("SDK 25", err)
+        self.read.assert_not_called()
+
+    def test_a_drag_cut_short_is_not_sent_again(self):
+        self.allow("scrcpy_send", side_effect=RuntimeError("mux replied: err drag failed part way: broken pipe"))
+        adb = self.allow("adb_or_ensure")
+        rc, out, err = self.drag("Chrome", "Maps")
+        self.assertEqual(rc, 1)
+        adb.assert_not_called()
+        self.assertIn("isn't sent again", err)
+
+    def test_an_ambiguous_or_missing_label_touches_nothing(self):
+        send = self.allow("scrcpy_send")
+        rc, out, err = self.drag("Photos", "Maps")
+        self.assertEqual(rc, 1)
+        self.assertIn('"Photos" is on the screen 2 times', err)
+        rc, out, err = self.drag("Chrome", "Gmail")
+        self.assertEqual(rc, 1)
+        self.assertIn('no "Gmail" on the screen', err)
+        send.assert_not_called()
+
+    def test_edges_go_between_the_ends(self):
+        send = self.allow("scrcpy_send")
+        for points in (("Chrome", "right"), ("left", "Maps"), ("Chrome",)):
+            rc, out, err = self.drag(*points)
+            self.assertEqual(rc, 1, points)
+        send.assert_not_called()
+
+    def test_scrcpy_drag_holds_moves_and_lifts(self):
+        sys.path.insert(0, os.path.join(pc.ROOT, "lib", "scrcpy"))
+        import scrcpy_ctl
+        ctl = scrcpy_ctl.ScrcpyControl.__new__(scrcpy_ctl.ScrcpyControl)
+        ctl.screen = (1080, 2400)
+        sent = []
+        ctl._touch = lambda action, x, y, **kw: sent.append((action, int(x), int(y)))
+        with mock.patch.object(scrcpy_ctl.time, "sleep") as sleep:
+            ctl.drag(100, 200, 800, [(300, 200, 32, 600)])
+        self.assertEqual(sent, [(scrcpy_ctl.ACTION_DOWN, 100, 200), (scrcpy_ctl.ACTION_MOVE, 200, 200),
+                                (scrcpy_ctl.ACTION_MOVE, 300, 200), (scrcpy_ctl.ACTION_UP, 300, 200)])
+        self.assertEqual(sleep.call_args_list[0], mock.call(0.8))  # the hold, before any move
+        self.assertEqual(sleep.call_args_list[-1], mock.call(0.6))  # the stay, before letting go
+
+    def test_scrcpy_drag_lifts_the_finger_when_a_send_fails(self):
+        sys.path.insert(0, os.path.join(pc.ROOT, "lib", "scrcpy"))
+        import scrcpy_ctl
+        ctl = scrcpy_ctl.ScrcpyControl.__new__(scrcpy_ctl.ScrcpyControl)
+        sent = []
+
+        def touch(action, x, y, **kw):
+            if action == scrcpy_ctl.ACTION_MOVE:
+                raise OSError("broken pipe")
+            sent.append(action)
+        ctl._touch = touch
+        with mock.patch.object(scrcpy_ctl.time, "sleep"), self.assertRaises(OSError):
+            ctl.drag(100, 200, 800, [(300, 200, 32, 600)])
+        self.assertEqual(sent, [scrcpy_ctl.ACTION_DOWN, scrcpy_ctl.ACTION_UP])
+
+    def test_mux_does_not_run_a_failed_drag_twice(self):
+        sys.path.insert(0, os.path.join(pc.ROOT, "lib", "scrcpy"))
+        spec = importlib.util.spec_from_file_location(
+            "scrcpy_mux_under_test", os.path.join(ROOT, "lib", "scrcpy", "mux.py"))
+        mux = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mux)
+        m = mux.Mux.__new__(mux.Mux)
+        m.lock = mux.threading.Lock()
+        m.ensure = mock.Mock()
+        ctl = m.ctl = mock.Mock()
+        ctl.drag.side_effect = OSError("broken pipe")
+        self.assertIn("part way", m.handle("drag 800 1 2 3 4 500 600"))
+        ctl.drag.assert_called_once_with(1, 2, 800, [(3, 4, 500, 600)])  # not again
+        self.assertEqual(m.handle("drag 800 1 2 3"), "err drag wants hold x y, then x y move dwell for each point")
+
+
 # ------------------------------------------------------- fast paths via u2 mux
 
 class FastPathTests(OfflineTestCase):

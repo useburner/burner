@@ -7,6 +7,7 @@ so every `burner` invocation gets ~5ms input without paying server startup.
 
 Unix socket: <burner folder>/run/scrcpy-mux.sock
 Line protocol:  "tap 540 1200" | "swipe x1 y1 x2 y2 ms" | "key 4" |
+                "drag hold x y x2 y2 move dwell [x3 y3 move dwell ...]" |
                 "back" | "home" | "wake" | "text hello" | "scroll x y h v" |
                 "startapp com.pkg" | "ping"
 Reply: "ok" or "err <message>" (one line).
@@ -155,6 +156,12 @@ class Mux:
             if len(rest) >= 3:
                 w, h = int(rest[1]), int(rest[2])
             c.swipe(int(x1), int(y1), int(x2), int(y2), ms, screen=(w, h) if w else None)
+        elif cmd == "drag":
+            hold, x, y, *rest = (int(v) for v in arg.split())
+            if not rest or len(rest) % 4:
+                raise ValueError("drag wants hold x y, then x y move dwell for each point")
+            legs = [tuple(rest[i:i + 4]) for i in range(0, len(rest), 4)]
+            c.drag(x, y, hold, legs)
         elif cmd == "key":
             c.keyevent(_keycode(arg))
         elif cmd == "back":
@@ -185,6 +192,25 @@ class Mux:
 
     def handle(self, line):
         with self.lock:
+            if line.split(" ", 1)[0].lower() == "drag":
+                # Not sent twice: a drag that failed part way has already
+                # carried the icon somewhere, and again from the same point
+                # would pick up whatever is there now.
+                try:
+                    self.ensure()
+                except Exception:
+                    try:
+                        self.ctl = None
+                        self.ensure()
+                    except Exception as e:
+                        return f"err {e}"
+                try:
+                    return self.run_command(line)
+                except ValueError as e:  # its numbers, before any touch
+                    return f"err {e}"
+                except Exception as e:
+                    self.ctl = None  # reconnect on the next command
+                    return f"err drag failed part way: {e}"
             try:
                 self.ensure()
                 return self.run_command(line)

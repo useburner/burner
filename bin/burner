@@ -607,8 +607,10 @@ def scrcpy_restart_if_stale():
             pass
 
 
-def scrcpy_send(line):
-    """Send a command to the scrcpy mux (persistent input channel)."""
+def scrcpy_send(line, retry=True):
+    """Send a command to the scrcpy mux (persistent input channel). Without
+    `retry`, a failure raises at once: for a command the phone may have
+    half done (a drag), which must not be sent again."""
     global _scrcpy_send
     if os.environ.get("BURNER_SCRCPY") == "0":
         # Test copies must not spawn a second scrcpy mux next to live's.
@@ -620,12 +622,12 @@ def scrcpy_send(line):
         _scrcpy_send = _mux_send
     for attempt in range(2):
         try:
-            reply = _scrcpy_send(line)
+            reply = _scrcpy_send(line) if retry else _scrcpy_send(line, resend=False)
             if reply == "ok":
                 return True
             raise RuntimeError("mux replied: {}".format(reply))
         except Exception as e:
-            if attempt == 0:
+            if attempt == 0 and retry:
                 time.sleep(2)  # mux may be mid-recovery; retry once
             else:
                 raise
@@ -4288,7 +4290,7 @@ def shot_fast(out):
 
 
 SHOT_HINT_S = 20  # a screenshot this soon after a command that printed the screen earns the hint
-PRINTING_VERBS = ("tap", "type", "press", "open", "start", "scroll", "wait", "dismiss",
+PRINTING_VERBS = ("tap", "drag", "type", "press", "open", "start", "scroll", "wait", "dismiss",
                   "settings", "state", "do", "recipe")
 
 
@@ -5471,6 +5473,218 @@ def cmd_scroll(args):
     return 1
 
 
+# ---------------------------------------------------------------- drag
+# Long-press, carry, drop: a home screen's icons moved, onto another page
+# or into a folder. A launcher picks an icon up only from a finger held
+# still past its long-press time, and moves it only while the finger keeps
+# moving or stays down; `input swipe` with a long duration starts moving at
+# once (no pick-up). Fastest first: the scrcpy helper's open connection
+# (every touch event timed by burner, any Android version the helper runs
+# on), then one adb call (`input motionevent` steps on Android 10+, `input
+# draganddrop` for a plain two-point drag on Android 8-9).
+
+DRAG_HOLD_MS = 800    # the press before moving: past the long-press time (400-500ms)
+DRAG_MOVE_MS = 500    # the glide to each point
+DRAG_DWELL_MS = 600   # the stay at each point: a launcher makes room (its reorder
+                      # wait is about 650ms after the first look) or rings a folder
+DRAG_EDGE_MS = 900    # the stay at a side edge: a page turns after ~500ms there, the
+                      # next ~900ms after that, so this turns one
+DRAG_EDGE_IN = 0.01   # how far in from the edge that stay is (the zone is ~20dp)
+DRAG_MAX_MS = 20000   # the whole drag; the helper's reply waits 30s
+DRAG_ADB_STEPS = 4    # `input motionevent` MOVEs per glide (each is one `input` call)
+DRAG_EDGES = ("left", "right")
+
+
+def parse_drag_point(s):
+    """One point of `burner drag`: ("edge", "left"|"right"), ("xy", (nx,
+    ny)) for "X,Y" in 0-1, ("handle", "@eN") or ("label", words). Raises
+    ValueError for "X,Y" out of range. Pure."""
+    t = (s or "").strip()
+    if t in DRAG_EDGES:
+        return "edge", t
+    if re.fullmatch(r"-?[0-9.]+\s*,\s*-?[0-9.]+", t):
+        try:
+            return "xy", parse_normalized_xy(t)
+        except ValueError:
+            raise ValueError("a point X,Y is 0 to 1 across and down, got {!r}".format(s))
+    if t.startswith("@e"):
+        return "handle", t
+    if not t:
+        raise ValueError("an empty point")
+    return "label", t
+
+
+def drag_legs(points, w, h, move_ms=DRAG_MOVE_MS, dwell_ms=DRAG_DWELL_MS):
+    """The drag's path after the press at points[0] (pixels): a list of
+    (x, y, move_ms, dwell_ms), one leg per point. "left"/"right" turn one
+    page that way: to that edge at the finger's height, a stay there, and
+    back to the middle (out of the edge, or the pages keep turning). Pure."""
+    x, y = points[0]
+    legs = []
+    for p in points[1:]:
+        if p in DRAG_EDGES:
+            inset = max(2, int(w * DRAG_EDGE_IN))
+            legs.append((inset if p == "left" else w - 1 - inset, y, move_ms, DRAG_EDGE_MS))
+            x = w // 2
+            legs.append((x, y, move_ms, dwell_ms))
+        else:
+            x, y = p
+            legs.append((x, y, move_ms, dwell_ms))
+    return legs
+
+
+def drag_ms(hold_ms, legs):
+    """How long the finger is down. Pure."""
+    return hold_ms + sum(m + d for _x, _y, m, d in legs)
+
+
+def _secs(ms):
+    return "{:g}".format(round(ms / 1000.0, 3))
+
+
+def drag_adb_script(x, y, hold_ms, legs):
+    """The drag as one `adb shell` line that picks its way by the phone's
+    Android: `input motionevent` (Android 10+; DRAG_ADB_STEPS moves per
+    leg, each an `input` call, so the glide takes what those take) with
+    the hold and stays as sleeps; `input draganddrop` on Android 8-9 for
+    one leg (its hold is the long-press time, and its glide starts from
+    the press, so the icon jumps a little when it starts); else it prints
+    `burner-drag-unsupported <sdk>`. Pure."""
+    steps = ["input motionevent DOWN {} {}".format(x, y), "sleep " + _secs(hold_ms)]
+    px, py = x, y
+    for x2, y2, _move, dwell in legs:
+        for i in range(1, DRAG_ADB_STEPS + 1):
+            t = i / DRAG_ADB_STEPS
+            steps.append("input motionevent MOVE {} {}".format(
+                int(round(px + (x2 - px) * t)), int(round(py + (y2 - py) * t))))
+        if dwell:
+            steps.append("sleep " + _secs(dwell))
+        px, py = x2, y2
+    steps.append("input motionevent UP {} {}".format(px, py))
+    script = 'v=$(getprop ro.build.version.sdk); if [ "$v" -ge 29 ]; then {}; '.format("; ".join(steps))
+    if len(legs) == 1:
+        script += 'elif [ "$v" -ge 26 ]; then input draganddrop {} {} {} {} {}; '.format(
+            x, y, px, py, max(hold_ms, 500) + legs[0][2])
+    return script + 'else echo "burner-drag-unsupported $v"; fi'
+
+
+def drag_touch(x, y, hold_ms, legs):
+    """Send the drag. Returns "ok", or why it isn't done: "unsent <why>"
+    (nothing reached the phone) or "partial <why>" (it may be half done:
+    not sent again)."""
+    wake()
+    line = "drag {} {} {} {}".format(hold_ms, x, y, " ".join(
+        "{} {} {} {}".format(*leg) for leg in legs))
+    t0 = time.time()
+    try:
+        if scrcpy_send(line, retry=False):
+            _trace("drag scrcpy {:.2f}s".format(time.time() - t0))
+            u2_invalidate()
+            return "ok"
+    except Exception as e:
+        why = str(e)
+        if "part way" in why or "timed out" in why:
+            u2_invalidate()
+            return "partial " + why
+        _trace("drag: no scrcpy helper ({}); over adb".format(why[:80]))
+    r = adb_or_ensure("shell", drag_adb_script(x, y, hold_ms, legs),
+                      timeout=drag_ms(hold_ms, legs) / 1000.0 + 60)
+    u2_invalidate()
+    out = (r.stdout or "") + (r.stderr or "")
+    m = re.search(r"burner-drag-unsupported (\S*)", out)
+    if m:
+        return ("unsent the phone's Android (SDK {}) has no drag over adb and the scrcpy helper isn't "
+                "running: `burner ensure`, then again".format(m.group(1) or "?")
+                if len(legs) == 1 else
+                "unsent stops on the way need the scrcpy helper or Android 10+: `burner ensure`, "
+                "then again, or drag from point to point")
+    if r.returncode != 0 or "Error" in out or "Exception" in out:
+        return "partial adb: " + out.strip()[:120]
+    return "ok"
+
+
+def _drag_point_px(spec, nodes, w, h):
+    """(x, y) pixels for a parsed point other than an edge, or raises
+    ValueError with what to do."""
+    kind, val = spec
+    if kind == "xy":
+        return int(val[0] * w), int(val[1] * h)
+    if kind == "handle":
+        entry = snap_entry(val)
+        if snap_node(nodes, entry) is None:
+            raise ValueError("{}'s row is no longer on the screen: `burner snap` again".format(val))
+        return entry["x"], entry["y"]
+    plan = plan_tap(nodes, w, h, text=val, check=False)
+    if plan["action"] == "ambiguous":
+        raise ValueError('"{}" is on the screen {} times: `burner snap`, then drag @eN'.format(
+            val, len(plan["hits"])))
+    if plan["action"] == "clipped":
+        pt = clickable_target(plan["node"])
+        if pt[0] is not None:
+            return pt
+    if plan["action"] != "tap":
+        raise ValueError('no "{}" on the screen (a point on another page is X,Y, 0 to 1 '
+                         'across and down)'.format(val))
+    return plan["xy"]
+
+
+def cmd_drag(args):
+    """Long-press the first point, carry it through the others, let go at
+    the last: a home screen's app icon moved, to another page (`left`,
+    `right`) or onto another icon (a folder)."""
+    if len(args.points) < 2:
+        print("drag needs a point to pick up and one to drop at", file=sys.stderr)
+        return 1
+    try:
+        specs = [parse_drag_point(p) for p in args.points]
+    except ValueError as e:
+        print("drag: {}".format(e), file=sys.stderr)
+        return 1
+    if specs[0][0] == "edge" or specs[-1][0] == "edge":
+        print("drag: start on what to pick up and end on where to drop it; `left` and `right` "
+              "go between them (each turns one page)", file=sys.stderr)
+        return 1
+    if min(args.hold, args.move, args.dwell) < 0:
+        print("drag: --hold, --move and --dwell are milliseconds, 0 or more", file=sys.stderr)
+        return 1
+    root = _cached_root()  # the screen the assistant took the points from
+    if root is None:
+        root = ui_dump()
+        _update_screen_from_dump(root)
+    nodes = walk(root)
+    w, h = _screen_for_tap()
+    pts = []
+    for spec in specs:
+        if spec[0] == "edge":
+            pts.append(spec[1])
+            continue
+        try:
+            pts.append(_drag_point_px(spec, nodes, w, h))
+        except ValueError as e:
+            print("drag: {}".format(e), file=sys.stderr)
+            return 1
+    legs = drag_legs(pts, w, h, args.move, args.dwell)
+    if drag_ms(args.hold, legs) > DRAG_MAX_MS:
+        print("drag: that drag holds the finger down {:.1f}s, {}s at most: fewer points or shorter "
+              "--move and --dwell".format(drag_ms(args.hold, legs) / 1000.0, DRAG_MAX_MS // 1000),
+              file=sys.stderr)
+        return 1
+    _disarm_watchdog()  # the drag has its own limit
+    status = drag_touch(pts[0][0], pts[0][1], args.hold, legs)
+    snap_invalidate()
+    if status.startswith("unsent"):
+        print("drag not done: " + status[len("unsent "):], file=sys.stderr)
+        return 1
+    if status.startswith("partial"):
+        print("burner: the drag may have stopped part way ({}); it isn't sent again: look at the "
+              "screen (burner state)".format(status[len("partial "):][:120]), file=sys.stderr)
+        return 1
+    print("dragged {} {} -> {} {}".format(args.points[0], tuple(pts[0]),
+                                          args.points[-1], tuple(legs[-1][:2])))
+    read_after(quiet=args.quiet, prev_root=root)
+    return 0
+
+
 # Labels that close a pop-up without agreeing to anything, safest first.
 DISMISS_LABELS = ["not now", "no thanks", "no, thanks", "maybe later", "skip",
                   "later", "don't allow", "deny", "dismiss", "got it", "close"]
@@ -6309,6 +6523,21 @@ def build_parser():
                    help="don't print the screen afterwards")
     p.set_defaults(fn=cmd_scroll)
 
+    p = sub.add_parser("drag", help="long-press, carry and drop (a home screen icon to another place, "
+                                    "page or folder)")
+    p.add_argument("points", nargs="+", metavar="POINT",
+                   help='what to pick up, any stops, where to drop it: a label ("Chrome"), @eN, '
+                        'X,Y (0 to 1 across and down), or left/right between them to turn a page')
+    p.add_argument("--hold", type=int, default=DRAG_HOLD_MS,
+                   help="ms to press before moving (default {})".format(DRAG_HOLD_MS))
+    p.add_argument("--move", type=int, default=DRAG_MOVE_MS,
+                   help="ms to glide to each point (default {})".format(DRAG_MOVE_MS))
+    p.add_argument("--dwell", type=int, default=DRAG_DWELL_MS,
+                   help="ms to stay at each point, the last before letting go (default {})".format(DRAG_DWELL_MS))
+    p.add_argument("--quiet", "-q", action="store_true",
+                   help="don't print the screen afterwards")
+    p.set_defaults(fn=cmd_drag)
+
     p = sub.add_parser("press", help="keyevent (BACK, HOME, 224, 67, ...)")
     p.add_argument("key")
     p.add_argument("--repeat", type=int, default=1,
@@ -6623,7 +6852,7 @@ def cmd_recipes(args):
     return 0
 
 
-SAVE_VERBS = {"tap", "type", "press", "wait", "start", "open", "scroll",
+SAVE_VERBS = {"tap", "drag", "type", "press", "wait", "start", "open", "scroll",
               "shot", "state", "dump", "snap", "dismiss", "sleep", "apps", "settings"}
 
 
@@ -7894,7 +8123,7 @@ def cmd_uninstall(args):
     return 0
 
 
-LOCKED_COMMANDS = {"tap", "type", "press", "scroll", "start", "open", "do",
+LOCKED_COMMANDS = {"tap", "drag", "type", "press", "scroll", "start", "open", "do",
                    "recipe", "replay", "dismiss", "notifications", "settings"}
 
 

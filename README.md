@@ -133,9 +133,10 @@ Thanks. Let me know on X: [@tropoFarmer](https://x.com/tropoFarmer).
 burner is a small command-line tool that your AI assistant runs. It
 connects to the phone through Android's wireless debugging, over Tailscale (or
 your home Wi-Fi when both are on the same network). From there it reads what's
-on the screen, taps, types, opens apps and links, and takes screenshots, the
-same way you would. Sign-in codes come from your email, so the phone doesn't
-need a SIM. Everything the phone does in your apps happens on your own Wi-Fi.
+on the screen, taps, types, moves app icons around the home screen, opens apps
+and links, and takes screenshots, the same way you would. Sign-in codes come
+from your email, so the phone doesn't need a SIM. Everything the phone does in
+your apps happens on your own Wi-Fi.
 
 The full setup steps and command reference are in [SKILL.md](SKILL.md).
 
