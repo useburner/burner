@@ -6841,11 +6841,12 @@ def build_parser():
     p.add_argument("--yes", action="store_true",
                    help="auto-confirm agent actions")
     p.add_argument("--code", metavar="CODE",
-                   help="6-digit pairing code (pair step; never stored)")
+                   help="6-digit pairing code (pair step, or self-pair when "
+                        "the code can't be read off the screen; never stored)")
     p.add_argument("--ip", metavar="IP",
                    help="phone tailnet IP from pairing dialog (pair step)")
     p.add_argument("--pair-port", metavar="PORT",
-                   help="pairing port from pairing dialog (pair step)")
+                   help="pairing port from pairing dialog (pair, self-pair)")
     p.add_argument("--connect-port", metavar="PORT",
                    help="wireless debugging port (pair step)")
     p.set_defaults(fn=cmd_setup)
@@ -7635,9 +7636,11 @@ def _setup_app_status():
 
 
 def _setup_tap_label(label, scrolls=12):
-    """Tap the node labelled exactly `label`, scrolling down to find it."""
+    """Tap the node labelled exactly `label`, scrolling down to find it.
+    Each look is a fresh read: the screen has just changed under it."""
     for _ in range(scrolls):
-        hits = find_nodes(walk(ui_dump()), label)
+        nodes = walk(ui_dump(fresh=True))
+        hits = find_nodes(nodes, label)
         if hits:
             x, y = clickable_target(hits[0])
             tap_center(x, y)
@@ -7649,17 +7652,295 @@ def _setup_tap_label(label, scrolls=12):
     return False
 
 
-def _setup_read_pair_dialog():
-    """Read (code, port) off the open pairing dialog. Never logged or stored."""
+# Settings' Wireless debugging screen and its pairing dialog (AOSP
+# WirelessDebuggingFragment, AdbWirelessDialog, adb_wireless_dialog.xml).
+# The dialog opens empty: the code and the "IP address & Port" line come
+# a moment later, each in its own broadcast from the system. Settings
+# logs the port ("WirelessDebuggingFrag: Got pairing code port=N") on
+# every Android since 11, and the system logs the code
+# ("AdbDebuggingManager: updateUIPairCode: N") on Android 16; earlier
+# ones only on a debug build.
+SETUP_PAIR_LABEL = "Pair device with pairing code"
+SETUP_PAIR_TITLE = "Pair with device"
+SETUP_PAIR_IDS = ("pairing_code", "ip_addr", "l_pairing_six_digit")
+SETUP_PAIR_READ_S = 12.0   # how long the code and the port are waited for
+SETUP_WIRELESS_TILE = ("com.android.settings/.development.qstile."
+                       "DevelopmentTiles$WirelessDebugging")
+SETUP_DEV_ACTIVITY = "com.android.settings/.Settings$DevelopmentSettingsActivity"
+
+
+def _setup_six_digits(text):
+    """The 6-digit code in `text`, however it is spaced ("482915",
+    "482 915", "4 8 2 9 1 5"), else None. Pure."""
+    t = re.sub(r"[\s\u00a0\u2007\u202f\u2009-]", "", text or "")
+    return t if re.fullmatch(r"\d{6}", t) else None
+
+
+def _setup_addr_port(text):
+    """The port of an "address:port" line, else None. Pure. Takes any
+    address part: an IPv4 one, "[ipv6]", a host name, and the empty or
+    "null" one Settings writes when the active network (Tailscale's VPN,
+    say) has no IPv4 address. A clock ("11:24") is not one."""
+    m = re.fullmatch(r"(?:\[[0-9A-Za-z:.%]*\]|[0-9A-Za-z.\-:%]*):(\d{4,5})",
+                     plain_words(text))
+    if not m:
+        return None
+    port = int(m.group(1))
+    return str(port) if 1024 <= port <= 65535 else None
+
+
+def parse_pair_dialog(nodes, exclude=()):
+    """(code, port, open) read off the pairing dialog's nodes. Pure.
+
+    By resource id first (pairing_code, ip_addr), then by the words: one
+    6-digit text, one address:port text. The Wireless debugging screen
+    behind the dialog has its own "IP address & Port" line, with the
+    connect port: ports in `exclude` (that one) are never taken, and two
+    different candidates are no answer. `open` is True when the dialog
+    itself is on the screen, read or not."""
     code = port = None
-    for n in walk(ui_dump()):
-        t = (n["text"] or "").strip()
-        if re.fullmatch(r"\d{6}", t):
-            code = t
-        m = re.fullmatch(r"[0-9a-fA-F.:\[\]]+:(\d{2,5})", t)
+    seen = False
+    codes, ports = set(), set()
+    exclude = {str(p) for p in exclude if p}
+    for n in nodes:
+        text = n.get("text") or ""
+        rid = (n.get("rid") or "").rsplit("/", 1)[-1]
+        if rid in SETUP_PAIR_IDS:
+            seen = True
+        if plain_words(text).lower() in (SETUP_PAIR_TITLE.lower(),
+                                         "wi-fi pairing code"):
+            seen = True
+        c = _setup_six_digits(text)
+        p = _setup_addr_port(text)
+        if rid == "pairing_code" and c:
+            code = c
+        if rid == "ip_addr" and p and p not in exclude:
+            port = p
+        if c:
+            codes.add(c)
+        if p and p not in exclude:
+            ports.add(p)
+    if not seen and len(codes) == 1 and len(ports) == 1:
+        seen = True  # a dialog worded differently: one code, one port
+    if code is None and seen and len(codes) == 1:
+        code = codes.pop()
+    if port is None and seen and len(ports) == 1:
+        port = ports.pop()
+    return code, port, seen
+
+
+def parse_pair_logcat(text):
+    """(code, port) from the last pairing in Settings' and the system's
+    log lines. Pure. The port is the last "Got pairing code port=N"; the
+    code the last "updateUIPairCode: N" before it (the system sends the
+    code first, then starts the pairing server and sends its port), so a
+    code from an earlier dialog is never paired with a later port."""
+    code = port = None
+    pending = None
+    for line in (text or "").splitlines():
+        m = re.search(r"updateUIPairCode: *(\d{6})\b", line)
         if m:
+            pending = m.group(1)
+            continue
+        m = re.search(r"Got pairing code port=(\d+)", line)
+        if m and m.group(1) != "0":
             port = m.group(1)
+            code, pending = pending, None
+    if port is None:
+        code = None
     return code, port
+
+
+def parse_listen_ports(text):
+    """Ports in LISTEN state in /proc/net/tcp{,6} text, as strings. Pure."""
+    ports = set()
+    for line in (text or "").splitlines():
+        f = line.split()
+        if len(f) > 3 and f[3] == "0A" and ":" in f[1]:
+            try:
+                ports.add(str(int(f[1].rsplit(":", 1)[1], 16)))
+            except ValueError:
+                pass
+    return ports
+
+
+def _setup_listen_ports():
+    """The phone's listening TCP ports, or None when they can't be read."""
+    out = _setup_sh("cat", "/proc/net/tcp", "/proc/net/tcp6")
+    if out is None:
+        return None
+    return parse_listen_ports(out)
+
+
+def _setup_pair_log():
+    return _setup_sh("logcat", "-d", "-b", "main", "-b", "system", "-s",
+                     "WirelessDebuggingFrag:I", "AdbDebuggingManager:I",
+                     timeout=20) or ""
+
+
+def _setup_adb_ports():
+    """The phone's own debugging ports, never the pairing port: the
+    Wireless debugging (connect) port, the fixed one, and config.env's."""
+    ports = {CFG.get("ADB_PORT")}
+    for prop in ("service.adb.tls.port", "service.adb.tcp.port"):
+        ports.add(_setup_sh("getprop", prop))
+    return {p for p in ports if p and p not in ("0", "-1")}
+
+
+def _setup_screen_words(nodes, n=14):
+    """What the screen says, for an error message: the first worded rows,
+    with any 6 digits in a row hidden (the code is never printed). Pure."""
+    seen, out = set(), []
+    for node in nodes:
+        w = plain_words(node.get("text") or node.get("desc") or "")
+        w = re.sub(r"\d[\d ]{4,}\d", lambda m: "#" * len(m.group(0))
+                   if _setup_six_digits(m.group(0)) else m.group(0), w)
+        if w and w not in seen:
+            seen.add(w)
+            out.append(w[:40])
+        if len(out) >= n:
+            break
+    return "; ".join(out) or "(nothing: the read came back empty)"
+
+
+def _setup_read_nodes():
+    try:
+        return walk(ui_dump(fresh=True))
+    except Exception:
+        return []
+
+
+def _setup_on_wireless_page(nodes):
+    hits = find_nodes(nodes, SETUP_PAIR_LABEL)
+    return bool(hits) or bool(find_nodes(nodes, "pair device with pairing",
+                                         exact=False))
+
+
+def _setup_open_pair_dialog():
+    """Open Settings > Developer options > Wireless debugging > Pair
+    device with pairing code. True once the tap on it was made."""
+    # Android 14+: the Wireless debugging tile's long-press intent opens
+    # its page straight away. Older ones (and a Settings that ignores it)
+    # land on Developer options, and the row is tapped from there.
+    adb("shell", "am", "start", "-a",
+        "android.service.quicksettings.action.QS_TILE_PREFERENCES",
+        "--ecn", "android.intent.extra.COMPONENT_NAME",
+        "'{}'".format(SETUP_WIRELESS_TILE),
+        "-n", "'{}'".format(SETUP_DEV_ACTIVITY), timeout=15)
+    on_page = False
+    for _ in range(4):
+        time.sleep(1.5)
+        if _setup_on_wireless_page(_setup_read_nodes()):
+            on_page = True
+            break
+    if not on_page:
+        adb("shell", "am", "start", "-a",
+            "android.settings.APPLICATION_DEVELOPMENT_SETTINGS", timeout=15)
+        time.sleep(2)
+        if not _setup_tap_label("Wireless debugging"):
+            print("could not find 'Wireless debugging' in Developer options "
+                  "on the phone.", file=sys.stderr)
+            return False
+    if _setup_tap_label(SETUP_PAIR_LABEL):
+        return True
+    hits = find_nodes(_setup_read_nodes(), "pair device with pairing",
+                      exact=False)
+    if hits:
+        tap_center(*clickable_target(hits[0]))
+        time.sleep(1.5)
+        return True
+    print("could not find '{}' on the Wireless debugging screen. Is "
+          "Wireless debugging on?".format(SETUP_PAIR_LABEL), file=sys.stderr)
+    return False
+
+
+def _setup_read_pairing(before, exclude, wait_s=None, log_before=""):
+    """Wait for the open pairing dialog's code and port. Never logged or
+    stored. Returns (code, port, open, nodes, how): the screen first,
+    read again each second until both show or wait_s runs out, then
+    the log (port, and code on Android 16; only the lines written since
+    `log_before`), then the port that started listening when the dialog
+    opened."""
+    if wait_s is None:
+        wait_s = SETUP_PAIR_READ_S
+    code = port = None
+    seen = False
+    nodes = []
+    how = []
+    t0 = time.time()
+    while True:
+        now = _setup_read_nodes()
+        nodes = now or nodes
+        c, p, s = parse_pair_dialog(now, exclude)
+        code, port, seen = code or c, port or p, seen or s
+        if code and port:
+            return code, port, True, nodes, "screen"
+        if time.time() - t0 >= wait_s:
+            break
+        time.sleep(1)
+    if code or port:
+        how.append("screen")
+    old = set((log_before or "").splitlines())
+    lc, lp = parse_pair_logcat("\n".join(
+        l for l in _setup_pair_log().splitlines() if l not in old))
+    listening = _setup_listen_ports()
+    if lp and listening is not None and lp not in listening:
+        lc = lp = None  # an earlier dialog's, closed since
+    if lp and not port and lp not in exclude:
+        port = lp
+        how.append("log")
+    if lc and not code and lp == port:
+        code = lc
+        how.append("log")
+    if not port and before is not None and listening is not None:
+        new = listening - before - set(exclude)
+        if len(new) == 1:
+            port = new.pop()
+            how.append("listening ports")
+    return code, port, seen, nodes, "+".join(how) or "nothing"
+
+
+def _setup_open_pair_port(exclude):
+    """The port of a pairing dialog still open from an earlier run (the
+    user read its code), else None."""
+    c, port, seen = parse_pair_dialog(_setup_read_nodes(), exclude)
+    listening = _setup_listen_ports()
+    if port and (listening is None or port in listening):
+        return port
+    _, lp = parse_pair_logcat(_setup_pair_log())
+    if lp and lp not in exclude and listening is not None and lp in listening:
+        return lp
+    return None
+
+
+def _setup_close_settings():
+    for _ in range(3):
+        adb("shell", "input", "keyevent", "KEYCODE_BACK", timeout=10)
+        time.sleep(0.5)
+
+
+def _setup_app_pair(port, code):
+    """Hand the port and code to ADB Auto Enable's /api/pair."""
+    res = _setup_app_api("/api/pair", "port={}&code={}".format(port, code))
+    _setup_close_settings()
+    if not res or not res.get("success"):
+        print("ADB Auto Enable pairing failed: {}. A pairing code works "
+              "once: run `burner setup --step self-pair` again for a new "
+              "one.".format((res or {}).get("error", "no response")),
+              file=sys.stderr)
+        return 1
+    time.sleep(2)
+    print("ADB Auto Enable is paired and will keep ADB on after reboots.")
+    return 0
+
+
+def _setup_code_arg(args):
+    """--code for self-pair: the 6 digits the user read off the open
+    dialog. "" when not given, None when given but not 6 digits."""
+    raw = getattr(args, "code", None)
+    if not raw:
+        return ""
+    return _setup_six_digits(raw)
 
 
 def _run_self_pair(args):
@@ -7667,8 +7948,19 @@ def _run_self_pair(args):
 
     Opens the app once (starts its service and local API), opens Settings >
     Developer options > Wireless debugging > Pair device with pairing code
-    on the phone, reads the code and port off the screen, and hands them to
-    the app's /api/pair. The app then pairs with the phone over localhost."""
+    on the phone, reads the code and port (off the screen, else Settings'
+    log, else the newly listening port), and hands them to the app's
+    /api/pair. The app then pairs with the phone over localhost.
+
+    When the port is known but the code can't be read (a Settings that
+    hides it from the screen read), the dialog is left open and the step
+    says how to finish: the code off a `burner shot`, or from the user,
+    with `--code`."""
+    code_arg = _setup_code_arg(args)
+    if code_arg is None:
+        print("self-pair: --code must be the 6 digits under Wi-Fi pairing "
+              "code in the phone's pairing dialog.", file=sys.stderr)
+        return 1
     if _check_self_pair():
         print("ADB Auto Enable is already paired.")
         return 0
@@ -7685,30 +7977,54 @@ def _run_self_pair(args):
               "debugging back on once and sends a screenshot of that screen. "
               "There's nothing for the user to fix.")
         return 0
-    adb("shell", "am", "start", "-a",
-        "android.settings.APPLICATION_DEVELOPMENT_SETTINGS", timeout=15)
-    time.sleep(2)
-    for label in ("Wireless debugging", "Pair device with pairing code"):
-        if not _setup_tap_label(label):
-            print("could not find '{}' on the phone screen.".format(label),
-                  file=sys.stderr)
-            return 1
-    code, port = _setup_read_pair_dialog()
-    if not code or not port:
-        print("could not read the pairing code and port off the phone "
-              "screen.", file=sys.stderr)
+    exclude = _setup_adb_ports()
+    if code_arg:
+        port = (str(args.pair_port).strip() if getattr(args, "pair_port", None)
+                else _setup_open_pair_port(exclude))
+        if port:
+            return _setup_app_pair(port, code_arg)
+        print("no pairing dialog is open on the phone any more (closing it "
+              "ends that code). Opening a new one: its code is a new one.",
+              file=sys.stderr)
+    before = _setup_listen_ports()
+    log_before = _setup_pair_log()
+    if not _setup_open_pair_dialog():
         return 1
-    res = _setup_app_api("/api/pair", "port={}&code={}".format(port, code))
-    for _ in range(3):
-        adb("shell", "input", "keyevent", "KEYCODE_BACK", timeout=10)
-        time.sleep(0.5)
-    if not res or not res.get("success"):
-        print("ADB Auto Enable pairing failed: {}".format(
-            (res or {}).get("error", "no response")), file=sys.stderr)
+    code, port, seen, nodes, how = _setup_read_pairing(
+        before, exclude, log_before=log_before)
+    _trace("self-pair read the pairing dialog via {}".format(how))
+    if code and port:
+        return _setup_app_pair(port, code)
+    words = _setup_screen_words(nodes)
+    if port:
+        # The dialog is open and pairing waits on it: leave it open.
+        print("the pairing dialog is open on the phone (pairing port {}), "
+              "but its 6-digit code can't be read over adb: this Settings "
+              "hides it from the screen read. The screen read shows: {}.\n"
+              "Leave the dialog open and get the code one of two ways:\n"
+              "  1. `burner shot --out .` and read the 6 digits under "
+              "\"Wi-Fi pairing code\" off the image (a black image means "
+              "the screen can't be captured either);\n"
+              "  2. ask the user to read them off the phone.\n"
+              "Then run: burner setup --step self-pair --code NNNNNN\n"
+              "(It reuses the open dialog. Closing the dialog ends the "
+              "code; then just run the step again.)".format(port, words),
+              file=sys.stderr)
         return 1
-    time.sleep(2)
-    print("ADB Auto Enable is paired and will keep ADB on after reboots.")
-    return 0
+    if not seen:
+        print("could not read the pairing code and port: the pairing "
+              "dialog did not show up on the screen read (shows: {}). Run "
+              "the step again; if it keeps failing, send `burner shot` of "
+              "the phone.".format(words), file=sys.stderr)
+        return 1
+    print("could not read the pairing code and port off the phone screen: "
+          "the dialog is open, but neither its 'IP address & Port' line, "
+          "Settings' log nor the phone's listening ports gave the pairing "
+          "port (screen read shows: {}). Ask the user to read the code and "
+          "the port after the last ':' off the dialog, keep it open, and "
+          "send both; then run `burner setup --step self-pair --code "
+          "NNNNNN --pair-port PPPPP`.".format(words), file=sys.stderr)
+    return 1
 
 
 def _check_stay_awake():
@@ -7787,22 +8103,70 @@ def _run_always_on_vpn(args):
     return 0
 
 
+def _setup_restart_tunnel():
+    """Point the tunnel at config.env's ADB_PORT: `tunnel.sh start` keeps
+    a tunnel that is already running, to the old port."""
+    tun = os.path.join(ROOT, "tunnel.sh")
+    _setup_spawn([tun, "stop"], timeout=20)
+    _setup_spawn([tun, "start"], timeout=45)
+
+
 def _run_fix_port(args):
-    r = adb("shell", "setprop", "service.adb.tcp.port", "5555", timeout=15)
-    if r.returncode != 0:
-        print("setprop failed.", file=sys.stderr)
-        return 1
-    _setup_write_config({"ADB_PORT": "5555"})
-    _setup_spawn([os.path.join(ROOT, "tunnel.sh"), "start"], timeout=45)
-    r = adb("connect", TARGET, timeout=20)
-    time.sleep(2)
-    port = _setup_sh("getprop", "service.adb.tcp.port")
-    if _setup_device_state() == "device" and port == "5555":
-        print("adbd is on fixed port 5555. config.env updated.")
+    """Move adbd to the fixed port 5555 with `adb tcpip 5555`.
+
+    adbd sets service.adb.tcp.port itself and restarts on it. `adb shell
+    setprop service.adb.tcp.port 5555` can't: on a phone's user build the
+    property (adbd_config_prop) is adbd's own, the shell may not set it
+    (and setting it alone wouldn't move adbd anyway). adb-auto-enable
+    does the same `tcpip:5555` after every restart, once it is paired
+    (step self-pair)."""
+    old_port = CFG.get("ADB_PORT", "")
+    if (_setup_sh("getprop", "service.adb.tcp.port") == "5555"
+            and old_port == "5555" and _setup_device_state() == "device"):
+        print("adbd is already on fixed port 5555.")
         return 0
-    print("port switch did not stick (adbd port: {}). The adb-auto-enable "
-          "app's self-pairing (step self-pair) is what pins it; make sure "
-          "that step is done, then re-run.".format(port), file=sys.stderr)
+    r = adb("tcpip", "5555", timeout=20)
+    said = " ".join(((r.stdout or "") + " " + (r.stderr or "")).split())
+    if r.returncode != 0 or "error" in said.lower():
+        print("could not move adbd to port 5555: `adb tcpip 5555` said: {}. "
+              "Nothing changed; burner still uses port {}.".format(
+                  said[:160] or "nothing", old_port or "?"), file=sys.stderr)
+        return 1
+    # adbd restarts now: this connection, on the old port, is gone.
+    adb("disconnect", TARGET, timeout=10)
+    _setup_write_config({"ADB_PORT": "5555"})
+    _setup_restart_tunnel()
+    state = None
+    for _ in range(8):
+        time.sleep(2)
+        adb("connect", TARGET, timeout=20)
+        time.sleep(1)
+        state = _setup_device_state()
+        if state in ("device", "unauthorized"):
+            break
+        adb("disconnect", TARGET, timeout=10)
+    port = _setup_sh("getprop", "service.adb.tcp.port") if state == "device" else None
+    if state == "device" and port == "5555":
+        print("adbd is on fixed port 5555. config.env updated.")
+        if _check_self_pair() is False:
+            print("note: ADB Auto Enable isn't paired yet (step self-pair), "
+                  "so after a restart the port isn't reopened by itself. "
+                  "Run `burner setup --step self-pair`.")
+        return 0
+    if state == "unauthorized":
+        print("adbd is on port 5555, but the phone asks to allow this "
+              "computer: ask the user to tap Allow on \"Allow USB "
+              "debugging?\" (check Always allow from this computer), then "
+              "run `burner setup --step fix-port` again.", file=sys.stderr)
+        return 1
+    print("adbd was told to move to port 5555 but doesn't answer there "
+          "(adb state: {}, adbd port: {}). config.env now says 5555. If "
+          "`burner ensure` can't reach it, Wireless debugging's own port "
+          "changed with the restart: ask the user for a screenshot of "
+          "Settings > Developer options > Wireless debugging, put the port "
+          "after the last ':' in ADB_PORT in config.env, and run this step "
+          "again.".format(state or "unknown", port or "unknown"),
+          file=sys.stderr)
     return 1
 
 

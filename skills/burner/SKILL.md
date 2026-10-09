@@ -473,17 +473,28 @@ on while charging", "Tailscale will now start by itself after a restart").
   `com.tpn.adbautoenable`,
   https://github.com/mouldybread/adb-auto-enable/releases), grants it
   `WRITE_SECURE_SETTINGS` and exempts it from battery optimization.
-- `self-pair`: opens the app, reads a pairing code off the phone's screen and
-  hands it to the app. Best effort: if the app's pairing page doesn't come up,
+- `self-pair`: opens the app, opens Wireless debugging's pairing dialog, reads
+  the code and port (off the screen, waiting up to 12 seconds for them to
+  appear; else from Settings' log and the phone's listening ports) and hands
+  them to the app. Best effort: if the app's pairing page doesn't come up,
   the step skips itself. burner still works; the only cost is that after a
   restart the user turns Wireless debugging back on once. Tell them that in a
   sentence and carry on. There's nothing for them to fix.
+  If it says the dialog is open but the code can't be read, the dialog stays
+  open on the phone: run `burner shot --out .` and read the 6 digits under
+  "Wi-Fi pairing code" off the image (if the image is black, ask the user to
+  read them off the phone), then run
+  `burner setup --step self-pair --code NNNNNN`. It reuses the open dialog.
+  If the dialog was closed meanwhile, the code is dead: run the step again.
 - `always-on-vpn`: sets Tailscale as the always-on VPN, so it starts by itself
   after a restart. Lockdown stays off, so if Tailscale ever fails the phone
   still has normal internet.
-- `fix-port`: pins the phone's debugging port to **5555** and saves it in
-  `config.env`. From then on adb-auto-enable reopens it on every restart, and
-  restarts need nothing from the user.
+- `fix-port`: pins the phone's debugging port to **5555** (`adb tcpip 5555`;
+  the connection drops and comes back on 5555) and saves it in `config.env`.
+  From then on adb-auto-enable reopens it on every restart, and restarts need
+  nothing from the user. It works without `self-pair`, but then the port
+  isn't reopened after a restart. If the phone asks "Allow USB debugging?",
+  ask the user to tap Allow and run the step again.
 
 ### 8. Wrap up
 

@@ -2472,17 +2472,269 @@ class SetupWizardTests(OfflineTestCase):
         self.assertEqual(st["installed_apps"], 2)
         self.assertEqual(st["model"], "Pixel 7a")
 
-    def test_read_pair_dialog(self):
-        xml = ('<hierarchy><node text="Pair with device" bounds="[0,0][1,1]"/>'
-               '<node text="Wi-Fi pairing code" bounds="[0,0][1,1]"/>'
-               '<node text="482915" bounds="[0,0][1,1]"/>'
-               '<node text="IP address &amp; Port" bounds="[0,0][1,1]"/>'
-               '<node text="100.64.1.2:37129" bounds="[0,0][1,1]"/>'
-               '</hierarchy>')
-        with mock.patch.object(pc, "ui_dump",
-                               return_value=pc.ET.fromstring(xml)):
-            self.assertEqual(pc._setup_read_pair_dialog(),
-                             ("482915", "37129"))
+    # --- self-pair: reading the pairing dialog ---
+
+    @staticmethod
+    def _dialog_nodes(code="482915", addr="100.64.1.2:37129", ids=True,
+                      behind="100.64.1.2:41235"):
+        """Nodes of the Wireless debugging screen with the pairing dialog
+        over it, as walk() gives them."""
+        def n(text, rid=""):
+            return {"text": text, "desc": "", "rid": rid}
+        rows = [n("Wireless debugging"), n("IP address & Port"), n(behind),
+                n("Pair device with pairing code")]
+        rows += [n("Pair with device"), n("Wi\u2011Fi pairing code"),
+                 n(code, "com.android.settings:id/pairing_code" if ids else ""),
+                 n("IP address & Port"),
+                 n(addr, "com.android.settings:id/ip_addr" if ids else ""),
+                 n("Cancel")]
+        return rows
+
+    def test_parse_pair_dialog_by_id(self):
+        self.assertEqual(pc.parse_pair_dialog(self._dialog_nodes(), {"41235"}),
+                         ("482915", "37129", True))
+
+    def test_parse_pair_dialog_by_words_skips_the_connect_port(self):
+        nodes = self._dialog_nodes(ids=False)
+        self.assertEqual(pc.parse_pair_dialog(nodes, {"41235"}),
+                         ("482915", "37129", True))
+        # Without knowing the connect port, two ports are no answer.
+        self.assertEqual(pc.parse_pair_dialog(nodes, ()), ("482915", None, True))
+
+    def test_parse_pair_dialog_spaced_code_and_odd_addresses(self):
+        for addr in ("100.64.1.2:37129", ":37129", "null:37129",
+                     "[fe80::1]:37129", "pixel.tail1234.ts.net:37129"):
+            nodes = self._dialog_nodes(code="482 915", addr=addr)
+            self.assertEqual(pc.parse_pair_dialog(nodes, {"41235"}),
+                             ("482915", "37129", True), addr)
+
+    def test_parse_pair_dialog_before_it_fills_in(self):
+        nodes = self._dialog_nodes(code="", addr=" ")
+        self.assertEqual(pc.parse_pair_dialog(nodes, {"41235"}), (None, None, True))
+        wireless = [{"text": t, "desc": "", "rid": ""} for t in
+                    ("Wireless debugging", "100.64.1.2:41235", "11:24")]
+        self.assertEqual(pc.parse_pair_dialog(wireless, {"41235"}),
+                         (None, None, False))
+
+    def test_addr_port_and_six_digits(self):
+        self.assertIsNone(pc._setup_addr_port("11:24"))
+        self.assertIsNone(pc._setup_addr_port("Pixel 9 Pro XL"))
+        self.assertIsNone(pc._setup_addr_port("1.2.3.4:99999"))
+        self.assertEqual(pc._setup_addr_port("192.168.1.5:5555"), "5555")
+        self.assertEqual(pc._setup_six_digits("4 8 2\u00a09 1 5"), "482915")
+        self.assertIsNone(pc._setup_six_digits("4829150"))
+
+    def test_parse_pair_logcat(self):
+        log = "\n".join([
+            "10-09 11:00:00.1 1 2 I AdbDebuggingManager: updateUIPairCode: 111111",
+            "10-09 11:00:00.3 3 4 I WirelessDebuggingFrag: Got pairing code port=40001",
+            "10-09 11:20:00.1 1 2 I AdbDebuggingManager: updateUIPairCode: 222222",
+            "10-09 11:20:00.3 3 4 I WirelessDebuggingFrag: Got pairing code port=40002",
+        ])
+        self.assertEqual(pc.parse_pair_logcat(log), ("222222", "40002"))
+        # Android 15: the code isn't logged; an old one is never reused.
+        old_code = "\n".join(log.splitlines()[:2] + log.splitlines()[3:])
+        self.assertEqual(pc.parse_pair_logcat(old_code), (None, "40002"))
+        self.assertEqual(pc.parse_pair_logcat(""), (None, None))
+
+    def test_parse_listen_ports(self):
+        text = "\n".join([
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid",
+            "   0: 00000000:9C4B 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000",
+            "   1: 0100007F:2385 0100007F:B1C2 01 00000000:00000000 00:00000000 00000000  2000",
+            "   0: 00000000000000000000000000000000:A119 00000000000000000000000000000000:0000 0A 0 0 0 2000",
+        ])
+        self.assertEqual(pc.parse_listen_ports(text), {"40011", "41241"})
+
+    def test_screen_words_hide_the_code(self):
+        words = pc._setup_screen_words(self._dialog_nodes(code="482 915"))
+        self.assertNotIn("482", words)
+        self.assertIn("Pair with device", words)
+
+    def _self_pair(self, args=None, reads=None, logs=("",), listen=None,
+                   pair_ok=True, open_ok=True, wait=0.0):
+        """Run _run_self_pair with the phone mocked. Returns (rc, out,
+        err, api mock, adb mock). logs: the log on each read, in turn."""
+        logs = list(logs)
+        m = self.allow("adb")
+        m.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+        reads = list(reads or [[]])
+
+        def read():
+            return reads.pop(0) if len(reads) > 1 else reads[0]
+        api = mock.Mock(return_value={"success": pair_ok, "error": "bad code"})
+        listens = list(listen or [None])
+        with mock.patch.object(pc, "_check_self_pair", return_value=False), \
+                mock.patch.object(pc, "_setup_app_status",
+                                  return_value={"isPaired": False}), \
+                mock.patch.object(pc, "_setup_app_api", api), \
+                mock.patch.object(pc, "_setup_adb_ports", return_value={"41235"}), \
+                mock.patch.object(pc, "_setup_open_pair_dialog",
+                                  return_value=open_ok) as opener, \
+                mock.patch.object(pc, "_setup_read_nodes", side_effect=read), \
+                mock.patch.object(pc, "_setup_pair_log",
+                                  side_effect=lambda: logs.pop(0) if len(logs) > 1 else logs[0]), \
+                mock.patch.object(pc, "_setup_listen_ports",
+                                  side_effect=lambda: listens.pop(0) if len(listens) > 1 else listens[0]), \
+                mock.patch.object(pc, "SETUP_PAIR_READ_S", wait), \
+                mock.patch.object(pc.time, "sleep"), \
+                self.cap() as (out, err):
+            rc = pc._run_self_pair(args or _setup_args())
+        self.opener = opener
+        return rc, out.getvalue(), err.getvalue(), api, m
+
+    def test_self_pair_reads_the_screen_and_pairs(self):
+        rc, out, err, api, m = self._self_pair(reads=[self._dialog_nodes()])
+        self.assertEqual(rc, 0, err)
+        api.assert_called_once_with("/api/pair", "port=37129&code=482915")
+        self.assertNotIn("482915", out + err)
+        self.assertIn(mock.call("shell", "input", "keyevent", "KEYCODE_BACK",
+                                timeout=10), m.call_args_list)
+
+    def test_self_pair_waits_for_the_dialog_to_fill_in(self):
+        empty = self._dialog_nodes(code="", addr=" ")
+        rc, out, err, api, _ = self._self_pair(
+            reads=[empty, empty, self._dialog_nodes()], wait=5.0)
+        self.assertEqual(rc, 0, err)
+        api.assert_called_once_with("/api/pair", "port=37129&code=482915")
+
+    def test_self_pair_falls_back_to_the_log(self):
+        log = ("I AdbDebuggingManager: updateUIPairCode: 135790\n"
+               "I WirelessDebuggingFrag: Got pairing code port=38001\n")
+        hidden = self._dialog_nodes(code="", addr="")
+        rc, out, err, api, _ = self._self_pair(
+            reads=[hidden], logs=["", log], listen=[{"41235"}, {"41235", "38001"}])
+        self.assertEqual(rc, 0, err)
+        api.assert_called_once_with("/api/pair", "port=38001&code=135790")
+
+    def test_self_pair_ignores_an_earlier_dialog_in_the_log(self):
+        log = ("I AdbDebuggingManager: updateUIPairCode: 135790\n"
+               "I WirelessDebuggingFrag: Got pairing code port=38001\n")
+        hidden = self._dialog_nodes(code="", addr="")
+        rc, out, err, api, _ = self._self_pair(reads=[hidden], logs=[log, log])
+        self.assertEqual(rc, 1)
+        api.assert_not_called()
+        self.assertIn("neither its 'IP address & Port' line", err)
+
+    def test_self_pair_hidden_code_leaves_the_dialog_open(self):
+        hidden = self._dialog_nodes(code="", addr="")
+        rc, out, err, api, m = self._self_pair(
+            reads=[hidden], listen=[{"41235"}, {"41235", "38001"}])
+        self.assertEqual(rc, 1)
+        api.assert_not_called()
+        self.assertIn("pairing port 38001", err)
+        self.assertIn("--step self-pair --code NNNNNN", err)
+        self.assertIn("burner shot", err)
+        self.assertNotIn(mock.call("shell", "input", "keyevent", "KEYCODE_BACK",
+                                   timeout=10), m.call_args_list)
+
+    def test_self_pair_with_code_reuses_the_open_dialog(self):
+        log = "I WirelessDebuggingFrag: Got pairing code port=38001\n"
+        rc, out, err, api, _ = self._self_pair(
+            args=_setup_args(code="135 790"), reads=[[]], logs=[log],
+            listen=[{"41235", "38001"}])
+        self.assertEqual(rc, 0, err)
+        api.assert_called_once_with("/api/pair", "port=38001&code=135790")
+        self.opener.assert_not_called()
+
+    def test_self_pair_with_code_and_pair_port(self):
+        rc, out, err, api, _ = self._self_pair(
+            args=_setup_args(code="135790", pair_port="38001"))
+        self.assertEqual(rc, 0, err)
+        api.assert_called_once_with("/api/pair", "port=38001&code=135790")
+
+    def test_self_pair_rejects_a_bad_code(self):
+        with self.cap() as (out, err):
+            rc = pc._run_self_pair(_setup_args(code="12345"))
+        self.assertEqual(rc, 1)
+        self.assertIn("6 digits", err.getvalue())
+
+    def test_self_pair_dialog_never_showed(self):
+        screen = [{"text": "Developer options", "desc": "", "rid": ""}]
+        rc, out, err, api, _ = self._self_pair(reads=[screen])
+        self.assertEqual(rc, 1)
+        self.assertIn("did not show up", err)
+        self.assertIn("Developer options", err)
+
+    def test_self_pair_failed_pairing_says_why(self):
+        rc, out, err, api, _ = self._self_pair(reads=[self._dialog_nodes()],
+                                               pair_ok=False)
+        self.assertEqual(rc, 1)
+        self.assertIn("bad code", err)
+
+    def test_open_pair_dialog_quotes_the_dollar_signs(self):
+        m = self.allow("adb")
+        m.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+        page = [{"text": "Pair device with pairing code", "desc": "", "rid": ""}]
+        with mock.patch.object(pc, "_setup_read_nodes", return_value=page), \
+                mock.patch.object(pc, "_setup_tap_label", return_value=True) as tap, \
+                mock.patch.object(pc.time, "sleep"):
+            self.assertTrue(pc._setup_open_pair_dialog())
+        argv = m.call_args_list[0][0]
+        self.assertIn("'com.android.settings/.development.qstile."
+                      "DevelopmentTiles$WirelessDebugging'", argv)
+        self.assertIn("'com.android.settings/.Settings$DevelopmentSettingsActivity'",
+                      argv)
+        tap.assert_called_once_with("Pair device with pairing code")
+
+    # --- fix-port ---
+
+    def _fix_port(self, tcpip_out="restarting in TCP mode port: 5555",
+                  tcpip_rc=0, states=("device",), prop="5555"):
+        calls = []
+        states = list(states)
+
+        def fake(*args, **kwargs):
+            key = tuple(str(a) for a in args)
+            calls.append(key)
+            if key == ("tcpip", "5555"):
+                return SimpleNamespace(returncode=tcpip_rc, stdout=tcpip_out, stderr="")
+            if key == ("get-state",):
+                s = states.pop(0) if len(states) > 1 else states[0]
+                return SimpleNamespace(returncode=0 if s else 1, stdout=s or "", stderr="")
+            if key == ("shell", "getprop", "service.adb.tcp.port"):
+                tcp = prop if ("tcpip", "5555") in calls else ""
+                return SimpleNamespace(returncode=0, stdout=tcp, stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        m = self.allow("adb")
+        m.side_effect = fake
+        with mock.patch.object(pc, "_setup_write_config") as wc, \
+                mock.patch.object(pc, "_setup_spawn") as sp, \
+                mock.patch.object(pc, "_check_self_pair", return_value=True), \
+                mock.patch.dict(pc.CFG, {"ADB_PORT": "41235"}), \
+                mock.patch.object(pc.time, "sleep"), \
+                self.cap() as (out, err):
+            rc = pc._run_fix_port(_setup_args())
+        return rc, out.getvalue(), err.getvalue(), calls, wc, sp
+
+    def test_fix_port_uses_adb_tcpip_not_setprop(self):
+        rc, out, err, calls, wc, sp = self._fix_port()
+        self.assertEqual(rc, 0, err)
+        self.assertIn(("tcpip", "5555"), calls)
+        self.assertFalse([c for c in calls if "setprop" in c])
+        wc.assert_called_once_with({"ADB_PORT": "5555"})
+        # The running tunnel (to the old port) is stopped, then started.
+        self.assertEqual([c[0][0][1] for c in sp.call_args_list], ["stop", "start"])
+        self.assertIn("fixed port 5555", out)
+
+    def test_fix_port_tcpip_error_changes_nothing(self):
+        rc, out, err, calls, wc, sp = self._fix_port(
+            tcpip_out="error: closed", tcpip_rc=1)
+        self.assertEqual(rc, 1)
+        self.assertIn("error: closed", err)
+        self.assertIn("still uses port 41235", err)
+        wc.assert_not_called()
+        sp.assert_not_called()
+
+    def test_fix_port_unauthorized_asks_for_allow(self):
+        rc, out, err, *_ = self._fix_port(states=("unauthorized",))
+        self.assertEqual(rc, 1)
+        self.assertIn("Allow USB debugging?", err)
+
+    def test_fix_port_no_answer_says_what_next(self):
+        rc, out, err, *_ = self._fix_port(states=("",))
+        self.assertEqual(rc, 1)
+        self.assertIn("doesn't answer there", err)
 
     def test_self_pair_already_paired(self):
         with mock.patch.object(pc, "_setup_app_status",
